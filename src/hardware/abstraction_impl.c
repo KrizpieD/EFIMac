@@ -1,6 +1,9 @@
 #include "abstraction.h"
 #include <efi.h>
 #include <efilib.h>
+#include <efinet.h>
+#include "memory/manager.h"
+#include "cpu/translation.h"
 
 // Hardware abstraction context with more complete implementation
 typedef struct {
@@ -17,6 +20,13 @@ typedef struct {
     BOOLEAN AudioInitialized;
     BOOLEAN StorageInitialized;
     BOOLEAN NetworkInitialized;
+    // Guest-visible framebuffer (window carved out of guest RAM)
+    UINT32 GuestFbBase;
+    VOID*  GuestFbHost;
+    UINT64 GuestFbSize;
+    UINT32 GuestFbWidth;
+    UINT32 GuestFbHeight;
+    UINT32 GuestFbPitch;
 } PPC_HARDWARE_CONTEXT;
 
 // Global hardware context
@@ -28,6 +38,25 @@ STATIC UINT32                         g_FramebufferPitch = 0;
 STATIC EFI_GRAPHICS_PIXEL_FORMAT      g_PixelFormat      = PixelRedGreenBlueReserved8BitPerColor;
 STATIC EFI_SIMPLE_FILE_SYSTEM_PROTOCOL **g_FileSystems    = NULL;
 STATIC UINTN                          g_FileSystemCount  = 0;
+
+// Real network interface state
+STATIC struct {
+    EFI_SIMPLE_NETWORK_PROTOCOL *Snp;
+    BOOLEAN                      Inited;
+} g_SnpIfaces[PPC_MAX_NETWORK_INTERFACES];
+STATIC UINTN                          g_SnpIfaceCount   = 0;
+STATIC EFI_SIMPLE_NETWORK_PROTOCOL   *g_Snp             = NULL;
+STATIC PPC_NETWORK_INFO               g_NetworkInfo     = {0};
+STATIC BOOLEAN                        g_NetworkInited   = FALSE;
+
+// Real block device state
+STATIC EFI_BLOCK_IO_PROTOCOL         **g_BlockDevices    = NULL;
+STATIC UINTN                          g_BlockDeviceCount = 0;
+STATIC PPC_BLOCK_IO_INFO              g_BlockIoInfo      = {0};
+
+// Emulated audio device state
+STATIC PPC_AUDIO_INFO                 g_AudioInfo        = {0};
+STATIC BOOLEAN                        g_AudioInited      = FALSE;
 
 /**
   Fill the real GOP framebuffer with a simple pattern so that the wired
@@ -184,6 +213,31 @@ PpcInitializeGraphics (
                                          (Info->VerticalResolution & 0xFFFF);
         g_HardwareContext.GraphicsInitialized = TRUE;
 
+        // Carve a guest-visible framebuffer window out of guest RAM. Guest
+        // code writes big-endian 0xRRGGBB00 pixels here; PpcGraphicsBlitToDisplay
+        // pushes the window to the real GOP framebuffer.
+        VOID*  GuestHost   = NULL;
+        UINT64 GuestBase   = 0;
+        UINT64 GuestSize   = 0;
+        EFI_STATUS FbStatus = PpcGetGuestMemoryRegion(&GuestHost, &GuestBase, &GuestSize);
+        if (!EFI_ERROR(FbStatus) && GuestHost != NULL) {
+            UINT32 FbSize = Info->HorizontalResolution * Info->VerticalResolution * 4;
+            if ((UINT64)(PPC_GRAPHICS_FRAMEBUFFER_GUEST_BASE - (UINT32)GuestBase) + FbSize <= GuestSize) {
+                g_HardwareContext.GuestFbBase  = PPC_GRAPHICS_FRAMEBUFFER_GUEST_BASE;
+                g_HardwareContext.GuestFbHost  = (UINT8*)GuestHost +
+                                                 (PPC_GRAPHICS_FRAMEBUFFER_GUEST_BASE - (UINT32)GuestBase);
+                g_HardwareContext.GuestFbSize  = FbSize;
+                g_HardwareContext.GuestFbWidth = Info->HorizontalResolution;
+                g_HardwareContext.GuestFbHeight = Info->VerticalResolution;
+                g_HardwareContext.GuestFbPitch = Info->HorizontalResolution * 4;
+                ZeroMem(g_HardwareContext.GuestFbHost, FbSize);
+                Print(L"Graphics: guest framebuffer at guest 0x%x (host 0x%x, %d bytes)\n",
+                      g_HardwareContext.GuestFbBase,
+                      g_HardwareContext.GuestFbHost,
+                      FbSize);
+            }
+        }
+
         // Make the wiring visible: draw a pattern on the real framebuffer.
         GraphicsFillFramebuffer(0x00, 0x40, 0xFF);
 
@@ -226,19 +280,133 @@ PpcInitializeAudio (
     VOID
     )
 {
-    Print(L"Initializing audio subsystem\n");
-    
-    // In a real implementation:
-    // 1. Set up audio drivers
-    // 2. Configure audio hardware
-    // 3. Allocate audio buffers
-    // 4. Initialize audio interface
-    
+    Print(L"Initializing audio subsystem (emulated PCM ring buffer in guest RAM)\n");
+
+    // UEFI has no standard audio output protocol, so the "device" is a fixed
+    // ring buffer inside guest RAM that guest code fills with big-endian
+    // 16-bit stereo PCM samples.
+    VOID*  GuestHost   = NULL;
+    UINT64 GuestBase   = 0;
+    UINT64 GuestSize   = 0;
+    EFI_STATUS Status = PpcGetGuestMemoryRegion(&GuestHost, &GuestBase, &GuestSize);
+    if (EFI_ERROR(Status) || GuestHost == NULL) {
+        Print(L"Audio subsystem: guest RAM unavailable, falling back to pool buffer\n");
+        Status = BS->AllocatePool(EfiBootServicesData, PPC_AUDIO_BUFFER_SIZE,
+                                  (VOID**)&g_AudioInfo.HostBuffer);
+        if (EFI_ERROR(Status)) {
+            return Status;
+        }
+        g_AudioInfo.GuestBase = 0;
+    } else {
+        if ((UINT64)(PPC_AUDIO_BUFFER_GUEST_BASE - (UINT32)GuestBase) + PPC_AUDIO_BUFFER_SIZE > GuestSize) {
+            Print(L"Audio subsystem: guest RAM too small\n");
+            return EFI_NOT_READY;
+        }
+        g_AudioInfo.GuestBase = PPC_AUDIO_BUFFER_GUEST_BASE;
+        g_AudioInfo.HostBuffer = (UINT8*)GuestHost +
+                                 (PPC_AUDIO_BUFFER_GUEST_BASE - (UINT32)GuestBase);
+    }
+
+    g_AudioInfo.Size = PPC_AUDIO_BUFFER_SIZE;
+    g_AudioInfo.SampleRate = PPC_AUDIO_SAMPLE_RATE;
+    g_AudioInfo.Channels = PPC_AUDIO_CHANNELS;
+    g_AudioInfo.BitsPerSample = PPC_AUDIO_BITS_PER_SAMPLE;
+    g_AudioInfo.WriteCursor = 0;
+    g_AudioInfo.PlayCursor = 0;
+    ZeroMem(g_AudioInfo.HostBuffer, g_AudioInfo.Size);
+
     g_HardwareContext.AudioEnabled = 1;
     g_HardwareContext.AudioInitialized = TRUE;
-    
-    Print(L"Audio subsystem initialized\n");
-    
+    g_AudioInited = TRUE;
+
+    Print(L"Audio subsystem initialized: guest 0x%x (host 0x%x, %d bytes, %d Hz, %d ch)\n",
+          g_AudioInfo.GuestBase, g_AudioInfo.HostBuffer,
+          g_AudioInfo.Size, g_AudioInfo.SampleRate, g_AudioInfo.Channels);
+
+    return EFI_SUCCESS;
+}
+
+EFI_STATUS
+PpcAudioGetBufferInfo (
+    OUT PPC_AUDIO_INFO* Info
+    )
+{
+    if (Info == NULL) {
+        return EFI_INVALID_PARAMETER;
+    }
+    if (!g_AudioInited) {
+        return EFI_NOT_READY;
+    }
+    CopyMem(Info, &g_AudioInfo, sizeof(PPC_AUDIO_INFO));
+    return EFI_SUCCESS;
+}
+
+EFI_STATUS
+PpcAudioWriteSample (
+    IN UINT32 SampleIndex,
+    IN UINT16 Value
+    )
+{
+    if (!g_AudioInited || g_AudioInfo.HostBuffer == NULL) {
+        return EFI_NOT_READY;
+    }
+    if ((UINT64)SampleIndex * 2 + 2 > g_AudioInfo.Size) {
+        return EFI_OUT_OF_RESOURCES;
+    }
+    UINT16 Be = (UINT16)(((Value & 0xFF) << 8) | (Value >> 8));
+    CopyMem((UINT8*)g_AudioInfo.HostBuffer + (UINT64)SampleIndex * 2, &Be, 2);
+    if (g_AudioInfo.WriteCursor < (UINT64)SampleIndex + 1) {
+        g_AudioInfo.WriteCursor = (UINT64)SampleIndex + 1;
+    }
+    return EFI_SUCCESS;
+}
+
+EFI_STATUS
+PpcAudioReadSample (
+    IN  UINT32  SampleIndex,
+    OUT UINT16* Value
+    )
+{
+    if (!g_AudioInited || g_AudioInfo.HostBuffer == NULL || Value == NULL) {
+        return EFI_NOT_READY;
+    }
+    if ((UINT64)SampleIndex * 2 + 2 > g_AudioInfo.Size) {
+        return EFI_OUT_OF_RESOURCES;
+    }
+    UINT16 Be;
+    CopyMem(&Be, (UINT8*)g_AudioInfo.HostBuffer + (UINT64)SampleIndex * 2, 2);
+    *Value = (UINT16)(((Be & 0xFF) << 8) | (Be >> 8));
+    return EFI_SUCCESS;
+}
+
+EFI_STATUS
+PpcAudioAdvancePlayback (
+    IN UINT32 SampleCount
+    )
+{
+    if (!g_AudioInited) {
+        return EFI_NOT_READY;
+    }
+    if (g_AudioInfo.PlayCursor + SampleCount > g_AudioInfo.Size / 2) {
+        return EFI_OUT_OF_RESOURCES;
+    }
+    g_AudioInfo.PlayCursor += SampleCount;
+    return EFI_SUCCESS;
+}
+
+EFI_STATUS
+PpcAudioReset (
+    VOID
+    )
+{
+    if (!g_AudioInited) {
+        return EFI_NOT_READY;
+    }
+    if (g_AudioInfo.HostBuffer != NULL) {
+        ZeroMem(g_AudioInfo.HostBuffer, g_AudioInfo.Size);
+    }
+    g_AudioInfo.WriteCursor = 0;
+    g_AudioInfo.PlayCursor = 0;
     return EFI_SUCCESS;
 }
 
@@ -330,21 +498,300 @@ PpcInitializeNetwork (
     if (InterfaceCount == 0) {
         return EFI_INVALID_PARAMETER;
     }
-    
-    Print(L"Initializing %d network interfaces\n", InterfaceCount);
-    
-    // In a real implementation:
-    // 1. Set up network drivers
-    // 2. Configure network interfaces
-    // 3. Initialize protocol stacks
-    // 4. Set up network communication
-    
-    g_HardwareContext.NetworkInterfaces = InterfaceCount;
+
+    Print(L"Initializing network interfaces (locating Simple Network Protocol)\n");
+
+    // Enumerate every real UEFI Simple Network Protocol instance.
+    EFI_HANDLE* Handles = NULL;
+    UINTN       Count   = 0;
+    EFI_STATUS  Status  = BS->LocateHandleBuffer(
+        ByProtocol,
+        &SimpleNetworkProtocol,
+        NULL,
+        &Count,
+        &Handles
+    );
+
+    if (EFI_ERROR(Status)) {
+        if (Status == EFI_NOT_FOUND) {
+            Print(L"No network interfaces found\n");
+            return EFI_NOT_FOUND;
+        }
+        Print(L"Failed to locate network interfaces: %r\n", Status);
+        return Status;
+    }
+
+    ZeroMem(&g_NetworkInfo, sizeof(g_NetworkInfo));
+    ZeroMem(g_SnpIfaces, sizeof(g_SnpIfaces));
+    g_SnpIfaceCount = 0;
+
+    for (UINTN i = 0; i < Count; i++) {
+        if (g_SnpIfaceCount >= PPC_MAX_NETWORK_INTERFACES) {
+            break;
+        }
+
+        EFI_SIMPLE_NETWORK_PROTOCOL* Snp = NULL;
+        Status = BS->HandleProtocol(Handles[i], &SimpleNetworkProtocol, (VOID**)&Snp);
+        if (EFI_ERROR(Status) || Snp == NULL) {
+            continue;
+        }
+
+        // Bring the adapter up with real SNP Start/Initialize calls.
+        Status = Snp->Start(Snp);
+        if (EFI_ERROR(Status)) {
+            Print(L"  Interface %d: Start failed %r\n", i, Status);
+            continue;
+        }
+        Status = Snp->Initialize(Snp, 0, 0);
+        if (EFI_ERROR(Status)) {
+            Print(L"  Interface %d: Initialize failed %r\n", i, Status);
+            continue;
+        }
+
+        // Restore the standard receive filter so ordinary traffic is visible.
+        if (Snp->Mode->ReceiveFilterMask != 0) {
+            Snp->ReceiveFilters(Snp,
+                                EFI_SIMPLE_NETWORK_RECEIVE_UNICAST |
+                                EFI_SIMPLE_NETWORK_RECEIVE_MULTICAST |
+                                EFI_SIMPLE_NETWORK_RECEIVE_BROADCAST,
+                                0, FALSE, 0, NULL);
+        }
+
+        // Record the initialized interface and snapshot its real mode info.
+        UINTN Slot = g_SnpIfaceCount;
+        g_SnpIfaces[Slot].Snp = Snp;
+        g_SnpIfaces[Slot].Inited = TRUE;
+        g_SnpIfaceCount++;
+
+        EFI_SIMPLE_NETWORK_MODE* Mode = Snp->Mode;
+        PPC_NETWORK_IFACE_INFO* Iface = &g_NetworkInfo.Interfaces[Slot];
+        CopyMem(Iface->MacAddress, Mode->CurrentAddress.Addr,
+                sizeof(Iface->MacAddress));
+        Iface->MediaPresent = (Mode->MediaPresentSupported) ? Mode->MediaPresent : TRUE;
+
+        Print(L"  Interface %d: MAC %02x:%02x:%02x:%02x:%02x:%02x, media %s, "
+              L"iftype %d, maxpkt %d, hdrsize %d, hwaddr %d, state %d\n",
+              (UINTN)i,
+              Iface->MacAddress[0], Iface->MacAddress[1],
+              Iface->MacAddress[2], Iface->MacAddress[3],
+              Iface->MacAddress[4], Iface->MacAddress[5],
+              Iface->MediaPresent ? L"present" : L"absent",
+              Mode->IfType, Mode->MaxPacketSize,
+              Mode->MediaHeaderSize, Mode->HwAddressSize, Mode->State);
+
+        // Transmit a real test frame (64-byte ARP-style probe, broadcast).
+        UINT8 Frame[64];
+        ZeroMem(Frame, sizeof(Frame));
+        for (UINTN b = 0; b < 6; b++) {
+            Frame[b] = 0xFF;                       // broadcast dest
+            Frame[6 + b] = Iface->MacAddress[b];   // our source
+        }
+        Frame[12] = 0x08;                          // ethertype
+        Frame[13] = 0x06;                          // 0x0806 = ARP
+        Frame[14] = 0x00;                          // ARP htype
+        Frame[15] = 0x01;
+        Frame[16] = 0x08;                          // ARP ptype = IP
+        Frame[17] = 0x00;
+        Frame[18] = 0x06;                          // hlen, plen
+        Frame[19] = 0x04;
+        Frame[20] = 0x00;                          // op = request
+        Frame[21] = 0x01;
+
+        // The frame already contains a complete MAC header (dest/src/ethertype),
+        // so call Transmit with HeaderSize == 0 (the driver takes the header
+        // straight from the buffer).
+        Status = Snp->Transmit(Snp, 0, sizeof(Frame), Frame, NULL, NULL, NULL);
+        Iface->TransmitTestPassed = (Status == EFI_SUCCESS);
+        if (Status != EFI_SUCCESS) {
+            Print(L"  Interface %d: transmit returned %r\n", (UINTN)i, Status);
+        }
+
+        // Poll GetStatus briefly to observe the transmit completion.
+        for (UINTN Poll = 0; Poll < 3; Poll++) {
+            UINT32 IrqStatus = 0;
+            VOID*   TxBuf    = NULL;
+            EFI_STATUS GetStatus = Snp->GetStatus(Snp, &IrqStatus, &TxBuf);
+            if (GetStatus == EFI_SUCCESS) {
+                break;
+            }
+        }
+
+        Print(L"  Interface %d: transmit test %s\n",
+              (UINTN)i,
+              Iface->TransmitTestPassed ? L"PASS" : L"FAIL");
+    }
+
+    FreePool(Handles);
+
+    if (g_SnpIfaceCount == 0) {
+        g_HardwareContext.NetworkInterfaces = 0;
+        g_HardwareContext.NetworkInitialized = FALSE;
+        return EFI_NOT_FOUND;
+    }
+
+    // Primary interface = first initialized interface (compat snapshot).
+    g_Snp = g_SnpIfaces[0].Snp;
+    g_NetworkInfo.InterfaceCount = g_SnpIfaceCount;
+    g_NetworkInfo.MediaPresent = g_NetworkInfo.Interfaces[0].MediaPresent;
+    g_NetworkInfo.TransmitTestPassed = g_NetworkInfo.Interfaces[0].TransmitTestPassed;
+    CopyMem(g_NetworkInfo.MacAddress, g_NetworkInfo.Interfaces[0].MacAddress,
+            sizeof(g_NetworkInfo.MacAddress));
+    EFI_SIMPLE_NETWORK_MODE* Mode = g_Snp->Mode;
+    g_NetworkInfo.MaxPacketSize = Mode->MaxPacketSize;
+    g_NetworkInfo.IfType = Mode->IfType;
+    g_NetworkInfo.HwAddressSize = Mode->HwAddressSize;
+    g_NetworkInfo.MediaHeaderSize = Mode->MediaHeaderSize;
+    g_NetworkInfo.State = Mode->State;
+
+    g_HardwareContext.NetworkInterfaces = (UINT32)g_SnpIfaceCount;
     g_HardwareContext.NetworkInitialized = TRUE;
-    
-    Print(L"Network subsystem initialized with %d interfaces\n", InterfaceCount);
-    
+    g_NetworkInited = TRUE;
+
+    Print(L"Network subsystem initialized with %d interface(s)\n",
+          g_SnpIfaceCount);
+
     return EFI_SUCCESS;
+}
+
+EFI_STATUS
+PpcGetNetworkInfo (
+    OUT PPC_NETWORK_INFO* Info
+    )
+{
+    if (Info == NULL) {
+        return EFI_INVALID_PARAMETER;
+    }
+    if (!g_NetworkInited || g_Snp == NULL) {
+        return EFI_NOT_READY;
+    }
+    CopyMem(Info, &g_NetworkInfo, sizeof(PPC_NETWORK_INFO));
+    return EFI_SUCCESS;
+}
+
+EFI_STATUS
+PpcInitializeBlockIo (
+    IN UINT32 DeviceCount
+    )
+{
+    if (DeviceCount == 0) {
+        return EFI_INVALID_PARAMETER;
+    }
+
+    Print(L"Initializing block devices (locating Block I/O protocols)\n");
+
+    EFI_HANDLE* Handles = NULL;
+    UINTN       Count   = 0;
+    EFI_STATUS  Status  = BS->LocateHandleBuffer(
+        ByProtocol,
+        &BlockIoProtocol,
+        NULL,
+        &Count,
+        &Handles
+    );
+
+    if (EFI_ERROR(Status)) {
+        if (Status == EFI_NOT_FOUND) {
+            Print(L"No block devices found\n");
+            return EFI_NOT_FOUND;
+        }
+        Print(L"Failed to locate block devices: %r\n", Status);
+        return Status;
+    }
+
+    if (g_BlockDevices != NULL) {
+        FreePool(g_BlockDevices);
+        g_BlockDevices = NULL;
+    }
+    g_BlockDeviceCount = 0;
+    ZeroMem(&g_BlockIoInfo, sizeof(g_BlockIoInfo));
+
+    g_BlockDevices = AllocatePool(Count * sizeof(EFI_BLOCK_IO_PROTOCOL*));
+    if (g_BlockDevices == NULL) {
+        FreePool(Handles);
+        return EFI_OUT_OF_RESOURCES;
+    }
+
+    for (UINTN i = 0; i < Count; i++) {
+        EFI_BLOCK_IO_PROTOCOL* Bio = NULL;
+        Status = BS->HandleProtocol(Handles[i], &BlockIoProtocol, (VOID**)&Bio);
+        if (EFI_ERROR(Status) || Bio == NULL || Bio->Media == NULL) {
+            continue;
+        }
+        if (!Bio->Media->MediaPresent) {
+            continue;
+        }
+        g_BlockDevices[g_BlockDeviceCount++] = Bio;
+    }
+
+    FreePool(Handles);
+
+    if (g_BlockDeviceCount == 0) {
+        Print(L"Block I/O subsystem initialized with 0 usable devices\n");
+        g_HardwareContext.StorageDevices = 0;
+        return EFI_NOT_FOUND;
+    }
+
+    g_BlockIoInfo.DeviceCount = g_BlockDeviceCount;
+
+    // Default to the first usable device for info reporting.
+    g_BlockIoInfo.SelectedIndex = 0;
+    g_BlockIoInfo.MediaId = g_BlockDevices[0]->Media->MediaId;
+    g_BlockIoInfo.BlockSize = g_BlockDevices[0]->Media->BlockSize;
+    g_BlockIoInfo.LastBlock = g_BlockDevices[0]->Media->LastBlock;
+    g_BlockIoInfo.ReadOnly = g_BlockDevices[0]->Media->ReadOnly;
+    g_BlockIoInfo.Removable = g_BlockDevices[0]->Media->RemovableMedia;
+
+    Print(L"Block I/O subsystem initialized with %d usable device(s)\n",
+          g_BlockDeviceCount);
+
+    for (UINTN i = 0; i < g_BlockDeviceCount; i++) {
+        EFI_BLOCK_IO_MEDIA* M = g_BlockDevices[i]->Media;
+        Print(L"  Device %d: %d bytes/block, %d blocks, %s%s\n",
+              (UINTN)i, M->BlockSize, (UINT64)M->LastBlock + 1,
+              M->RemovableMedia ? L"removable, " : L"",
+              M->ReadOnly ? L"read-only" : L"writable");
+    }
+
+    g_HardwareContext.StorageDevices = (UINT32)g_BlockDeviceCount;
+    g_HardwareContext.StorageInitialized = TRUE;
+
+    return EFI_SUCCESS;
+}
+
+EFI_STATUS
+PpcGetBlockIoInfo (
+    OUT PPC_BLOCK_IO_INFO* Info
+    )
+{
+    if (Info == NULL) {
+        return EFI_INVALID_PARAMETER;
+    }
+    if (g_BlockDeviceCount == 0 || g_BlockDevices == NULL) {
+        return EFI_NOT_READY;
+    }
+    CopyMem(Info, &g_BlockIoInfo, sizeof(PPC_BLOCK_IO_INFO));
+    return EFI_SUCCESS;
+}
+
+EFI_STATUS
+PpcReadDiskBlock (
+    IN  UINTN   Index,
+    IN  EFI_LBA Lba,
+    IN  UINTN   BufferSize,
+    OUT VOID*   Buffer
+    )
+{
+    if (Buffer == NULL) {
+        return EFI_INVALID_PARAMETER;
+    }
+    if (Index >= g_BlockDeviceCount || g_BlockDevices == NULL) {
+        return EFI_INVALID_PARAMETER;
+    }
+
+    EFI_BLOCK_IO_PROTOCOL* Bio = g_BlockDevices[Index];
+    UINT32 MediaId = Bio->Media->MediaId;
+
+    return Bio->ReadBlocks(Bio, MediaId, Lba, BufferSize, Buffer);
 }
 
 EFI_STATUS
@@ -557,5 +1004,179 @@ PpcUpdateVideoDisplay (
     // 2. Handle hardware-specific display updates
     // 3. Synchronize with refresh rate
     
+    return EFI_SUCCESS;
+}
+
+EFI_STATUS
+PpcGetFrameBufferInfo (
+    OUT PPC_FRAMEBUFFER_INFO* Info
+    )
+{
+    if (Info == NULL) {
+        return EFI_INVALID_PARAMETER;
+    }
+    if (!g_HardwareContext.GraphicsInitialized || g_Gop == NULL) {
+        return EFI_NOT_READY;
+    }
+
+    Info->Width           = g_HardwareContext.GuestFbWidth;
+    Info->Height          = g_HardwareContext.GuestFbHeight;
+    Info->Pitch           = g_HardwareContext.GuestFbPitch;
+    Info->BitsPerPixel    = 32;
+    Info->GuestBase       = g_HardwareContext.GuestFbBase;
+    Info->HostBuffer      = g_HardwareContext.GuestFbHost;
+    Info->HostBufferSize  = g_HardwareContext.GuestFbSize;
+    Info->GopFrameBuffer  = g_Gop->Mode->FrameBufferBase;
+    Info->GopPitch        = g_FramebufferPitch;
+    Info->PixelFormat     = g_PixelFormat;
+    return EFI_SUCCESS;
+}
+
+/**
+  Read a pixel from the guest framebuffer (big-endian 0xRRGGBB00).
+  Unmapped or out-of-bounds reads return zero.
+**/
+STATIC
+UINT32
+FrameBufferReadPixel (
+    IN UINT32 X,
+    IN UINT32 Y
+    )
+{
+    if (g_HardwareContext.GuestFbHost == NULL ||
+        X >= g_HardwareContext.GuestFbWidth ||
+        Y >= g_HardwareContext.GuestFbHeight) {
+        return 0;
+    }
+
+    UINT8* Pixel = (UINT8*)g_HardwareContext.GuestFbHost +
+                   (UINT64)Y * g_HardwareContext.GuestFbPitch +
+                   (UINT64)X * 4;
+    return ((UINT32)Pixel[0] << 24) |
+           ((UINT32)Pixel[1] << 16) |
+           ((UINT32)Pixel[2] << 8)  |
+           ((UINT32)Pixel[3]);
+}
+
+/**
+  Write a pixel to the guest framebuffer in big-endian 0xRRGGBB00 layout.
+  Out-of-bounds writes are dropped.
+**/
+STATIC
+VOID
+FrameBufferWritePixel (
+    IN UINT32 X,
+    IN UINT32 Y,
+    IN UINT32 Color
+    )
+{
+    if (g_HardwareContext.GuestFbHost == NULL ||
+        X >= g_HardwareContext.GuestFbWidth ||
+        Y >= g_HardwareContext.GuestFbHeight) {
+        return;
+    }
+
+    UINT8* Pixel = (UINT8*)g_HardwareContext.GuestFbHost +
+                   (UINT64)Y * g_HardwareContext.GuestFbPitch +
+                   (UINT64)X * 4;
+    Pixel[0] = (UINT8)(Color >> 24);
+    Pixel[1] = (UINT8)(Color >> 16);
+    Pixel[2] = (UINT8)(Color >> 8);
+    Pixel[3] = (UINT8)Color;
+}
+
+EFI_STATUS
+PpcGraphicsBlitToDisplay (
+    VOID
+    )
+{
+    if (!g_HardwareContext.GraphicsInitialized ||
+        g_Gop == NULL ||
+        g_HardwareContext.GuestFbHost == NULL) {
+        return EFI_NOT_READY;
+    }
+
+    UINT32* Dest = (UINT32*)(UINTN)g_Gop->Mode->FrameBufferBase;
+    UINTN   DestPitch = g_FramebufferPitch / 4;
+    UINTN   W = g_HardwareContext.GuestFbWidth;
+    UINTN   H = g_HardwareContext.GuestFbHeight;
+
+    BOOLEAN Bgr = (g_PixelFormat == PixelBlueGreenRedReserved8BitPerColor);
+
+    UINTN Y;
+    for (Y = 0; Y < H; Y++) {
+        UINT32* Row = Dest + Y * DestPitch;
+        UINTN X;
+        for (X = 0; X < W; X++) {
+            UINT32 GuestColor = FrameBufferReadPixel((UINT32)X, (UINT32)Y);
+            UINT8 R = (UINT8)(GuestColor >> 24);
+            UINT8 G = (UINT8)(GuestColor >> 16);
+            UINT8 B = (UINT8)(GuestColor >> 8);
+            UINT32 HostColor;
+            if (Bgr) {
+                // BGR layout: byte0=Blue, byte1=Green, byte2=Red, byte3=reserved.
+                HostColor = ((UINT32)B) | ((UINT32)G << 8) | ((UINT32)R << 16);
+            } else {
+                // RGB layout: byte0=Red, byte1=Green, byte2=Blue, byte3=reserved.
+                HostColor = ((UINT32)R) | ((UINT32)G << 8) | ((UINT32)B << 16);
+            }
+            Row[X] = HostColor;
+        }
+    }
+
+    return EFI_SUCCESS;
+}
+
+EFI_STATUS
+PpcGraphicsClear (
+    IN UINT32 Color
+    )
+{
+    if (!g_HardwareContext.GraphicsInitialized || g_HardwareContext.GuestFbHost == NULL) {
+        return EFI_NOT_READY;
+    }
+
+    UINTN X, Y;
+    for (Y = 0; Y < g_HardwareContext.GuestFbHeight; Y++) {
+        for (X = 0; X < g_HardwareContext.GuestFbWidth; X++) {
+            FrameBufferWritePixel((UINT32)X, (UINT32)Y, Color);
+        }
+    }
+    return EFI_SUCCESS;
+}
+
+EFI_STATUS
+PpcGraphicsSetPixel (
+    IN UINT32 X,
+    IN UINT32 Y,
+    IN UINT32 Color
+    )
+{
+    if (!g_HardwareContext.GraphicsInitialized || g_HardwareContext.GuestFbHost == NULL) {
+        return EFI_NOT_READY;
+    }
+    FrameBufferWritePixel(X, Y, Color);
+    return EFI_SUCCESS;
+}
+
+EFI_STATUS
+PpcGraphicsDrawRect (
+    IN UINT32 X,
+    IN UINT32 Y,
+    IN UINT32 Width,
+    IN UINT32 Height,
+    IN UINT32 Color
+    )
+{
+    if (!g_HardwareContext.GraphicsInitialized || g_HardwareContext.GuestFbHost == NULL) {
+        return EFI_NOT_READY;
+    }
+
+    UINT32 Rx, Ry;
+    for (Ry = Y; Ry < Y + Height; Ry++) {
+        for (Rx = X; Rx < X + Width; Rx++) {
+            FrameBufferWritePixel(Rx, Ry, Color);
+        }
+    }
     return EFI_SUCCESS;
 }

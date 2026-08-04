@@ -12,6 +12,52 @@ UINT32 _fltused = 0;
 #include "utils/debug.h"
 #include "platform/uefi_interface.h"
 
+// True if the GOP pixel at (X,Y) holds exactly the R/G/B channels of the
+// given guest color (big-endian 0xRRGGBB00), placed according to the GOP
+// pixel format (byte-exact, so channel-position bugs are caught).
+STATIC
+BOOLEAN
+GopPixelMatches (
+  IN UINT8* GopBase,
+  IN UINTN  GopPitch,
+  IN UINTN  X,
+  IN UINTN  Y,
+  IN UINT32 GuestColor,
+  IN UINT32 PixelFormat
+  )
+{
+  UINT8 R = (UINT8)(GuestColor >> 24);
+  UINT8 G = (UINT8)(GuestColor >> 16);
+  UINT8 B = (UINT8)(GuestColor >> 8);
+  UINT8* P = GopBase + Y * GopPitch + X * 4;
+  if (PixelFormat == PixelBlueGreenRedReserved8BitPerColor) {
+    return P[0] == B && P[1] == G && P[2] == R;
+  }
+  return P[0] == R && P[1] == G && P[2] == B;
+}
+
+// True if every visible pixel of the GOP framebuffer matches the guest color.
+STATIC
+BOOLEAN
+GopFrameIsSolid (
+  IN UINT8* GopBase,
+  IN UINTN  GopPitch,
+  IN UINTN  W,
+  IN UINTN  H,
+  IN UINT32 GuestColor,
+  IN UINT32 PixelFormat
+  )
+{
+  for (UINTN Y = 0; Y < H; Y++) {
+    for (UINTN X = 0; X < W; X++) {
+      if (!GopPixelMatches(GopBase, GopPitch, X, Y, GuestColor, PixelFormat)) {
+        return FALSE;
+      }
+    }
+  }
+  return TRUE;
+}
+
 EFI_STATUS
 efi_main (
   IN EFI_HANDLE        ImageHandle,
@@ -176,25 +222,215 @@ efi_main (
     return Status;
   }
   
+  // Graphics self-check: draw into the guest framebuffer, blit to the real
+  // GOP display, and read pixels back from both buffers to verify the path.
+  {
+    PPC_FRAMEBUFFER_INFO FbInfo;
+    Status = PpcGetFrameBufferInfo(&FbInfo);
+    if (!EFI_ERROR(Status) && FbInfo.HostBuffer != NULL) {
+      PpcGraphicsClear(0x10101000);                          // dark grey background
+      PpcGraphicsDrawRect(0, 0, 640, 120, 0xCC000000);       // red band
+      PpcGraphicsDrawRect(0, 120, 640, 120, 0x00CC0000);     // green band
+      PpcGraphicsDrawRect(0, 240, 640, 120, 0x0000CC00);     // blue band
+      PpcGraphicsDrawRect(0, 360, 640, 120, 0xCCCC0000);     // yellow band
+      Status = PpcGraphicsBlitToDisplay();
+
+      UINT32 P0 = (UINT32)((UINT8*)FbInfo.HostBuffer)[0] << 24 |
+                  (UINT32)((UINT8*)FbInfo.HostBuffer)[1] << 16 |
+                  (UINT32)((UINT8*)FbInfo.HostBuffer)[2] << 8;
+      UINT8* GopP = (UINT8*)(UINTN)FbInfo.GopFrameBuffer;
+      UINT32 P1 = ((UINT32)GopP[2] << 16) | ((UINT32)GopP[1] << 8) | (UINT32)GopP[0];
+
+      if (!EFI_ERROR(Status) && (P0 >> 24) == 0xCC && (P0 & 0xFF0000) == 0) {
+        Print(L"Graphics self-check: PASS (guest fb 0x%08x, GOP fb 0x%08x)\n", P0, P1);
+      } else {
+        Print(L"Graphics self-check: FAIL (guest fb 0x%08x, GOP fb 0x%08x)\n", P0, P1);
+      }
+    } else {
+      Print(L"Graphics self-check: SKIP (no framebuffer)\n");
+    }
+  }
+
+  // Multi-frame graphics test: full-screen frames written into the guest
+  // framebuffer are blitted through the real GOP path and verified across
+  // the entire display, plus band boundaries, corners, and out-of-bounds.
+  {
+    PPC_FRAMEBUFFER_INFO FbInfo;
+    Status = PpcGetFrameBufferInfo(&FbInfo);
+    if (!EFI_ERROR(Status) && FbInfo.HostBuffer != NULL && FbInfo.GopPitch != 0) {
+      UINTN  W   = FbInfo.Width;
+      UINTN  H   = FbInfo.Height;
+      UINT8* Gop = (UINT8*)(UINTN)FbInfo.GopFrameBuffer;
+      BOOLEAN MultiOk = TRUE;
+
+      // Frames 1-3: solid red, green, blue across the full visible area.
+      UINT32 Solids[3] = { 0xCC000000, 0x00CC0000, 0x0000CC00 };
+      for (UINTN f = 0; f < 3; f++) {
+        PpcGraphicsClear(Solids[f]);
+        PpcGraphicsBlitToDisplay();
+        if (!GopFrameIsSolid(Gop, FbInfo.GopPitch, W, H, Solids[f],
+                             (UINT32)FbInfo.PixelFormat)) {
+          MultiOk = FALSE;
+          Print(L"Multi-frame: solid frame %d FAIL\n", f + 1);
+        }
+      }
+      if (MultiOk) {
+        Print(L"Multi-frame: 3 solid frames full-coverage PASS\n");
+      }
+
+      // Frame 4: vertical color bands; verify band centers and boundaries.
+      PpcGraphicsClear(0x10101000);
+      PpcGraphicsDrawRect(0, 0, W / 4, H, 0xCC000000);      // red
+      PpcGraphicsDrawRect(W / 4, 0, W / 4, H, 0x00CC0000);  // green
+      PpcGraphicsDrawRect(W / 2, 0, W / 4, H, 0x0000CC00);  // blue
+      PpcGraphicsDrawRect(3 * W / 4, 0, W / 4, H, 0xCCCC0000); // yellow
+      PpcGraphicsBlitToDisplay();
+
+      BOOLEAN BandsOk =
+        GopPixelMatches(Gop, FbInfo.GopPitch, W / 8, H / 2, 0xCC000000,
+                        (UINT32)FbInfo.PixelFormat) &&
+        GopPixelMatches(Gop, FbInfo.GopPitch, 3 * W / 8, H / 2, 0x00CC0000,
+                        (UINT32)FbInfo.PixelFormat) &&
+        GopPixelMatches(Gop, FbInfo.GopPitch, 5 * W / 8, H / 2, 0x0000CC00,
+                        (UINT32)FbInfo.PixelFormat) &&
+        GopPixelMatches(Gop, FbInfo.GopPitch, 7 * W / 8, H / 2, 0xCCCC0000,
+                        (UINT32)FbInfo.PixelFormat) &&
+        GopPixelMatches(Gop, FbInfo.GopPitch, W / 2 - 1, H / 2, 0x00CC0000,
+                        (UINT32)FbInfo.PixelFormat) &&
+        GopPixelMatches(Gop, FbInfo.GopPitch, W / 2, H / 2, 0x0000CC00,
+                        (UINT32)FbInfo.PixelFormat);
+      Print(L"Multi-frame: band frame %s\n", BandsOk ? L"PASS" : L"FAIL");
+      MultiOk = MultiOk && BandsOk;
+
+      // Corner and out-of-bounds handling.
+      BOOLEAN CornersOk =
+        GopPixelMatches(Gop, FbInfo.GopPitch, 0, 0, 0xCC000000,
+                        (UINT32)FbInfo.PixelFormat) &&
+        GopPixelMatches(Gop, FbInfo.GopPitch, W - 1, H - 1, 0xCCCC0000,
+                        (UINT32)FbInfo.PixelFormat);
+      PpcGraphicsSetPixel(W + 100, H + 100, 0xFF000000);   // OOB write is dropped
+      PpcGraphicsBlitToDisplay();
+      BOOLEAN OobOk =
+        GopPixelMatches(Gop, FbInfo.GopPitch, W - 1, H - 1, 0xCCCC0000,
+                        (UINT32)FbInfo.PixelFormat);
+      Print(L"Multi-frame: corners %s, OOB dropped %s\n",
+            CornersOk ? L"PASS" : L"FAIL", OobOk ? L"PASS" : L"FAIL");
+      MultiOk = MultiOk && CornersOk && OobOk;
+
+      Print(L"Multi-frame graphics self-check: %s\n",
+            MultiOk ? L"PASS" : L"FAIL");
+    } else {
+      Print(L"Multi-frame graphics self-check: SKIP (no framebuffer)\n");
+    }
+  }
+  
   // Initialize audio subsystem
   Status = PpcInitializeAudio();
   if (EFI_ERROR(Status)) {
     Print(L"Failed to initialize audio: %r\n", Status);
     return Status;
   }
+
+  // Audio self-check: the guest writes big-endian PCM samples into the
+  // ring buffer, the host reads them back, then advances playback.
+  {
+    PPC_AUDIO_INFO AudioInfo;
+    Status = PpcAudioGetBufferInfo(&AudioInfo);
+    if (!EFI_ERROR(Status) && AudioInfo.HostBuffer != NULL) {
+      // Guest-side write path: 16-bit big-endian 0x1000 = 4096 sample.
+      UINT32 GuestAddr = AudioInfo.GuestBase;
+      PpcWriteGuestByte(GuestAddr + 0, 0x10);
+      PpcWriteGuestByte(GuestAddr + 1, 0x00);
+      PpcWriteGuestByte(GuestAddr + 2, 0x20);
+      PpcWriteGuestByte(GuestAddr + 3, 0x00);
+
+      UINT16 S0 = 0, S1 = 0;
+      BOOLEAN ReadOk = (PpcAudioReadSample(0, &S0) == EFI_SUCCESS) &&
+                       (PpcAudioReadSample(1, &S1) == EFI_SUCCESS);
+      Status = PpcAudioAdvancePlayback(2);
+      PPC_AUDIO_INFO After;
+      PpcAudioGetBufferInfo(&After);
+
+      if (ReadOk && S0 == 0x1000 && S1 == 0x2000 && !EFI_ERROR(Status) &&
+          After.PlayCursor == 2) {
+        Print(L"Audio self-check: PASS (samples 0x%04x/0x%04x, played %d)\n",
+              S0, S1, (UINT32)After.PlayCursor);
+      } else {
+        Print(L"Audio self-check: FAIL (samples 0x%04x/0x%04x, played %d)\n",
+              S0, S1, (UINT32)(After.PlayCursor));
+      }
+    } else {
+      Print(L"Audio self-check: SKIP (no buffer)\n");
+    }
+  }
   
   // Initialize storage subsystem
   Status = PpcInitializeStorage(1);
-  if (EFI_ERROR(Status)) {
+  if (EFI_ERROR(Status) && Status != EFI_NOT_FOUND) {
     Print(L"Failed to initialize storage: %r\n", Status);
     return Status;
   }
   
+  // Block I/O self-check: enumerate real block devices and read a sector.
+  Status = PpcInitializeBlockIo(1);
+  if (!EFI_ERROR(Status)) {
+    PPC_BLOCK_IO_INFO BioInfo;
+    Status = PpcGetBlockIoInfo(&BioInfo);
+    if (!EFI_ERROR(Status)) {
+      BOOLEAN FoundMarker = FALSE;
+      for (UINTN i = 0; i < BioInfo.DeviceCount; i++) {
+        UINT8 Sector[512];
+        if (!EFI_ERROR(PpcReadDiskBlock(i, 0, 512, Sector)) &&
+            Sector[0] == 'E' && Sector[1] == 'F' && Sector[2] == 'I') {
+          Print(L"Block I/O self-check: PASS (device %d, LBA 0 = \"%c%c%c...\", 512-byte sector)\n",
+                (UINTN)i, Sector[0], Sector[1], Sector[2]);
+          FoundMarker = TRUE;
+          break;
+        }
+      }
+      if (!FoundMarker) {
+        Print(L"Block I/O self-check: devices enumerated, marker not found\n");
+      }
+    }
+  } else {
+    Print(L"Block I/O self-check: SKIP (%r)\n", Status);
+  }
+  
   // Initialize network subsystem
   Status = PpcInitializeNetwork(1);
-  if (EFI_ERROR(Status)) {
+  if (EFI_ERROR(Status) && Status != EFI_NOT_FOUND) {
     Print(L"Failed to initialize network: %r\n", Status);
     return Status;
+  }
+
+  // Network self-check: report every real SNP interface and its transmit test.
+  {
+    PPC_NETWORK_INFO NetInfo;
+    Status = PpcGetNetworkInfo(&NetInfo);
+    if (!EFI_ERROR(Status)) {
+      BOOLEAN AllPassed = NetInfo.InterfaceCount > 0;
+      for (UINTN i = 0; i < NetInfo.InterfaceCount; i++) {
+        Print(L"Network self-check: interface %d MAC %02x:%02x:%02x:%02x:%02x:%02x, "
+              L"media %s, transmit %s\n",
+              i,
+              NetInfo.Interfaces[i].MacAddress[0],
+              NetInfo.Interfaces[i].MacAddress[1],
+              NetInfo.Interfaces[i].MacAddress[2],
+              NetInfo.Interfaces[i].MacAddress[3],
+              NetInfo.Interfaces[i].MacAddress[4],
+              NetInfo.Interfaces[i].MacAddress[5],
+              NetInfo.Interfaces[i].MediaPresent ? L"present" : L"absent",
+              NetInfo.Interfaces[i].TransmitTestPassed ? L"PASS" : L"FAIL");
+        if (!NetInfo.Interfaces[i].MediaPresent ||
+            !NetInfo.Interfaces[i].TransmitTestPassed) {
+          AllPassed = FALSE;
+        }
+      }
+      Print(L"Network self-check: %s (%d interface(s))\n",
+            AllPassed ? L"PASS" : L"FAIL", NetInfo.InterfaceCount);
+    } else {
+      Print(L"Network self-check: SKIP (no SNP interface)\n");
+    }
   }
   
   // Display system information

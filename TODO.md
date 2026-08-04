@@ -2,43 +2,63 @@
 
 ## Current State
 
-Phase 3 (Core Implementation) is complete. All `_impl.c` files now use real
-UEFI services with no placeholder/simulated code in the critical path.
+Phase 4 (Emulation Components) is complete and verified in a single QEMU/OVMF
+run alongside the Phase 3 work.
 
-**Interpreter + registers:** 18-check self-test all PASS (arithmetic, carry/CR,
-branches, SPRs, rlwinm, loads/stores, exception on unknown opcode).
+**Phase 3 recap:** All `_impl.c` files use real UEFI services. Interpreter passes
+an 18-check self-test. Memory manager allocates 256 MB of guest RAM via
+`AllocatePages`; a small PPC program is executed from guest RAM at boot.
+Bootloader `PpcLoadKernel` resolves the boot volume, opens
+`\System\MacOS\kernel` from the FAT volume, and reads it into guest RAM;
+`PpcVerifyKernel` bounds-checks and reads the first word; `PpcBootSystem`
+configures PC/SRR0/SRR1/MSR. Debug writes `boot.log` via real file I/O and uses
+`GetNextMonotonicCount` for timers. UEFI interface functions use real
+`HandleProtocol`/`LocateHandleBuffer`/`GetMemoryMap`.
 
-**Memory manager:** `PpcInitializeMemoryManager` allocates 256 MB of guest RAM
-via `AllocatePages` (with fallback to `AllocateAnyPages`); guest-to-host address
-translation is real and bounds-checked. A small PPC program is written into guest
-RAM, fetched, decoded, executed, and verified at boot.
+**Graphics (GOP framebuffer):** `PpcInitializeGraphics` sets a real GOP mode
+and carves a guest-visible framebuffer window out of guest RAM at guest
+0x18000000 (640x480x32). Guest code writes big-endian 0xRRGGBB00 pixels there;
+`PpcGraphicsBlitToDisplay` converts and copies the window to the real GOP
+framebuffer (byte-exact RGB and BGR pixel layouts). `PpcGetFrameBufferInfo`
+reports the window plus the GOP base/pitch/pixel format,
+`PpcGraphicsClear`/`SetPixel`/`DrawRect` provide host-side helpers. The
+self-check now includes a multi-frame test: three solid full-screen frames
+(red/green/blue) verified across every pixel of the GOP framebuffer, a
+four-band frame checked at centers and boundaries, corner pixels, and
+out-of-bounds writes. This test caught and led to a fix of a blit bug where
+channels were shifted 8 bits too high (blue landed in the reserved byte).
 
-**Hardware abstraction:** Graphics uses the real GOP protocol (real framebuffer,
-pitch/format/mode info); storage enumerates real SimpleFS volumes. Audio and
-network remain simulated stubs.
+**Networking (SNP):** `PpcInitializeNetwork` enumerates every UEFI Simple
+Network Protocol instance, calls real `Start`/`Initialize` on each, sets the
+standard receive filter, snapshots the real mode (MAC, media present, iftype,
+max packet), and transmits a real 64-byte ARP-style frame via `Transmit` with a
+`GetStatus` poll. Every initialized interface is stored in
+`PPC_NETWORK_INFO.Interfaces[]` (up to `PPC_MAX_NETWORK_INTERFACES`), so
+multi-NIC systems are fully brought up and tested. `PpcGetNetworkInfo` reports
+per-interface results.
 
-**Bootloader:** `PpcLoadKernel` resolves the boot volume via
-`HandleProtocol(LoadedImageProtocol)` on the boot device, opens
-`\System\MacOS\kernel` from the FAT volume, reads it into guest RAM with a real
-`File->Read` loop, and reports the byte count. `PpcVerifyKernel` performs a real
-bounds check against the guest RAM region and reads the first 4 bytes (big-endian)
-to confirm the data was loaded correctly. `PpcBootSystem` configures the CPU
-context (PC, SRR0/SRR1, MSR with ME+RI bits) for transfer of control.
+**Storage (Block I/O):** `PpcInitializeBlockIo` enumerates every UEFI Block I/O
+protocol instance and reports real geometry (block size, block count,
+removable/read-only flags). `PpcReadDiskBlock` performs a real `ReadBlocks`
+sector read. Self-check reads LBA 0 of every device until it finds the "EFI"
+marker. `PpcGetBlockIoInfo` reports the state.
 
-**Debug:** `PpcDebugLogToFile` writes to `boot.log` on the boot FAT volume via
-real `File->Open`/`Write`/`Close` chain. `PpcDebugStartTimer` /
-`PpcDebugStopTimer` use real UEFI `GetNextMonotonicCount`.
+**Audio (emulated device):** UEFI has no standard audio output protocol, so the
+audio "device" is a fixed ring buffer inside guest RAM at guest 0x18800000
+(8KB, 44100 Hz stereo 16-bit). Guest code fills it with big-endian PCM samples;
+the host reads them back and advances a play cursor. `PpcAudioGetBufferInfo`,
+`PpcAudioWriteSample`, `PpcAudioReadSample`, `PpcAudioAdvancePlayback`,
+`PpcAudioReset` implement the device. Self-check verifies a two-sample write via
+the guest RAM path reads back correctly and playback advances.
 
-**UEFI interface:** `PpcGetFileSystem`, `PpcLoadFile`, `PpcGetBootDevice`, and
-`PpcGetSystemInformation` are fully implemented using real UEFI protocols
-(`HandleProtocol`, `LocateHandleBuffer`, `GetMemoryMap`). All functions compile
-clean with `-Wall -Werror`.
-
-**Verified in QEMU/OVMF:** 18/18 self-test PASS; guest RAM demo PASS; real GOP
-graphics (640x480); 1 real SimpleFS volume; `boot.log` written and confirmed on
-host; kernel loaded from disk (16 bytes), verify passes (`first word 0x38600064`);
-loaded-kernel execution PASS (r5=700); `PpcBootSystem` configures CPU context.
-Build is clean with `make clean && make` (GNU-EFI + clang/lld-link on macOS).
+**Verified in QEMU/OVMF (single boot, mixed devices):** Graphics self-check
+PASS plus the full multi-frame test PASS; Audio self-check PASS; Block I/O
+self-check PASS (4 devices: FAT ESP + IDE raw disk + virtio-blk raw disk +
+partition, marker found); Network self-check PASS for **both** an e1000 NIC
+(MAC ...:56) and a virtio-net-pci NIC (MAC ...:57) simultaneously — both
+transmit PASS; plus all Phase 3 checks still PASS (18/18 self-test, guest RAM
+demo, kernel load/verify/execute, boot.log). Build is clean with
+`make clean && make` (GNU-EFI + clang/lld-link on macOS).
 
 ## Phase 1: Research and Analysis
 - [x] Analyze existing Mac emulators (SheepShaver, Basilisk II, QEMU, DingusPPC)
@@ -61,10 +81,10 @@ Build is clean with `make clean && make` (GNU-EFI + clang/lld-link on macOS).
 - [x] Remove placeholder/simulated behavior from current `_impl.c` files
 
 ## Phase 4: Emulation Components
-- [ ] Implement graphics subsystem (framebuffer via GOP)
-- [ ] Add audio handling
-- [ ] Integrate storage I/O (UEFI file protocols / block I/O)
-- [ ] Implement basic networking
+- [x] Implement graphics subsystem (framebuffer via GOP)
+- [x] Add audio handling
+- [x] Integrate storage I/O (UEFI file protocols / block I/O)
+- [x] Implement basic networking
 
 ## Phase 5: Boot Process
 - [ ] Create bootloader for Mac OS (load ROM image, set up guest memory map)
