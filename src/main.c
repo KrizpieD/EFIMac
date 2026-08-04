@@ -530,16 +530,25 @@ efi_main (
           (UINT32)LowMemAddress, (UINT64)LowMemSize);
 
     // 2. System ROM at guest 0xFFF00000. Load a real ROM image from the boot
-    //    volume if present; otherwise install a self-contained demo ROM so the
-    //    full ROM -> guest-memory-map -> execution path is still exercised.
+    //    volume if present (the classic Mac OS "Mac OS ROM" file in the
+    //    System Folder Extensions is the fallback); otherwise install a
+    //    self-contained demo ROM so the full ROM -> guest-memory-map ->
+    //    execution path is still exercised.
     BootStatus = PpcInstallSystemRom(PPC_ROM_DEFAULT_PATH, &RomAddress, &RomSize);
     if (EFI_ERROR(BootStatus) && BootStatus != EFI_ALREADY_STARTED) {
       if (BootStatus == EFI_NOT_FOUND) {
-        Print(L"System ROM not found on volume, installing demo ROM\n");
-      } else {
-        Print(L"System ROM install failed (%r), installing demo ROM\n", BootStatus);
+        Print(L"System ROM not found at '%s', trying Mac OS ROM file\n",
+              PPC_ROM_DEFAULT_PATH);
+        BootStatus = PpcInstallSystemRom(PPC_SYSTEM_FOLDER_ROM_PATH, &RomAddress, &RomSize);
       }
-      BootStatus = PpcInstallDemoRom(&RomAddress, &RomSize);
+      if (EFI_ERROR(BootStatus) && BootStatus != EFI_ALREADY_STARTED) {
+        if (BootStatus == EFI_NOT_FOUND) {
+          Print(L"Mac OS ROM file not found, installing demo ROM\n");
+        } else {
+          Print(L"System ROM install failed (%r), installing demo ROM\n", BootStatus);
+        }
+        BootStatus = PpcInstallDemoRom(&RomAddress, &RomSize);
+      }
     }
     Print(L"System ROM: %s (guest 0x%x, %d bytes)\n",
           EFI_ERROR(BootStatus) ? L"FAIL" : L"OK",
@@ -567,6 +576,56 @@ efi_main (
             (UINT64)BootInfo.MemoryMap.RomSize,
             (UINT32)BootInfo.MemoryMap.LowMemoryBase,
             (UINT64)BootInfo.MemoryMap.LowMemorySize);
+    }
+  }
+
+  // Phase 5: classic Mac OS system files and drivers (System Folder support).
+  {
+    PPC_SYSTEM_FOLDER_INFO SysInfo;
+    EFI_STATUS SysStatus;
+
+    Print(L"\n--- System files and drivers ---\n");
+
+    // 1. Scan the boot volume for the System Folder and its components.
+    ZeroMem(&SysInfo, sizeof(SysInfo));
+    SysStatus = PpcLocateSystemFolder(&SysInfo);
+    if (EFI_ERROR(SysStatus) || !SysInfo.Found) {
+      Print(L"System Folder not found on volume (scan: %r)\n", SysStatus);
+    } else {
+      Print(L"System Folder found: %s\n", SysInfo.Path);
+      Print(L"  System=%d, Finder=%d, Extensions=%d, Mac OS ROM=%d\n",
+            SysInfo.SystemPresent, SysInfo.FinderPresent,
+            SysInfo.ExtensionsPresent, SysInfo.MacOsRomPresent);
+
+      // 2. Stage the System file, Finder, and Mac OS ROM into guest memory.
+      SysStatus = PpcLoadSystemFiles();
+      Print(L"System files staged: %s\n",
+            EFI_ERROR(SysStatus) ? L"FAIL" : L"OK");
+
+      // 3. Enumerate Extensions and stage the drivers.
+      SysStatus = PpcScanExtensionsDirectory();
+      Print(L"Extensions scanned: %s\n",
+            EFI_ERROR(SysStatus) ? L"FAIL" : L"OK");
+      SysStatus = PpcLoadDrivers();
+      Print(L"Drivers staged: %s\n",
+            EFI_ERROR(SysStatus) ? L"FAIL" : L"OK");
+    }
+
+    // 4. Self-test: staged files read back through the interpreter memory path.
+    SysStatus = PpcRunSystemFilesSelfTest();
+    Print(L"System files self-test: %s\n",
+          EFI_ERROR(SysStatus) ? L"FAIL" : L"PASS");
+
+    // 5. Report the final staging state.
+    if (!EFI_ERROR(PpcGetSystemFolderInfo(&SysInfo))) {
+      Print(L"System files: %d staged, %d drivers registered (%d staged), "
+            L"%d bytes total\n",
+            SysInfo.LoadedFileCount, SysInfo.DriverCount,
+            SysInfo.LoadedDriverCount, SysInfo.TotalStagedBytes);
+      if (SysInfo.SystemAreaBase != 0) {
+        Print(L"Staging areas: system 0x%x, drivers 0x%x\n",
+              (UINT32)SysInfo.SystemAreaBase, (UINT32)SysInfo.DriverAreaBase);
+      }
     }
   }
 

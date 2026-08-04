@@ -29,6 +29,63 @@ typedef struct {
 #define PPC_LOW_MEM_MAGIC_OFFSET    0x0000
 #define PPC_LOW_MEM_BOOTINFO_OFFSET 0x0100
 
+// System Folder layout on the boot volume (classic Mac OS)
+#define PPC_SYSTEM_FOLDER_PATH      L"\\System Folder"
+#define PPC_SYSTEM_FILE_PATH        L"\\System Folder\\System"
+#define PPC_FINDER_FILE_PATH        L"\\System Folder\\Finder"
+#define PPC_EXTENSIONS_DIR_PATH     L"\\System Folder\\Extensions"
+#define PPC_SYSTEM_FOLDER_ROM_PATH  L"\\System Folder\\Extensions\\Mac OS ROM"
+
+// Guest staging areas for system files and drivers
+#define PPC_SYSTEM_AREA_GUEST_BASE  0x20000000  // System + Finder + Mac OS ROM
+#define PPC_SYSTEM_AREA_SIZE        0x01000000  // 16 MB
+#define PPC_DRIVER_AREA_GUEST_BASE  0x21000000  // Extensions (drivers)
+#define PPC_DRIVER_AREA_SIZE        0x00800000  // 8 MB
+
+// Limits for the system file / driver registry
+#define PPC_SYSTEM_FOLDER_PATH_MAX  256
+#define PPC_SYSTEM_FILE_NAME_MAX    64
+#define PPC_SYSTEM_FILE_PATH_MAX    260
+#define PPC_MAX_SYSTEM_FILES        6
+#define PPC_MAX_DRIVERS             24
+
+// Types of classic Mac OS system files
+typedef enum {
+    PPC_SYSTEM_FILE_TYPE_UNKNOWN = 0,
+    PPC_SYSTEM_FILE_TYPE_SYSTEM,   // System file
+    PPC_SYSTEM_FILE_TYPE_FINDER,   // Finder
+    PPC_SYSTEM_FILE_TYPE_ROM,      // Mac OS ROM file
+    PPC_SYSTEM_FILE_TYPE_DRIVER    // extension in the Extensions folder
+} PPC_SYSTEM_FILE_TYPE;
+
+// A staged system file or driver
+typedef struct {
+    PPC_SYSTEM_FILE_TYPE Type;
+    BOOLEAN Loaded;
+    CHAR16  Name[PPC_SYSTEM_FILE_NAME_MAX];
+    CHAR16  Path[PPC_SYSTEM_FILE_PATH_MAX];
+    UINT64  FileSize;      // size on disk
+    UINT64  GuestAddress;  // guest address where staged (0 if not loaded)
+    UINT64  StagedSize;    // bytes staged into guest memory
+} PPC_SYSTEM_FILE;
+
+// Aggregate report of the System Folder scan / staging results
+typedef struct {
+    BOOLEAN Found;
+    CHAR16  Path[PPC_SYSTEM_FOLDER_PATH_MAX];
+    BOOLEAN SystemPresent;
+    BOOLEAN FinderPresent;
+    BOOLEAN ExtensionsPresent;
+    BOOLEAN MacOsRomPresent;
+    UINTN   FileCount;
+    UINTN   LoadedFileCount;
+    UINTN   DriverCount;
+    UINTN   LoadedDriverCount;
+    UINT64  TotalStagedBytes;
+    UINT64  SystemAreaBase;
+    UINT64  DriverAreaBase;
+} PPC_SYSTEM_FOLDER_INFO;
+
 // Guest memory map as installed for a classic Mac OS boot
 typedef struct {
     BOOLEAN RomInstalled;
@@ -48,6 +105,7 @@ typedef struct {
     BOOLEAN KernelLoaded;
     BOOLEAN SystemReady;
     PPC_GUEST_MEMORY_MAP MemoryMap;
+    PPC_SYSTEM_FOLDER_INFO SystemFolder;
 } PPC_BOOT_INFO;
 
 /**
@@ -233,6 +291,102 @@ PpcRunBootSelfTest (
 EFI_STATUS
 EFIAPI
 PpcPrepareSystemForBoot (
+    VOID
+    );
+
+/**
+  Scan the boot volume for a classic Mac OS System Folder and record the
+  presence of System, Finder, Extensions, and Mac OS ROM.
+  @param[out] Info  Folder scan report (may be NULL)
+  @retval EFI_STATUS
+**/
+EFI_STATUS
+EFIAPI
+PpcLocateSystemFolder (
+    OUT PPC_SYSTEM_FOLDER_INFO* Info
+    );
+
+/**
+  Stage the System file, Finder, and Mac OS ROM file from the System Folder
+  into the guest system staging area.
+  @retval EFI_SUCCESS       Files staged
+  @retval EFI_NOT_FOUND     No System Folder / no stageable files
+  @retval EFI_ALREADY_STARTED  Files already staged
+**/
+EFI_STATUS
+EFIAPI
+PpcLoadSystemFiles (
+    VOID
+    );
+
+/**
+  Enumerate the Extensions folder and register each file as a driver.
+  @retval EFI_SUCCESS
+  @retval EFI_NOT_FOUND     No Extensions folder
+**/
+EFI_STATUS
+EFIAPI
+PpcScanExtensionsDirectory (
+    VOID
+    );
+
+/**
+  Stage every registered driver into the guest driver staging area.
+  @retval EFI_SUCCESS       At least one driver staged
+  @retval EFI_NOT_FOUND     No drivers registered
+**/
+EFI_STATUS
+EFIAPI
+PpcLoadDrivers (
+    VOID
+    );
+
+/**
+  Get the current System Folder scan / staging report.
+  @param[out] Info  Report structure to fill
+  @retval EFI_STATUS
+**/
+EFI_STATUS
+EFIAPI
+PpcGetSystemFolderInfo (
+    OUT PPC_SYSTEM_FOLDER_INFO* Info
+    );
+
+/**
+  Get a single staged system file entry.
+  @param[in]  Index  Entry index
+  @param[out] File   Entry structure to fill
+  @retval EFI_STATUS
+**/
+EFI_STATUS
+EFIAPI
+PpcGetSystemFile (
+    IN  UINTN Index,
+    OUT PPC_SYSTEM_FILE* File
+    );
+
+/**
+  Get a single registered driver entry.
+  @param[in]  Index  Driver index
+  @param[out] Driver Driver structure to fill
+  @retval EFI_STATUS
+**/
+EFI_STATUS
+EFIAPI
+PpcGetDriver (
+    IN  UINTN Index,
+    OUT PPC_SYSTEM_FILE* Driver
+    );
+
+/**
+  Run the system files & drivers self-test: staged files read back through the
+  interpreter memory path, low-memory boot info intact, registry consistent.
+  @retval EFI_SUCCESS       All checks passed
+  @retval EFI_LOAD_ERROR    One or more checks failed
+**/
+EFI_STATUS
+EFIAPI
+PpcRunSystemFilesSelfTest (
     VOID
     );
 

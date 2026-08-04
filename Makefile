@@ -28,7 +28,8 @@ TARGET      := $(BUILD_DIR)/EFI-Mac-Emulator.efi
 # --- Flags ---
 ARCH       := -target x86_64-pc-win32-coff
 COMMON     := -mno-red-zone -ffreestanding -fshort-wchar \
-              -fno-stack-protector -fno-strict-aliasing -funsigned-char
+              -fno-stack-protector -fno-strict-aliasing -funsigned-char \
+              -fno-math-errno
 CFLAGS     := $(ARCH) $(COMMON) -O2 -I $(GNUEFI_DIR)/inc -I src
 
 # GNU-EFI runtime library sources (mirrors gnu-efi lib/Makefile for x86_64,

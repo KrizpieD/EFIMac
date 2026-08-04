@@ -26,6 +26,29 @@ typedef struct {
     UINT64  RomAddress;
     UINT64  RomSize;
     VOID*   RomHostBuffer;
+    // Phase 5: system files and drivers (classic Mac OS System Folder)
+    BOOLEAN SystemFolderScanned;
+    BOOLEAN SystemFolderFound;
+    CHAR16  SystemFolderPath[PPC_SYSTEM_FOLDER_PATH_MAX];
+    BOOLEAN SystemPresent;
+    BOOLEAN FinderPresent;
+    BOOLEAN ExtensionsPresent;
+    BOOLEAN MacOsRomPresent;
+    UINTN   SystemFileCount;
+    UINTN   LoadedSystemFileCount;
+    UINTN   DriverCount;
+    UINTN   LoadedDriverCount;
+    UINT64  TotalStagedBytes;
+    BOOLEAN SystemAreaInstalled;
+    UINT64  SystemAreaCursor;
+    VOID*   SystemAreaHost;
+    BOOLEAN DriverAreaInstalled;
+    UINT64  DriverAreaCursor;
+    VOID*   DriverAreaHost;
+    PPC_SYSTEM_FILE SystemFiles[PPC_MAX_SYSTEM_FILES];
+    VOID*   SystemFileHosts[PPC_MAX_SYSTEM_FILES];
+    PPC_SYSTEM_FILE Drivers[PPC_MAX_DRIVERS];
+    VOID*   DriverHosts[PPC_MAX_DRIVERS];
 } PPC_BOOTLOADER_CONTEXT;
 
 // Global bootloader context
@@ -38,10 +61,174 @@ STATIC PPC_BOOTLOADER_CONTEXT g_BootContext = {0};
 // ---------------------------------------------------------------------------
 STATIC
 EFI_STATUS
+BootOpenFile (
+    IN  CHAR16* FilePath,
+    OUT EFI_FILE_HANDLE* Root,
+    OUT EFI_FILE_HANDLE* File,
+    OUT UINT64* FileSize
+    )
+{
+    EFI_FILE_IO_INTERFACE* Fs = NULL;
+    EFI_STATUS Status = PpcGetFileSystem(&Fs, NULL);
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+
+    EFI_FILE_HANDLE RootHandle = NULL;
+    Status = Fs->OpenVolume(Fs, &RootHandle);
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+
+    EFI_FILE_HANDLE FileHandle = NULL;
+    Status = RootHandle->Open(RootHandle, &FileHandle, FilePath, EFI_FILE_MODE_READ, 0);
+    if (EFI_ERROR(Status) || FileHandle == NULL) {
+        RootHandle->Close(RootHandle);
+        return (Status == EFI_SUCCESS) ? EFI_NOT_FOUND : Status;
+    }
+
+    UINTN FileInfoSize = SIZE_OF_EFI_FILE_INFO + 260 * sizeof(CHAR16);
+    EFI_FILE_INFO* Info = AllocateZeroPool(FileInfoSize);
+    if (Info == NULL) {
+        FileHandle->Close(FileHandle);
+        RootHandle->Close(RootHandle);
+        return EFI_OUT_OF_RESOURCES;
+    }
+    Status = FileHandle->GetInfo(FileHandle, &GenericFileInfo, &FileInfoSize, Info);
+    if (EFI_ERROR(Status)) {
+        FreePool(Info);
+        FileHandle->Close(FileHandle);
+        RootHandle->Close(RootHandle);
+        return Status;
+    }
+
+    *Root = RootHandle;
+    *File = FileHandle;
+    *FileSize = Info->FileSize;
+    FreePool(Info);
+    return EFI_SUCCESS;
+}
+
+STATIC
+EFI_STATUS
+BootReadFileInto (
+    IN  EFI_FILE_HANDLE File,
+    IN  CHAR16*         FilePath,
+    IN  VOID*           Dst,
+    IN  UINTN           DstSize,
+    OUT UINTN*          BytesRead
+    )
+{
+    UINT64 Remaining = DstSize;
+    UINTN  Offset    = 0;
+    EFI_STATUS Status;
+
+    while (Remaining > 0) {
+        UINTN Chunk = (UINTN)Remaining;
+        Status = File->Read(File, &Chunk, (UINT8*)Dst + Offset);
+        if (EFI_ERROR(Status)) {
+            Print(L"Failed while reading '%s': %r\n", FilePath, Status);
+            return EFI_LOAD_ERROR;
+        }
+        if (Chunk == 0) {
+            break;  // clean end of file
+        }
+        Offset += Chunk;
+        Remaining -= Chunk;
+    }
+
+    if (BytesRead != NULL) {
+        *BytesRead = Offset;
+    }
+    return EFI_SUCCESS;
+}
+
+// Read a whole file from the boot volume into a page-aligned buffer (UEFI
+// pool allocations are limited to ~128 KB; ROM and system blobs are several MB,
+// so they are page-backed).
+STATIC
+EFI_STATUS
 BootReadFileToPages (
     IN  CHAR16* FilePath,
+    IN  UINTN   MaxSize,
     OUT VOID**  Buffer,
     OUT UINTN*  Size
+    )
+{
+    EFI_FILE_HANDLE Root = NULL;
+    EFI_FILE_HANDLE File = NULL;
+    UINT64 FileSize = 0;
+    EFI_STATUS Status = BootOpenFile(FilePath, &Root, &File, &FileSize);
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+
+    if (FileSize == 0 || FileSize > MaxSize) {
+        File->Close(File);
+        Root->Close(Root);
+        Print(L"File '%s' has invalid size %d (max %d)\n", FilePath, (UINT64)FileSize, (UINTN)MaxSize);
+        return EFI_LOAD_ERROR;
+    }
+
+    UINTN Pages = (UINTN)((FileSize + EFI_PAGE_SIZE - 1) / EFI_PAGE_SIZE);
+    EFI_PHYSICAL_ADDRESS Base = 0;
+    Status = BS->AllocatePages(AllocateAnyPages, EfiBootServicesData, Pages, &Base);
+    if (EFI_ERROR(Status)) {
+        File->Close(File);
+        Root->Close(Root);
+        Print(L"Failed to allocate %d pages for '%s': %r\n", Pages, FilePath, Status);
+        return Status;
+    }
+
+    Status = BootReadFileInto(File, FilePath, (VOID*)(UINTN)Base, (UINTN)FileSize, NULL);
+    File->Close(File);
+    Root->Close(Root);
+
+    if (EFI_ERROR(Status)) {
+        BS->FreePages(Base, Pages);
+        return Status;
+    }
+
+    *Buffer = (VOID*)(UINTN)Base;
+    *Size = (UINTN)FileSize;
+    return EFI_SUCCESS;
+}
+
+// Check whether a file exists on the boot volume and get its size.
+STATIC
+EFI_STATUS
+BootFileExists (
+    IN  CHAR16* FilePath,
+    OUT BOOLEAN* Exists,
+    OUT UINT64*  FileSize
+    )
+{
+    EFI_FILE_HANDLE Root = NULL;
+    EFI_FILE_HANDLE File = NULL;
+    UINT64 Size = 0;
+    EFI_STATUS Status = BootOpenFile(FilePath, &Root, &File, &Size);
+    if (Status == EFI_NOT_FOUND) {
+        if (Exists != NULL) { *Exists = FALSE; }
+        if (FileSize != NULL) { *FileSize = 0; }
+        return EFI_SUCCESS;
+    }
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+    File->Close(File);
+    Root->Close(Root);
+
+    if (Exists != NULL) { *Exists = (Size > 0); }
+    if (FileSize != NULL) { *FileSize = Size; }
+    return EFI_SUCCESS;
+}
+
+// Check whether a directory exists on the boot volume.
+STATIC
+EFI_STATUS
+BootDirectoryExists (
+    IN  CHAR16* DirPath,
+    OUT BOOLEAN* Exists
     )
 {
     EFI_FILE_IO_INTERFACE* Fs = NULL;
@@ -56,74 +243,17 @@ BootReadFileToPages (
         return Status;
     }
 
-    EFI_FILE_HANDLE File = NULL;
-    Status = Root->Open(Root, &File, FilePath, EFI_FILE_MODE_READ, 0);
-    if (EFI_ERROR(Status) || File == NULL) {
+    EFI_FILE_HANDLE Dir = NULL;
+    Status = Root->Open(Root, &Dir, DirPath, EFI_FILE_MODE_READ, 0);
+    if (EFI_ERROR(Status) || Dir == NULL) {
         Root->Close(Root);
-        return (Status == EFI_SUCCESS) ? EFI_NOT_FOUND : Status;
+        if (Exists != NULL) { *Exists = FALSE; }
+        return (Status == EFI_SUCCESS) ? EFI_SUCCESS : Status;
     }
 
-    UINTN FileInfoSize = SIZE_OF_EFI_FILE_INFO + 260 * sizeof(CHAR16);
-    EFI_FILE_INFO* Info = AllocateZeroPool(FileInfoSize);
-    if (Info == NULL) {
-        File->Close(File);
-        Root->Close(Root);
-        return EFI_OUT_OF_RESOURCES;
-    }
-    Status = File->GetInfo(File, &GenericFileInfo, &FileInfoSize, Info);
-    if (EFI_ERROR(Status)) {
-        FreePool(Info);
-        File->Close(File);
-        Root->Close(Root);
-        return Status;
-    }
-
-    UINT64 FileSize = Info->FileSize;
-    FreePool(Info);
-
-    if (FileSize == 0 || FileSize > PPC_ROM_MAX_SIZE) {
-        File->Close(File);
-        Root->Close(Root);
-        Print(L"File '%s' has invalid size %d for ROM load\n", FilePath, FileSize);
-        return EFI_LOAD_ERROR;
-    }
-
-    UINTN Pages = (UINTN)((FileSize + EFI_PAGE_SIZE - 1) / EFI_PAGE_SIZE);
-    EFI_PHYSICAL_ADDRESS Base = 0;
-    Status = BS->AllocatePages(AllocateAnyPages, EfiBootServicesData, Pages, &Base);
-    if (EFI_ERROR(Status)) {
-        File->Close(File);
-        Root->Close(Root);
-        Print(L"Failed to allocate %d pages for '%s': %r\n", Pages, FilePath, Status);
-        return Status;
-    }
-
-    VOID* Dst = (VOID*)(UINTN)Base;
-    UINT64 Remaining = FileSize;
-    UINTN  BytesRead = 0;
-    BOOLEAN Failed = FALSE;
-    while (Remaining > 0) {
-        UINTN Chunk = (UINTN)Remaining;
-        Status = File->Read(File, &Chunk, (UINT8*)Dst + BytesRead);
-        if (EFI_ERROR(Status) || Chunk == 0) {
-            Print(L"Failed while reading '%s': %r\n", FilePath, Status);
-            Failed = TRUE;
-            break;
-        }
-        BytesRead += Chunk;
-        Remaining -= Chunk;
-    }
-
-    File->Close(File);
+    Dir->Close(Dir);
     Root->Close(Root);
-
-    if (Failed) {
-        BS->FreePages(Base, Pages);
-        return EFI_LOAD_ERROR;
-    }
-
-    *Buffer = Dst;
-    *Size = (UINTN)FileSize;
+    if (Exists != NULL) { *Exists = TRUE; }
     return EFI_SUCCESS;
 }
 
@@ -159,6 +289,321 @@ BootWriteWord32 (
     PpcWriteGuestByte(Address + 1, (UINT8)(Value >> 16));
     PpcWriteGuestByte(Address + 2, (UINT8)(Value >> 8));
     PpcWriteGuestByte(Address + 3, (UINT8)Value);
+}
+
+// NUL-terminated bounded string copy (avoids GNU-EFI StrnCpy padding pitfalls).
+STATIC VOID
+BootCopyString (
+    OUT CHAR16* Dst,
+    IN  CHAR16* Src,
+    IN  UINTN   MaxChars
+    )
+{
+    UINTN I;
+    for (I = 0; I + 1 < MaxChars && Src[I] != 0; I++) {
+        Dst[I] = Src[I];
+    }
+    Dst[I] = 0;
+}
+
+// Case-insensitive CHAR16 comparison (ASCII; no GNU-EFI Stricmp dependency).
+STATIC INTN
+BootStriCmp (
+    IN CHAR16* A,
+    IN CHAR16* B
+    )
+{
+    while (*A != 0 && *B != 0) {
+        CHAR16 Ca = *A;
+        CHAR16 Cb = *B;
+        if (Ca >= L'a' && Ca <= L'z') { Ca -= (L'a' - L'A'); }
+        if (Cb >= L'a' && Cb <= L'z') { Cb -= (L'a' - L'A'); }
+        if (Ca != Cb) {
+            return (Ca < Cb) ? -1 : 1;
+        }
+        A++;
+        B++;
+    }
+    if (*A == *B) {
+        return 0;
+    }
+    return (*A == 0) ? -1 : 1;
+}
+
+// Build "DirPath\FileName" into OutPath (bounded).
+STATIC VOID
+BootBuildPath (
+    IN  CHAR16* DirPath,
+    IN  CHAR16* FileName,
+    OUT CHAR16* OutPath,
+    IN  UINTN   MaxChars
+    )
+{
+    UINTN I = 0;
+    while (I + 1 < MaxChars && DirPath[I] != 0) {
+        OutPath[I] = DirPath[I];
+        I++;
+    }
+    if (I + 1 < MaxChars) {
+        OutPath[I++] = L'\\';
+    }
+    {
+        UINTN J = 0;
+        while (I + 1 < MaxChars && FileName[J] != 0) {
+            OutPath[I++] = FileName[J++];
+        }
+    }
+    OutPath[I] = 0;
+}
+
+// Allocate and map the guest staging area for System/Finder/Mac OS ROM.
+STATIC EFI_STATUS
+BootEnsureSystemArea (
+    VOID
+    )
+{
+    if (g_BootContext.SystemAreaInstalled) {
+        return EFI_SUCCESS;
+    }
+    UINTN Pages = PPC_SYSTEM_AREA_SIZE / EFI_PAGE_SIZE;
+    EFI_PHYSICAL_ADDRESS Base = 0;
+    EFI_STATUS Status = BS->AllocatePages(AllocateAnyPages, EfiBootServicesData, Pages, &Base);
+    if (EFI_ERROR(Status)) {
+        Print(L"Failed to allocate system staging area: %r\n", Status);
+        return Status;
+    }
+    ZeroMem((VOID*)(UINTN)Base, PPC_SYSTEM_AREA_SIZE);
+
+    Status = PpcAddGuestMemoryRegion((VOID*)(UINTN)Base,
+                                     PPC_SYSTEM_AREA_GUEST_BASE,
+                                     PPC_SYSTEM_AREA_SIZE,
+                                     FALSE);
+    if (EFI_ERROR(Status)) {
+        BS->FreePages(Base, Pages);
+        Print(L"Failed to map system staging area: %r\n", Status);
+        return Status;
+    }
+
+    g_BootContext.SystemAreaInstalled = TRUE;
+    g_BootContext.SystemAreaHost = (VOID*)(UINTN)Base;
+    g_BootContext.SystemAreaCursor = PPC_SYSTEM_AREA_GUEST_BASE;
+    Print(L"System staging area installed: guest 0x%x (%d MB, read/write)\n",
+          PPC_SYSTEM_AREA_GUEST_BASE, PPC_SYSTEM_AREA_SIZE / (1024 * 1024));
+    return EFI_SUCCESS;
+}
+
+// Allocate and map the guest staging area for drivers (extensions).
+STATIC EFI_STATUS
+BootEnsureDriverArea (
+    VOID
+    )
+{
+    if (g_BootContext.DriverAreaInstalled) {
+        return EFI_SUCCESS;
+    }
+    UINTN Pages = PPC_DRIVER_AREA_SIZE / EFI_PAGE_SIZE;
+    EFI_PHYSICAL_ADDRESS Base = 0;
+    EFI_STATUS Status = BS->AllocatePages(AllocateAnyPages, EfiBootServicesData, Pages, &Base);
+    if (EFI_ERROR(Status)) {
+        Print(L"Failed to allocate driver staging area: %r\n", Status);
+        return Status;
+    }
+    ZeroMem((VOID*)(UINTN)Base, PPC_DRIVER_AREA_SIZE);
+
+    Status = PpcAddGuestMemoryRegion((VOID*)(UINTN)Base,
+                                     PPC_DRIVER_AREA_GUEST_BASE,
+                                     PPC_DRIVER_AREA_SIZE,
+                                     FALSE);
+    if (EFI_ERROR(Status)) {
+        BS->FreePages(Base, Pages);
+        Print(L"Failed to map driver staging area: %r\n", Status);
+        return Status;
+    }
+
+    g_BootContext.DriverAreaInstalled = TRUE;
+    g_BootContext.DriverAreaHost = (VOID*)(UINTN)Base;
+    g_BootContext.DriverAreaCursor = PPC_DRIVER_AREA_GUEST_BASE;
+    Print(L"Driver staging area installed: guest 0x%x (%d MB, read/write)\n",
+          PPC_DRIVER_AREA_GUEST_BASE, PPC_DRIVER_AREA_SIZE / (1024 * 1024));
+    return EFI_SUCCESS;
+}
+
+STATIC VOID
+BootExtractFileName (
+    IN  CHAR16* Path,
+    OUT CHAR16* Name,
+    IN  UINTN   MaxChars
+    );
+
+// Stage a single file from the boot volume into a guest staging area.
+STATIC EFI_STATUS
+BootStageFile (
+    IN  CHAR16* FilePath,
+    IN  PPC_SYSTEM_FILE_TYPE Type,
+    IN  UINT64  AreaGuestBase,
+    IN  UINTN   AreaSize,
+    IN  VOID*   AreaHost,
+    IN  UINT64* Cursor,
+    OUT PPC_SYSTEM_FILE* OutFile,
+    OUT VOID**  OutHost
+    )
+{
+    EFI_FILE_HANDLE Root = NULL;
+    EFI_FILE_HANDLE File = NULL;
+    UINT64 FileSize = 0;
+    EFI_STATUS Status = BootOpenFile(FilePath, &Root, &File, &FileSize);
+    if (EFI_ERROR(Status)) {
+        return Status;  // EFI_NOT_FOUND, etc.
+    }
+    if (FileSize == 0) {
+        File->Close(File);
+        Root->Close(Root);
+        return EFI_NOT_FOUND;
+    }
+
+    UINTN Aligned = ((UINTN)FileSize + 0xF) & ~0xF;
+    if ((UINT64)(*Cursor - AreaGuestBase) + Aligned > AreaSize) {
+        File->Close(File);
+        Root->Close(Root);
+        Print(L"Staging area full for '%s'\n", FilePath);
+        return EFI_OUT_OF_RESOURCES;
+    }
+
+    UINTN Offset = (UINTN)(*Cursor - AreaGuestBase);
+    UINTN BytesRead = 0;
+    Status = BootReadFileInto(File, FilePath, (UINT8*)AreaHost + Offset, Aligned, &BytesRead);
+    File->Close(File);
+    Root->Close(Root);
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+    (VOID)BytesRead;
+
+    OutFile->Type = Type;
+    OutFile->Loaded = TRUE;
+    OutFile->FileSize = FileSize;
+    OutFile->GuestAddress = *Cursor;
+    OutFile->StagedSize = Aligned;
+    BootCopyString(OutFile->Path, FilePath, PPC_SYSTEM_FILE_PATH_MAX);
+    BootExtractFileName(FilePath, OutFile->Name, PPC_SYSTEM_FILE_NAME_MAX);
+
+    if (OutHost != NULL) {
+        *OutHost = (UINT8*)AreaHost + Offset;
+    }
+    *Cursor += Aligned;
+    g_BootContext.TotalStagedBytes += FileSize;
+
+    return EFI_SUCCESS;
+}
+
+// Enumerate the Extensions folder and register every file as a driver.
+STATIC EFI_STATUS
+BootEnumerateExtensions (
+    VOID
+    )
+{
+    EFI_FILE_IO_INTERFACE* Fs = NULL;
+    EFI_STATUS Status = PpcGetFileSystem(&Fs, NULL);
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+
+    EFI_FILE_HANDLE Root = NULL;
+    Status = Fs->OpenVolume(Fs, &Root);
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+
+    EFI_FILE_HANDLE Dir = NULL;
+    Status = Root->Open(Root, &Dir, PPC_EXTENSIONS_DIR_PATH, EFI_FILE_MODE_READ, 0);
+    if (EFI_ERROR(Status) || Dir == NULL) {
+        Root->Close(Root);
+        return (Status == EFI_SUCCESS) ? EFI_NOT_FOUND : Status;
+    }
+
+    UINTN  BufSize = SIZE_OF_EFI_FILE_INFO + 260 * sizeof(CHAR16);
+    UINT8* Buf = AllocateZeroPool(BufSize);
+    if (Buf == NULL) {
+        Dir->Close(Dir);
+        Root->Close(Root);
+        return EFI_OUT_OF_RESOURCES;
+    }
+
+    UINTN Count = 0;
+    for (;;) {
+        UINTN ReadSize = BufSize;
+        Status = Dir->Read(Dir, &ReadSize, Buf);
+        if (Status == EFI_BUFFER_TOO_SMALL) {
+            UINTN NewSize = BufSize * 2;
+            UINT8* NewBuf = AllocateZeroPool(NewSize);
+            if (NewBuf == NULL) {
+                FreePool(Buf);
+                Dir->Close(Dir);
+                Root->Close(Root);
+                return EFI_OUT_OF_RESOURCES;
+            }
+            FreePool(Buf);
+            Buf = NewBuf;
+            BufSize = NewSize;
+            continue;
+        }
+        if (EFI_ERROR(Status)) {
+            break;
+        }
+        if (ReadSize == 0) {
+            break;  // end of directory
+        }
+
+        EFI_FILE_INFO* Info = (EFI_FILE_INFO*)Buf;
+        if (Info->Attribute & EFI_FILE_DIRECTORY) {
+            continue;
+        }
+        if (BootStriCmp(Info->FileName, L"Mac OS ROM") == 0) {
+            continue;  // handled by the ROM loader
+        }
+        if (BootStriCmp(Info->FileName, L".") == 0 || BootStriCmp(Info->FileName, L"..") == 0) {
+            continue;
+        }
+
+        if (Count >= PPC_MAX_DRIVERS) {
+            break;
+        }
+        PPC_SYSTEM_FILE* D = &g_BootContext.Drivers[Count];
+        ZeroMem(D, sizeof(PPC_SYSTEM_FILE));
+        D->Type = PPC_SYSTEM_FILE_TYPE_DRIVER;
+        D->Loaded = FALSE;
+        BootCopyString(D->Name, Info->FileName, PPC_SYSTEM_FILE_NAME_MAX);
+        BootBuildPath(PPC_EXTENSIONS_DIR_PATH, Info->FileName, D->Path, PPC_SYSTEM_FILE_PATH_MAX);
+        D->FileSize = Info->FileSize;
+        Count++;
+    }
+
+    FreePool(Buf);
+    Dir->Close(Dir);
+    Root->Close(Root);
+
+    g_BootContext.DriverCount = Count;
+    Print(L"Extensions scanned: %d driver(s) found\n", Count);
+    return EFI_SUCCESS;
+}
+
+// Extract the trailing file name component from a path.
+STATIC VOID
+BootExtractFileName (
+    IN  CHAR16* Path,
+    OUT CHAR16* Name,
+    IN  UINTN   MaxChars
+    )
+{
+    UINTN Len = 0;
+    UINTN LastSep = 0;
+    while (Path[Len] != 0) {
+        if (Path[Len] == L'\\') {
+            LastSep = Len + 1;
+        }
+        Len++;
+    }
+    BootCopyString(Name, Path + LastSep, MaxChars);
 }
 
 EFI_STATUS
@@ -420,6 +865,8 @@ PpcGetBootInfo (
     BootInfo->MemoryMap.LowMemoryBase = g_BootContext.LowMemoryAddress;
     BootInfo->MemoryMap.LowMemorySize = g_BootContext.LowMemorySize;
     BootInfo->MemoryMap.Ready = g_BootContext.SystemReady;
+
+    PpcGetSystemFolderInfo(&BootInfo->SystemFolder);
     
     return EFI_SUCCESS;
 }
@@ -443,7 +890,7 @@ PpcLoadSystemRom (
 
     Print(L"Loading system ROM from: %s\n", RomPath);
 
-    Status = BootReadFileToPages(RomPath, &Buffer, &Size);
+    Status = BootReadFileToPages(RomPath, PPC_ROM_MAX_SIZE, &Buffer, &Size);
     if (EFI_ERROR(Status)) {
         return Status;
     }
@@ -827,6 +1274,297 @@ PpcRunBootSelfTest (
         L"program stored result to guest RAM");
 
     Print(L"--- Boot self-test complete: %d passed, %d failed ---\n",
+          g_BootTestPasses, g_BootTestFailures);
+
+    return (g_BootTestFailures == 0) ? EFI_SUCCESS : EFI_LOAD_ERROR;
+}
+
+// ---------------------------------------------------------------------------
+// System files & drivers (classic Mac OS System Folder support)
+// ---------------------------------------------------------------------------
+
+STATIC VOID
+BootFillSystemFolderInfo (
+    OUT PPC_SYSTEM_FOLDER_INFO* Info
+    )
+{
+    ZeroMem(Info, sizeof(PPC_SYSTEM_FOLDER_INFO));
+    Info->Found = g_BootContext.SystemFolderFound;
+    BootCopyString(Info->Path, g_BootContext.SystemFolderPath, PPC_SYSTEM_FOLDER_PATH_MAX);
+    Info->SystemPresent = g_BootContext.SystemPresent;
+    Info->FinderPresent = g_BootContext.FinderPresent;
+    Info->ExtensionsPresent = g_BootContext.ExtensionsPresent;
+    Info->MacOsRomPresent = g_BootContext.MacOsRomPresent;
+    Info->FileCount = g_BootContext.SystemFileCount;
+    Info->LoadedFileCount = g_BootContext.LoadedSystemFileCount;
+    Info->DriverCount = g_BootContext.DriverCount;
+    Info->LoadedDriverCount = g_BootContext.LoadedDriverCount;
+    Info->TotalStagedBytes = g_BootContext.TotalStagedBytes;
+    Info->SystemAreaBase = g_BootContext.SystemAreaInstalled ? PPC_SYSTEM_AREA_GUEST_BASE : 0;
+    Info->DriverAreaBase = g_BootContext.DriverAreaInstalled ? PPC_DRIVER_AREA_GUEST_BASE : 0;
+}
+
+EFI_STATUS
+PpcLocateSystemFolder (
+    OUT PPC_SYSTEM_FOLDER_INFO* Info
+    )
+{
+    if (!g_BootContext.SystemFolderScanned) {
+        BOOLEAN Exists = FALSE;
+        EFI_STATUS Status = BootDirectoryExists(PPC_SYSTEM_FOLDER_PATH, &Exists);
+        if (EFI_ERROR(Status)) {
+            return Status;
+        }
+
+        g_BootContext.SystemFolderFound = Exists;
+        BootCopyString(g_BootContext.SystemFolderPath,
+                       g_BootContext.SystemFolderFound ? PPC_SYSTEM_FOLDER_PATH : L"",
+                       PPC_SYSTEM_FOLDER_PATH_MAX);
+        if (Exists) {
+            BootFileExists(PPC_SYSTEM_FILE_PATH, &g_BootContext.SystemPresent, NULL);
+            BootFileExists(PPC_FINDER_FILE_PATH, &g_BootContext.FinderPresent, NULL);
+            BootDirectoryExists(PPC_EXTENSIONS_DIR_PATH, &g_BootContext.ExtensionsPresent);
+            BootFileExists(PPC_SYSTEM_FOLDER_ROM_PATH, &g_BootContext.MacOsRomPresent, NULL);
+        }
+        g_BootContext.SystemFolderScanned = TRUE;
+        Print(L"System Folder scan: found=%d System=%d Finder=%d Extensions=%d MacOSROM=%d\n",
+              g_BootContext.SystemFolderFound,
+              g_BootContext.SystemPresent,
+              g_BootContext.FinderPresent,
+              g_BootContext.ExtensionsPresent,
+              g_BootContext.MacOsRomPresent);
+    }
+
+    if (Info != NULL) {
+        BootFillSystemFolderInfo(Info);
+    }
+    return EFI_SUCCESS;
+}
+
+EFI_STATUS
+PpcLoadSystemFiles (
+    VOID
+    )
+{
+    PPC_SYSTEM_FILE* F;
+    VOID* Host = NULL;
+    EFI_STATUS Status;
+
+    if (!g_BootContext.SystemFolderFound) {
+        return EFI_NOT_FOUND;
+    }
+    if (g_BootContext.SystemFileCount > 0) {
+        return EFI_ALREADY_STARTED;
+    }
+
+    Status = BootEnsureSystemArea();
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+
+    if (g_BootContext.SystemPresent) {
+        F = &g_BootContext.SystemFiles[g_BootContext.SystemFileCount];
+        Status = BootStageFile(PPC_SYSTEM_FILE_PATH, PPC_SYSTEM_FILE_TYPE_SYSTEM,
+                               PPC_SYSTEM_AREA_GUEST_BASE, PPC_SYSTEM_AREA_SIZE,
+                               g_BootContext.SystemAreaHost, &g_BootContext.SystemAreaCursor,
+                               F, &Host);
+        if (!EFI_ERROR(Status)) {
+            g_BootContext.SystemFileHosts[g_BootContext.SystemFileCount] = Host;
+            g_BootContext.SystemFileCount++;
+            g_BootContext.LoadedSystemFileCount++;
+            Print(L"Staged System file: %s -> guest 0x%x (%d bytes)\n",
+                  F->Name, (UINT64)F->GuestAddress, (UINT64)F->FileSize);
+        } else {
+            Print(L"Failed to stage System file: %r\n", Status);
+        }
+    }
+
+    if (g_BootContext.FinderPresent) {
+        F = &g_BootContext.SystemFiles[g_BootContext.SystemFileCount];
+        Status = BootStageFile(PPC_FINDER_FILE_PATH, PPC_SYSTEM_FILE_TYPE_FINDER,
+                               PPC_SYSTEM_AREA_GUEST_BASE, PPC_SYSTEM_AREA_SIZE,
+                               g_BootContext.SystemAreaHost, &g_BootContext.SystemAreaCursor,
+                               F, &Host);
+        if (!EFI_ERROR(Status)) {
+            g_BootContext.SystemFileHosts[g_BootContext.SystemFileCount] = Host;
+            g_BootContext.SystemFileCount++;
+            g_BootContext.LoadedSystemFileCount++;
+            Print(L"Staged Finder: %s -> guest 0x%x (%d bytes)\n",
+                  F->Name, (UINT64)F->GuestAddress, (UINT64)F->FileSize);
+        } else {
+            Print(L"Failed to stage Finder: %r\n", Status);
+        }
+    }
+
+    if (g_BootContext.MacOsRomPresent) {
+        F = &g_BootContext.SystemFiles[g_BootContext.SystemFileCount];
+        Status = BootStageFile(PPC_SYSTEM_FOLDER_ROM_PATH, PPC_SYSTEM_FILE_TYPE_ROM,
+                               PPC_SYSTEM_AREA_GUEST_BASE, PPC_SYSTEM_AREA_SIZE,
+                               g_BootContext.SystemAreaHost, &g_BootContext.SystemAreaCursor,
+                               F, &Host);
+        if (!EFI_ERROR(Status)) {
+            g_BootContext.SystemFileHosts[g_BootContext.SystemFileCount] = Host;
+            g_BootContext.SystemFileCount++;
+            g_BootContext.LoadedSystemFileCount++;
+            Print(L"Staged Mac OS ROM file: %s -> guest 0x%x (%d bytes)\n",
+                  F->Name, (UINT64)F->GuestAddress, (UINT64)F->FileSize);
+        } else {
+            Print(L"Failed to stage Mac OS ROM file: %r\n", Status);
+        }
+    }
+
+    return (g_BootContext.LoadedSystemFileCount > 0) ? EFI_SUCCESS : EFI_NOT_FOUND;
+}
+
+EFI_STATUS
+PpcScanExtensionsDirectory (
+    VOID
+    )
+{
+    if (!g_BootContext.SystemFolderFound) {
+        return EFI_NOT_FOUND;
+    }
+    return BootEnumerateExtensions();
+}
+
+EFI_STATUS
+PpcLoadDrivers (
+    VOID
+    )
+{
+    UINTN I;
+    UINTN Loaded = 0;
+    EFI_STATUS Status;
+
+    if (g_BootContext.DriverCount == 0) {
+        return EFI_NOT_FOUND;
+    }
+    if (g_BootContext.LoadedDriverCount > 0) {
+        return EFI_ALREADY_STARTED;
+    }
+
+    Status = BootEnsureDriverArea();
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+
+    for (I = 0; I < g_BootContext.DriverCount; I++) {
+        PPC_SYSTEM_FILE* D = &g_BootContext.Drivers[I];
+        VOID* Host = NULL;
+        Status = BootStageFile(D->Path, PPC_SYSTEM_FILE_TYPE_DRIVER,
+                               PPC_DRIVER_AREA_GUEST_BASE, PPC_DRIVER_AREA_SIZE,
+                               g_BootContext.DriverAreaHost, &g_BootContext.DriverAreaCursor,
+                               D, &Host);
+        if (!EFI_ERROR(Status)) {
+            g_BootContext.DriverHosts[I] = Host;
+            Loaded++;
+            Print(L"  Staged driver: %s -> guest 0x%x (%d bytes)\n",
+                  D->Name, (UINT64)D->GuestAddress, (UINT64)D->FileSize);
+        } else {
+            Print(L"  Failed to stage driver '%s': %r\n", D->Name, Status);
+        }
+    }
+
+    g_BootContext.LoadedDriverCount = Loaded;
+    return (Loaded > 0) ? EFI_SUCCESS : EFI_NOT_FOUND;
+}
+
+EFI_STATUS
+PpcGetSystemFolderInfo (
+    OUT PPC_SYSTEM_FOLDER_INFO* Info
+    )
+{
+    if (Info == NULL) {
+        return EFI_INVALID_PARAMETER;
+    }
+    BootFillSystemFolderInfo(Info);
+    return EFI_SUCCESS;
+}
+
+EFI_STATUS
+PpcGetSystemFile (
+    IN  UINTN Index,
+    OUT PPC_SYSTEM_FILE* File
+    )
+{
+    if (File == NULL) {
+        return EFI_INVALID_PARAMETER;
+    }
+    if (Index >= g_BootContext.SystemFileCount) {
+        return EFI_NOT_FOUND;
+    }
+    *File = g_BootContext.SystemFiles[Index];
+    return EFI_SUCCESS;
+}
+
+EFI_STATUS
+PpcGetDriver (
+    IN  UINTN Index,
+    OUT PPC_SYSTEM_FILE* Driver
+    )
+{
+    if (Driver == NULL) {
+        return EFI_INVALID_PARAMETER;
+    }
+    if (Index >= g_BootContext.DriverCount) {
+        return EFI_NOT_FOUND;
+    }
+    *Driver = g_BootContext.Drivers[Index];
+    return EFI_SUCCESS;
+}
+
+EFI_STATUS
+PpcRunSystemFilesSelfTest (
+    VOID
+    )
+{
+    UINTN I;
+    UINTN DriverMismatch = 0;
+
+    g_BootTestPasses = 0;
+    g_BootTestFailures = 0;
+
+    Print(L"--- System Files & Drivers Self-Test ---\n");
+
+    BootSelfTestCheck(g_BootContext.SystemFolderScanned, L"system folder scan ran");
+    BootSelfTestCheck(g_BootContext.LoadedSystemFileCount <= g_BootContext.SystemFileCount,
+                      L"system file count consistent");
+    BootSelfTestCheck(g_BootContext.LoadedDriverCount <= g_BootContext.DriverCount,
+                      L"driver count consistent");
+
+    for (I = 0; I < g_BootContext.SystemFileCount; I++) {
+        PPC_SYSTEM_FILE* F = &g_BootContext.SystemFiles[I];
+        if (!F->Loaded) {
+            continue;
+        }
+        UINT8 First = PpcReadGuestByte((UINT32)F->GuestAddress);
+        UINT8 Expect = ((UINT8*)g_BootContext.SystemFileHosts[I])[0];
+        BootSelfTestCheck(First == Expect, F->Name);
+    }
+
+    for (I = 0; I < g_BootContext.DriverCount; I++) {
+        PPC_SYSTEM_FILE* D = &g_BootContext.Drivers[I];
+        if (!D->Loaded) {
+            continue;
+        }
+        UINT8 First = PpcReadGuestByte((UINT32)D->GuestAddress);
+        UINT8 Expect = ((UINT8*)g_BootContext.DriverHosts[I])[0];
+        if (First != Expect) {
+            DriverMismatch++;
+        }
+    }
+    BootSelfTestCheck(DriverMismatch == 0, L"staged drivers read back correctly");
+
+    if (g_BootContext.SystemReady) {
+        BootSelfTestCheck(
+            PpcReadGuestByte(PPC_LOW_MEM_GUEST_BASE + PPC_LOW_MEM_MAGIC_OFFSET + 0) == 0x45 &&
+            PpcReadGuestByte(PPC_LOW_MEM_GUEST_BASE + PPC_LOW_MEM_MAGIC_OFFSET + 1) == 0x46 &&
+            PpcReadGuestByte(PPC_LOW_MEM_GUEST_BASE + PPC_LOW_MEM_MAGIC_OFFSET + 2) == 0x49 &&
+            PpcReadGuestByte(PPC_LOW_MEM_GUEST_BASE + PPC_LOW_MEM_MAGIC_OFFSET + 3) == 0x21,
+            L"low-memory boot info intact after staging");
+    }
+
+    Print(L"--- System files self-test complete: %d passed, %d failed ---\n",
           g_BootTestPasses, g_BootTestFailures);
 
     return (g_BootTestFailures == 0) ? EFI_SUCCESS : EFI_LOAD_ERROR;

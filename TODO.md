@@ -2,13 +2,36 @@
 
 ## Current State
 
-Phase 5 (Boot Process) first deliverable is implemented: the classic Mac OS boot
-memory map, ROM loading, and system initialization routines.
+Phase 5 (Boot Process) is implemented up to the platform-verification step: the
+classic Mac OS boot memory map, ROM loading, system initialization, System
+Folder / driver support, and now an initial PowerPC FPU core in the interpreter
+(FP registers, FPSCR, FP loads/stores, arithmetic/compare/move/convert).
+
+**FPU core (implemented):** `PpcExecuteInstruction` now gates all FP opcodes
+(48-55, 59, 63; 56-58 and 60-62 are reserved and stay `EFI_UNSUPPORTED`) on
+MSR[FP] and raises the FP-unavailable exception (0x800) when clear, so an OS
+can set MSR[FP] and re-execute. FP D-form loads/stores
+(`lfs/lfsu/lfd/lfdu/stfs/stfsu/stfd/stfdu`), X-form execution
+(`fcmpu/fcmpo/fctiw/fctiwz/fadd/fsub/fdiv/fneg/fmr/fnabs/fabs/frsp/fsqrt/fres/
+mffs/mtfsf/mtfsfi/mtfsb0/mtfsb1/fsel`), and A-form arithmetic (`fmul/fmadd/
+fmsub/fnmadd/fnmsub`, single with an `s` suffix; the multiplier rides in the
+FRC field) are dispatched. FPSCR handling uses the classic PowerPC 32-bit
+layout (bit 0 = MSB: FX/FEX/VX/OX, sticky VX* bits, enable bits VE/OE/UE/ZE/XE,
+RN, FPCC), FX/FEX/VX recomputation, CR1 recording, and big-endian guest
+single/double loads/stores. FP accessors (`PpcGet/SetFprValue`,
+`PpcGet/SetFpscrValue`) are wired into the register API. `PpcHandleException`
+maps FP-unavailable to 0x800 and program to 0x700. The self-test gained 17 FP
+checks (#17-33), including fmul/fmadd A-form and mtfsfi RN. `PpcDecodeInstruction`
+has FP mnemonics for opcodes 48-55 and 59/63. **Remaining:** a macOS build/run
+(`make clean && make`, then QEMU/OVMF) is required; a Windows host cannot run
+the clang/lld-link GNU-EFI toolchain.
 
 **Phase 5 recap:** The CPU guest memory map is now multi-region
-(`PpcAddGuestMemoryRegion` in `src/cpu/interpreter.c`): the primary 256 MB guest
-RAM at guest 0x10000000, a dedicated read/write low-memory globals region at
-guest 0x00000000 (16 KB), and a read-only system ROM window at guest 0xFFF00000.
+(`PpcAddGuestMemoryRegion` in `src/cpu/interpreter.c`, up to 8 regions): the
+primary 256 MB guest RAM at guest 0x10000000, a dedicated read/write low-memory
+globals region at guest 0x00000000 (16 KB), a read-only system ROM window at
+guest 0xFFF00000, and read/write staging areas for system files (0x20000000,
+16 MB) and drivers (0x21000000, 8 MB).
 `PpcInstallLowMemory`/`PpcInstallSystemRom`/`PpcInstallDemoRom` in
 `src/boot/bootloader_impl.c` install the regions; the demo ROM is a
 self-contained image with a reset-vector program. `PpcPrepareSystemForBoot`
@@ -16,8 +39,19 @@ resets the CPU to the ROM reset vector with `MSR = ME|RI` and writes an emulator
 boot info block (magic + RAM/ROM geometry) into low memory.
 `PpcRunBootSelfTest` verifies: low-memory read/write, ROM magic word `ROM1`
 readable, ROM read-only enforcement, and a cross-region ROM -> RAM program
-executed from the reset vector. `src/main.c` wires the Phase 5 sequence
-(install low memory -> install ROM with demo fallback -> self-test -> prepare ->
+executed from the reset vector.
+
+**System files & drivers:** `PpcLocateSystemFolder` scans the boot volume for
+`\System Folder` and detects System, Finder, Extensions, and the Mac OS ROM
+file. `PpcLoadSystemFiles` stages System/Finder/Mac OS ROM into the system
+staging area; `PpcScanExtensionsDirectory` enumerates `\System Folder\
+Extensions` via real directory reads into a driver registry and `PpcLoadDrivers`
+stages each one. The ROM loader falls back from `\System\MacOS\ROM` to the
+`Mac OS ROM` file before the demo ROM. `PpcRunSystemFilesSelfTest` verifies
+staged files read back through the interpreter memory path, driver readback, and
+that the low-memory boot info survives staging. `src/main.c` wires the Phase 5
+sequence (install low memory -> install ROM with demo fallback -> memory-map
+self-test -> prepare -> scan/stage system files and drivers -> self-test ->
 report). Code is written against GNU-EFI idioms; a build/run on macOS
 (`make clean && make`, then QEMU/OVMF) is still required to verify.
 
@@ -108,7 +142,7 @@ demo, kernel load/verify/execute, boot.log). Build is clean with
 ## Phase 5: Boot Process
 - [x] Create bootloader for Mac OS (load ROM image, set up guest memory map) - first deliverable: multi-region guest memory map (RAM + low-memory globals + read-only ROM window), ROM load from volume with demo-ROM fallback
 - [x] Implement system initialization routines - CPU reset to ROM reset vector (MSR ME|RI), boot info block in low memory, `PpcRunBootSelfTest` (low-memory R/W, ROM read-only, cross-region ROM->RAM execution)
-- [ ] Add support for system files and drivers
+- [x] Add support for system files and drivers - System Folder scan (`\System Folder` + System/Finder/Extensions/Mac OS ROM detection), guest staging areas (system 0x20000000, drivers 0x21000000) mapped via the multi-region memory map, Extensions directory enumeration with a driver registry, `PpcRunSystemFilesSelfTest`, and Mac OS ROM file fallback in the ROM loader
 - [ ] Test boot process with various Mac OS versions
 - [ ] Verify Phase 5 on macOS (`make clean && make`) and in QEMU/OVMF
 

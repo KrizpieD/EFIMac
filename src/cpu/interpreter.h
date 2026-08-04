@@ -19,6 +19,10 @@ typedef struct {
     UINT32  Lr;             // Link Register
     UINT32  Pc;             // Program Counter (guest address)
     UINT32  Spr[1024];      // Special Purpose Register file
+    UINT32  TimeBaseL;      // Time base lower (TBL)
+    UINT32  TimeBaseH;      // Time base upper (TBU)
+    UINT64  Fpr[32];        // Floating-point registers (IEEE-754 double bit patterns)
+    UINT32  Fpscr;          // Floating-point status/control register (classic 32-bit layout)
     UINT32  ExceptionPending;  // 0 = none, else PPC_EXCEPTION_*
 } PPC_CPU_CONTEXT;
 

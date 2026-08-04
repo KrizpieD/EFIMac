@@ -48,6 +48,7 @@ PpcGetRegisterValue (
         case PPC_REG_CR:   *Value = g_PpcContext.Cr;   return EFI_SUCCESS;
         case PPC_REG_XER:  *Value = g_PpcContext.Xer;  return EFI_SUCCESS;
         case PPC_REG_PC:   *Value = g_PpcContext.Pc;   return EFI_SUCCESS;
+        case PPC_REG_FPSCR:*Value = g_PpcContext.Fpscr;return EFI_SUCCESS;
         default:           return EFI_INVALID_PARAMETER;
     }
 }
@@ -73,6 +74,7 @@ PpcSetRegisterValue (
         case PPC_REG_CR:   g_PpcContext.Cr   = Value; return EFI_SUCCESS;
         case PPC_REG_XER:  g_PpcContext.Xer  = Value; return EFI_SUCCESS;
         case PPC_REG_PC:   g_PpcContext.Pc   = Value; return EFI_SUCCESS;
+        case PPC_REG_FPSCR:g_PpcContext.Fpscr= Value; return EFI_SUCCESS;
         default:           return EFI_INVALID_PARAMETER;
     }
 }
@@ -97,6 +99,44 @@ PpcSetGprValue (
     if (RegisterNumber < 32) {
         g_PpcContext.Gpr[RegisterNumber] = Value;
     }
+}
+
+UINT64
+PpcGetFprValue (
+    IN UINT8 RegisterNumber
+    )
+{
+    if (RegisterNumber < 32) {
+        return g_PpcContext.Fpr[RegisterNumber];
+    }
+    return 0;
+}
+
+VOID
+PpcSetFprValue (
+    IN UINT8  RegisterNumber,
+    IN UINT64 Value
+    )
+{
+    if (RegisterNumber < 32) {
+        g_PpcContext.Fpr[RegisterNumber] = Value;
+    }
+}
+
+UINT32
+PpcGetFpscrValue (
+    VOID
+    )
+{
+    return g_PpcContext.Fpscr;
+}
+
+VOID
+PpcSetFpscrValue (
+    IN UINT32 Value
+    )
+{
+    g_PpcContext.Fpscr = Value;
 }
 
 // ---------------------------------------------------------------------------
@@ -273,6 +313,135 @@ PpcRunSelfTest (
                   g_SelfTestMem[0] == 0x12 && g_SelfTestMem[1] == 0x34 &&
                   g_SelfTestMem[2] == 0x56 && g_SelfTestMem[3] == 0x78,
                   L"lwz r11,0(r1) -> 0x12345678 (big-endian)");
+
+    // -------- Floating-point core --------
+
+    // 17. FP-unavailable: an FP instruction with MSR[FP] clear raises the
+    //     FP-unavailable exception instead of executing.
+    g_PpcContext.Msr = 0;
+    g_PpcContext.ExceptionPending = 0;
+    PpcSetGprValue(1, 0x10000);
+    Status = PpcExecuteInstruction(0xC8410000, 0x4000, &Next);   // lfd f2,0(r1)
+    SelfTestCheck(Status == EFI_SUCCESS &&
+                  g_PpcContext.ExceptionPending == PPC_EXCEPTION_FP_UNAVAILABLE,
+                  L"lfd with MSR[FP]=0 -> FP unavailable");
+    g_PpcContext.ExceptionPending = 0;
+
+    // 18. lfd f2,0(r1) loads the double 1.5 stored at guest 0x10000.
+    g_PpcContext.Msr = PPC_MSR_FP;
+    ZeroMem(g_SelfTestMem, sizeof(g_SelfTestMem));
+    PpcWriteGuestByte(0x10000, 0x3F);
+    PpcWriteGuestByte(0x10001, 0xF8);
+    PpcWriteGuestByte(0x10002, 0x00);
+    PpcWriteGuestByte(0x10003, 0x00);
+    PpcWriteGuestByte(0x10004, 0x00);
+    PpcWriteGuestByte(0x10005, 0x00);
+    PpcWriteGuestByte(0x10006, 0x00);
+    PpcWriteGuestByte(0x10007, 0x00);
+    Status = PpcExecuteInstruction(0xC8410000, 0x4004, &Next);
+    SelfTestCheck(Status == EFI_SUCCESS &&
+                  PpcGetFprValue(2) == 0x3FF8000000000000ULL,
+                  L"lfd f2,0(r1) -> FPR2 = 1.5");
+
+    // 19. stfd f2,8(r1) writes the value back big-endian.
+    Status = PpcExecuteInstruction(0xD8410008, 0x4008, &Next);   // stfd f2,8(r1)
+    SelfTestCheck(Status == EFI_SUCCESS &&
+                  g_SelfTestMem[8] == 0x3F && g_SelfTestMem[9] == 0xF8 &&
+                  g_SelfTestMem[10] == 0x00 && g_SelfTestMem[11] == 0x00 &&
+                  g_SelfTestMem[12] == 0x00 && g_SelfTestMem[13] == 0x00 &&
+                  g_SelfTestMem[14] == 0x00 && g_SelfTestMem[15] == 0x00,
+                  L"stfd f2,8(r1) -> memory holds 1.5");
+
+    // 20. fadd f3,f2,f2 -> 3.0 (0x4008000000000000)
+    Status = PpcExecuteInstruction(0xFC62102A, 0x400C, &Next);
+    SelfTestCheck(Status == EFI_SUCCESS &&
+                  PpcGetFprValue(3) == 0x4008000000000000ULL,
+                  L"fadd f3,f2,f2 -> 3.0");
+
+    // 21. fcmpu cr7,f2,f3 (1.5 < 3.0) -> CR7 = LT, FPSCR[FPCC] = FL
+    Status = PpcExecuteInstruction(0xFF821800, 0x4010, &Next);
+    SelfTestCheck(Status == EFI_SUCCESS && PpcGetCrField(7) == PPC_CR_LT &&
+                  (PpcGetFpscrValue() & PPC_FPSCR_FPCC) == PPC_FPSCR_FL,
+                  L"fcmpu cr7,f2,f3 (1.5<3.0) -> CR7=LT");
+
+    // 22. fctiwz f4,f2 -> FPR4 high word 0xFFF80000, low word 1
+    Status = PpcExecuteInstruction(0xFC80101E, 0x4014, &Next);
+    SelfTestCheck(Status == EFI_SUCCESS &&
+                  PpcGetFprValue(4) == ((0xFFF80000ULL << 32) | 1ULL),
+                  L"fctiwz f4,f2 -> 1 in low word");
+
+    // 23. fneg f6,f2 -> -1.5 (0xBFF8000000000000)
+    Status = PpcExecuteInstruction(0xFCC01050, 0x4018, &Next);
+    SelfTestCheck(Status == EFI_SUCCESS &&
+                  PpcGetFprValue(6) == 0xBFF8000000000000ULL,
+                  L"fneg f6,f2 -> -1.5");
+
+    // 24. fabs f7,f6 -> 1.5
+    Status = PpcExecuteInstruction(0xFCE03210, 0x401C, &Next);
+    SelfTestCheck(Status == EFI_SUCCESS &&
+                  PpcGetFprValue(7) == 0x3FF8000000000000ULL,
+                  L"fabs f7,f6 -> 1.5");
+
+    // 25. fmr f8,f2 -> 1.5
+    Status = PpcExecuteInstruction(0xFD001090, 0x4020, &Next);
+    SelfTestCheck(Status == EFI_SUCCESS &&
+                  PpcGetFprValue(8) == 0x3FF8000000000000ULL,
+                  L"fmr f8,f2 -> 1.5");
+
+    // 26. mffs f5 -> FPR5 high word equals FPSCR
+    Status = PpcExecuteInstruction(0xFCA0048E, 0x4024, &Next);
+    SelfTestCheck(Status == EFI_SUCCESS &&
+                  (PpcGetFprValue(5) >> 32) == PpcGetFpscrValue(),
+                  L"mffs f5 -> FPR5 high word = FPSCR");
+
+    // 27. lfs f9,16(r1) loads the single 1.0 (0x3F800000) -> FPR9 = 1.0 double
+    PpcWriteGuestByte(0x10010, 0x3F);
+    PpcWriteGuestByte(0x10011, 0x80);
+    PpcWriteGuestByte(0x10012, 0x00);
+    PpcWriteGuestByte(0x10013, 0x00);
+    Status = PpcExecuteInstruction(0xC1210010, 0x4028, &Next);   // lfs f9,16(r1)
+    SelfTestCheck(Status == EFI_SUCCESS &&
+                  PpcGetFprValue(9) == 0x3FF0000000000000ULL,
+                  L"lfs f9,16(r1) -> FPR9 = 1.0");
+
+    // 28. stfs f9,24(r1) stores the single 1.0 big-endian.
+    Status = PpcExecuteInstruction(0xD1210018, 0x402C, &Next);   // stfs f9,24(r1)
+    SelfTestCheck(Status == EFI_SUCCESS &&
+                  g_SelfTestMem[24] == 0x3F && g_SelfTestMem[25] == 0x80 &&
+                  g_SelfTestMem[26] == 0x00 && g_SelfTestMem[27] == 0x00,
+                  L"stfs f9,24(r1) -> memory holds single 1.0");
+
+    // 29. FPSCR accessor round-trip
+    PpcSetFpscrValue(PPC_FPSCR_RN_ZERO | PPC_FPSCR_ZX);
+    SelfTestCheck(PpcGetFpscrValue() == (PPC_FPSCR_RN_ZERO | PPC_FPSCR_ZX),
+                  L"PpcSetFpscrValue/PpcGetFpscrValue round-trip");
+
+    // 30. FPSCR via the register-file API
+    PpcSetRegisterValue(PPC_REG_FPSCR, PPC_FPSCR_VXZDZ | PPC_FPSCR_RN_PLUS);
+    PpcGetRegisterValue(PPC_REG_FPSCR, &RegVal);
+    SelfTestCheck(RegVal == (PPC_FPSCR_VXZDZ | PPC_FPSCR_RN_PLUS),
+                  L"FPSCR via PpcSet/GetRegisterValue");
+
+    // 31. fmul f10,f2,f2 -> 2.25 (A-form: multiplier rides in the FRC field)
+    g_PpcContext.Fpscr = 0;
+    Status = PpcExecuteInstruction(0xFD4200B2, 0x4030, &Next);   // fmul f10,f2,f2
+    SelfTestCheck(Status == EFI_SUCCESS &&
+                  PpcGetFprValue(10) == 0x4002000000000000ULL,
+                  L"fmul f10,f2,f2 -> 2.25");
+
+    // 32. fmadd f11,f2,f2,f9 -> 1.5*1.5 + 1.0 = 3.25
+    Status = PpcExecuteInstruction(0xFD62127A, 0x4034, &Next);   // fmadd f11,f2,f2,f9
+    SelfTestCheck(Status == EFI_SUCCESS &&
+                  PpcGetFprValue(11) == 0x400A000000000000ULL,
+                  L"fmadd f11,f2,f2,f9 -> 3.25");
+
+    // 33. mtfsfi 7,2 sets FPSCR[RN] = 10 (round toward +infinity)
+    g_PpcContext.Fpscr = 0;
+    Status = PpcExecuteInstruction(0xFF84010C, 0x4038, &Next);   // mtfsfi 7,2
+    SelfTestCheck(Status == EFI_SUCCESS &&
+                  (PpcGetFpscrValue() & PPC_FPSCR_RN) == PPC_FPSCR_RN_PLUS,
+                  L"mtfsfi 7,2 -> FPSCR[RN] = round toward +inf");
+
     PpcSetMemoryAccess(NULL, NULL);
 
     Print(L"--- Self-test complete: %d passed, %d failed ---\n",
@@ -334,6 +503,8 @@ PpcHandleException (
         case PPC_EXCEPTION_INTERRUPT:   Vector = PPC_EXCEPTION_VECTOR_INTERRUPT;   break;
         case PPC_EXCEPTION_TRAP:        Vector = PPC_EXCEPTION_VECTOR_TRAP;        break;
         case PPC_EXCEPTION_SYSTEM_CALL: Vector = PPC_EXCEPTION_VECTOR_SYSTEM_CALL; break;
+        case PPC_EXCEPTION_FP_UNAVAILABLE: Vector = PPC_EXCEPTION_VECTOR_FP_UNAVAILABLE; break;
+        case PPC_EXCEPTION_PROGRAM:     Vector = PPC_EXCEPTION_VECTOR_PROGRAM;     break;
         default:
             Print(L"Unhandled PowerPC exception type: %d\n", ExceptionType);
             return EFI_UNSUPPORTED;

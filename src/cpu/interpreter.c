@@ -36,6 +36,14 @@ PPC_CPU_CONTEXT g_PpcContext = {0};
                              (((w) >> 2) | 0xFF000000) : \
                              (((w) >> 2) & 0xFFFFFF)))
 
+// Floating-point fields (opcodes 48-63). FRT/FRA/FRB occupy the same word
+// positions as their fixed-point counterparts; FRC is the third source of the
+// A-form fused multiply-add instructions.
+#define FRT(w)     (((w) >> 21) & 0x1F)
+#define FRA(w)     (((w) >> 16) & 0x1F)
+#define FRB(w)     (((w) >> 11) & 0x1F)
+#define FRC(w)     (((w) >> 6) & 0x1F)
+
 // Effective address helpers (RA==0 means GPR(0) is NOT used)
 #define EaD(w, ra) (((ra) == 0) ? SIMM(w) : (g_PpcContext.Gpr[ra] + SIMM(w)))
 #define EaX(w, ra, rb) ((((ra) == 0) ? 0U : g_PpcContext.Gpr[ra]) + g_PpcContext.Gpr[rb])
@@ -127,6 +135,37 @@ PPC_CPU_CONTEXT g_PpcContext = {0};
 #define XO19_ISYNC   150
 #define XO19_BCCTR   528
 
+// X-form XO values for floating-point opcodes 59 (single) and 63 (double)
+#define XOFP_FCMPU      0
+#define XOFP_FRSP      12
+#define XOFP_FCTIW     14
+#define XOFP_FCTIWZ    15
+#define XOFP_FDIV      18
+#define XOFP_FSUB      20
+#define XOFP_FADD      21
+#define XOFP_FSQRT     22
+#define XOFP_FSEL      23
+#define XOFP_FRES      24
+#define XOFP_FCMPO     32
+#define XOFP_FNEG      40
+#define XOFP_FMR       72
+#define XOFP_FNABS    136
+#define XOFP_FABS     264
+#define XOFP_MFFS     583
+#define XOFP_MTFSFI   134
+#define XOFP_MTFSB0   192
+#define XOFP_MTFSB1   193
+#define XOFP_MTFSF    711
+
+// A-form XO values (word bits 1-5) for the FP ops that take a third source in
+// the FRC field. FMUL encodes the multiplier in FRC; the fused multiply-add
+// family (FMSUB/FMADD/FNMSUB/FNMADD) uses FRA x FRB plus FRC.
+#define XOAF_FMUL      25
+#define XOAF_FMSUB     28
+#define XOAF_FMADD     29
+#define XOAF_FNMSUB    30
+#define XOAF_FNMADD    31
+
 // SPR numbers
 #define SPR_XER    1
 #define SPR_LR     8
@@ -145,7 +184,7 @@ PPC_CPU_CONTEXT g_PpcContext = {0};
 // PpcAddGuestMemoryRegion(). Addresses not covered by any region read as
 // zero and ignore writes.
 // ---------------------------------------------------------------------------
-#define PPC_MAX_GUEST_REGIONS 4
+#define PPC_MAX_GUEST_REGIONS 8
 
 typedef struct {
     VOID*   HostBase;   // Host virtual address backing the region
@@ -605,6 +644,466 @@ PpcStoreString (
 }
 
 // ---------------------------------------------------------------------------
+// Floating-point helpers
+//
+// FPRs hold IEEE-754 double bit patterns. Guest memory is big-endian. The C
+// arithmetic uses the host's round-to-nearest-even, which matches FPSCR[RN]=0;
+// the other rounding modes are honored by the integer-conversion helpers but
+// not by the arithmetic ops (documented limitation of the emulator core).
+// FPSCR sticky/exception bits are recomputed where cheap; FP exceptions never
+// raise traps in the interpreter.
+// ---------------------------------------------------------------------------
+typedef union {
+    UINT64 U;
+    double D;
+} PPC_FP64;
+
+typedef union {
+    UINT32 U;
+    float  F;
+} PPC_FP32;
+
+static double
+PpcFprValue (
+    IN UINT8 Reg
+    )
+{
+    PPC_FP64 V;
+    V.U = g_PpcContext.Fpr[Reg & 31];
+    return V.D;
+}
+
+static UINT64
+PpcFprBits (
+    IN double D
+    )
+{
+    PPC_FP64 V;
+    V.D = D;
+    return V.U;
+}
+
+static double
+PpcLoadDouble (
+    IN UINT32 Ea
+    )
+{
+    PPC_FP64 V;
+    V.U = ((UINT64)g_ReadByte(Ea + 0) << 56) |
+          ((UINT64)g_ReadByte(Ea + 1) << 48) |
+          ((UINT64)g_ReadByte(Ea + 2) << 40) |
+          ((UINT64)g_ReadByte(Ea + 3) << 32) |
+          ((UINT64)g_ReadByte(Ea + 4) << 24) |
+          ((UINT64)g_ReadByte(Ea + 5) << 16) |
+          ((UINT64)g_ReadByte(Ea + 6) << 8)  |
+          ((UINT64)g_ReadByte(Ea + 7));
+    return V.D;
+}
+
+static VOID
+PpcStoreDouble (
+    IN UINT32 Ea,
+    IN double D
+    )
+{
+    PPC_FP64 V;
+    V.D = D;
+    g_WriteByte(Ea + 0, (UINT8)(V.U >> 56));
+    g_WriteByte(Ea + 1, (UINT8)(V.U >> 48));
+    g_WriteByte(Ea + 2, (UINT8)(V.U >> 40));
+    g_WriteByte(Ea + 3, (UINT8)(V.U >> 32));
+    g_WriteByte(Ea + 4, (UINT8)(V.U >> 24));
+    g_WriteByte(Ea + 5, (UINT8)(V.U >> 16));
+    g_WriteByte(Ea + 6, (UINT8)(V.U >> 8));
+    g_WriteByte(Ea + 7, (UINT8)V.U);
+}
+
+static float
+PpcLoadSingle (
+    IN UINT32 Ea
+    )
+{
+    PPC_FP32 V;
+    V.U = ((UINT32)g_ReadByte(Ea + 0) << 24) |
+          ((UINT32)g_ReadByte(Ea + 1) << 16) |
+          ((UINT32)g_ReadByte(Ea + 2) << 8)  |
+          ((UINT32)g_ReadByte(Ea + 3));
+    return V.F;
+}
+
+static VOID
+PpcStoreSingle (
+    IN UINT32 Ea,
+    IN double D
+    )
+{
+    PPC_FP32 V;
+    V.F = (float)D;
+    g_WriteByte(Ea + 0, (UINT8)(V.U >> 24));
+    g_WriteByte(Ea + 1, (UINT8)(V.U >> 16));
+    g_WriteByte(Ea + 2, (UINT8)(V.U >> 8));
+    g_WriteByte(Ea + 3, (UINT8)V.U);
+}
+
+static double
+PpcFpAbs (
+    IN double D
+    )
+{
+    PPC_FP64 V;
+    V.D = D;
+    V.U &= 0x7FFFFFFFFFFFFFFFULL;
+    return V.D;
+}
+
+static double
+PpcFpNeg (
+    IN double D
+    )
+{
+    PPC_FP64 V;
+    V.D = D;
+    V.U ^= 0x8000000000000000ULL;
+    return V.D;
+}
+
+// Truncate D toward zero to a signed 32-bit integer (fctiwz). NaN returns
+// 0x80000000 and out-of-range values saturate, both setting VXCVI.
+static INT32
+PpcFpTruncToInt32 (
+    IN double D
+    )
+{
+    PPC_FP64 V;
+    UINT64  Bits;
+    INT32   Exp;
+    UINT64  Mant;
+    INT32   Result;
+    BOOLEAN Neg;
+
+    if (D != D) {  // NaN
+        g_PpcContext.Fpscr |= PPC_FPSCR_VXCVI;
+        return (INT32)0x80000000;
+    }
+    V.D = D;
+    Bits = V.U;
+    Neg  = (Bits >> 63) != 0;
+    Exp  = (INT32)((Bits >> 52) & 0x7FF) - 1023;
+    Mant = Bits & 0xFFFFFFFFFFFFFULL;
+
+    if (Exp < 0) {
+        return 0;  // |D| < 1
+    }
+    if (Exp >= 31) {
+        g_PpcContext.Fpscr |= PPC_FPSCR_VXCVI;  // |D| >= 2^31 (or infinity)
+        return Neg ? (INT32)0x80000000 : (INT32)0x7FFFFFFF;
+    }
+    Result = (INT32)((Mant | 0x1000000000000ULL) >> (52 - Exp));
+    return Neg ? -Result : Result;
+}
+
+// Round D to the nearest integer (half-to-even) as a signed 32-bit integer
+// (fctiw with FPSCR[RN]=0). NaN and out-of-range behave like PpcFpTruncToInt32.
+static INT32
+PpcFpRoundToInt32 (
+    IN double D
+    )
+{
+    double R;
+
+    if (D != D) {  // NaN
+        g_PpcContext.Fpscr |= PPC_FPSCR_VXCVI;
+        return (INT32)0x80000000;
+    }
+    if (D >= 2147483648.0 || D < -2147483648.0) {
+        g_PpcContext.Fpscr |= PPC_FPSCR_VXCVI;
+        return (D < 0) ? (INT32)0x80000000 : (INT32)0x7FFFFFFF;
+    }
+    // Round-to-nearest-even via the 2^52 add/subtract trick (|D| < 2^31 here).
+    if (D >= 0) {
+        R = (D + 4503599627370496.0) - 4503599627370496.0;
+    } else {
+        R = (D - 4503599627370496.0) + 4503599627370496.0;
+    }
+    return (INT32)R;
+}
+
+// Recompute the derived FPSCR bits (VX, FX, FEX) from the raw sticky flags.
+static VOID
+PpcUpdateFpscr (
+    VOID
+    )
+{
+    UINT32 F = g_PpcContext.Fpscr;
+
+    if (F & PPC_FPSCR_VI_MASK) {
+        F |= PPC_FPSCR_VX;
+    } else {
+        F &= ~PPC_FPSCR_VX;
+    }
+    if (F & (PPC_FPSCR_OX | PPC_FPSCR_UX | PPC_FPSCR_ZX | PPC_FPSCR_XX)) {
+        F |= PPC_FPSCR_FX;
+    } else {
+        F &= ~PPC_FPSCR_FX;
+    }
+    F &= ~PPC_FPSCR_FEX;
+    if ((F & PPC_FPSCR_VX) && (F & PPC_FPSCR_VE)) F |= PPC_FPSCR_FEX;
+    if ((F & PPC_FPSCR_OX) && (F & PPC_FPSCR_OE)) F |= PPC_FPSCR_FEX;
+    if ((F & PPC_FPSCR_UX) && (F & PPC_FPSCR_UE)) F |= PPC_FPSCR_FEX;
+    if ((F & PPC_FPSCR_ZX) && (F & PPC_FPSCR_ZE)) F |= PPC_FPSCR_FEX;
+    if ((F & PPC_FPSCR_XX) && (F & PPC_FPSCR_XE)) F |= PPC_FPSCR_FEX;
+
+    g_PpcContext.Fpscr = F;
+}
+
+// Set the FPSCR[FPCC] field (C, FL, FG, FE, FU).
+static VOID
+PpcSetFpscrFpcc (
+    IN UINT32 Field
+    )
+{
+    g_PpcContext.Fpscr =
+        (g_PpcContext.Fpscr & ~PPC_FPSCR_FPCC) | (Field & PPC_FPSCR_FPCC);
+}
+
+// FP compare: set CR field Bf and FPSCR[FPCC] from the relation of A and B.
+// SignalInvalid selects fcmpo (VXVC on unordered) vs fcmpu.
+static VOID
+PpcFpCompare (
+    IN UINT32  Bf,
+    IN double  A,
+    IN double  B,
+    IN BOOLEAN SignalInvalid
+    )
+{
+    UINT32 Field;
+    UINT32 Fpcc;
+
+    if (A == B) {
+        Field = PPC_CR_EQ;
+        Fpcc  = PPC_FPSCR_FE;
+    } else if (A < B) {
+        Field = PPC_CR_LT;
+        Fpcc  = PPC_FPSCR_FL;
+    } else if (A > B) {
+        Field = PPC_CR_GT;
+        Fpcc  = PPC_FPSCR_FG;
+    } else {
+        Field = PPC_CR_UN;   // NaN / unordered
+        Fpcc  = PPC_FPSCR_FU;
+        if (SignalInvalid) {
+            g_PpcContext.Fpscr |= PPC_FPSCR_VXVC;
+            PpcUpdateFpscr();
+        }
+    }
+
+    PpcSetCrField(Bf, Field);
+    PpcSetFpscrFpcc(Fpcc);
+}
+
+// Record bit: copy FX/FEX/VX/OX from FPSCR into CR1.
+static VOID
+PpcUpdateCr1FromFpscr (
+    VOID
+    )
+{
+    UINT32 F = g_PpcContext.Fpscr;
+    UINT32 Value =
+        ((F & PPC_FPSCR_FX)  ? PPC_CR_LT : 0) |
+        ((F & PPC_FPSCR_FEX) ? PPC_CR_GT : 0) |
+        ((F & PPC_FPSCR_VX)  ? PPC_CR_EQ : 0) |
+        ((F & PPC_FPSCR_OX)  ? PPC_CR_SO : 0);
+    PpcSetCrField(1, Value);
+}
+
+// Execute a floating-point instruction (opcode 59 = single precision,
+// opcode 63 = double precision). Handles X-form ops (fadd/fsub/fdiv/compare/
+// move/convert/...), A-form fmul (the multiplier rides in the FRC field) and
+// the A-form fused ops fmadd/fmsub/fnmadd/fnmsub. Returns EFI_UNSUPPORTED for
+// unhandled encodings.
+static EFI_STATUS
+PpcExecuteFpXform (
+    IN  UINT32  w,
+    IN  BOOLEAN Single
+    )
+{
+    UINT32 X5  = (w >> 1) & 0x1F;
+    UINT32 Frt = FRT(w);
+    double A   = PpcFprValue(FRA(w));
+    double B   = PpcFprValue(FRB(w));
+    double C   = PpcFprValue(FRC(w));
+    double R;
+
+    // A-form ops are recognised by their 5-bit XO (bits 26-30). FMUL encodes
+    // the multiplier in the FRC field; the fused ops use FRA x FRB plus the
+    // addend/subtrahend in FRC.
+    switch (X5) {
+    case XOAF_FMUL:   R = A * C;         break;
+    case XOAF_FMSUB:  R = A * B - C;     break;
+    case XOAF_FMADD:  R = A * B + C;     break;
+    case XOAF_FNMSUB: R = -(A * B) - C;  break;
+    case XOAF_FNMADD: R = -(A * B) + C;  break;
+    default:
+        {
+            UINT32 X = XO10(w);
+
+            switch (X) {
+            case XOFP_FCMPU:   // fcmpu crfD, frA, frB
+                PpcFpCompare((w >> 23) & 0x7, A, B, FALSE);
+                return EFI_SUCCESS;
+
+            case XOFP_FCMPO:   // fcmpo crfD, frA, frB
+                PpcFpCompare((w >> 23) & 0x7, A, B, TRUE);
+                return EFI_SUCCESS;
+
+            case XOFP_FCTIW:   // fctiw frD, frB (round per FPSCR[RN])
+                g_PpcContext.Fpr[Frt] =
+                    (0xFFF80000ULL << 32) | (UINT32)PpcFpRoundToInt32(B);
+                if (Rc(w)) {
+                    PpcUpdateCr1FromFpscr();
+                }
+                return EFI_SUCCESS;
+
+            case XOFP_FCTIWZ:  // fctiwz frD, frB (truncate)
+                g_PpcContext.Fpr[Frt] =
+                    (0xFFF80000ULL << 32) | (UINT32)PpcFpTruncToInt32(B);
+                if (Rc(w)) {
+                    PpcUpdateCr1FromFpscr();
+                }
+                return EFI_SUCCESS;
+
+            case XOFP_FDIV:
+                R = A / B;
+                break;
+
+            case XOFP_FSUB:
+                R = A - B;
+                break;
+
+            case XOFP_FADD:
+                R = A + B;
+                break;
+
+            case XOFP_FNEG:
+                R = PpcFpNeg(B);
+                break;
+
+            case XOFP_FMR:
+                R = B;
+                break;
+
+            case XOFP_FNABS:
+                R = PpcFpNeg(PpcFpAbs(B));
+                break;
+
+            case XOFP_FABS:
+                R = PpcFpAbs(B);
+                break;
+
+            case XOFP_FRSP:    // frsp frD, frB: round to single precision
+                R = (double)(float)B;
+                break;
+
+            case XOFP_FSQRT:
+                R = __builtin_sqrt(B);
+                break;
+
+            case XOFP_FRES:    // fres frD, frB: reciprocal estimate (exact 1/x here)
+                R = 1.0 / B;
+                break;
+
+            case XOFP_MFFS:    // mffs frD
+                g_PpcContext.Fpr[Frt] = (UINT64)g_PpcContext.Fpscr << 32;
+                if (Rc(w)) {
+                    PpcUpdateCr1FromFpscr();
+                }
+                return EFI_SUCCESS;
+
+            case XOFP_MTFSFI:  // mtfsfi crfD, IMM
+                {
+                    UINT32 Field = (w >> 23) & 0x7;
+                    UINT32 Imm   = (w >> 17) & 0xF;
+                    UINT32 Shift = 28 - Field * 4;
+                    g_PpcContext.Fpscr =
+                        (g_PpcContext.Fpscr & ~(0xFUL << Shift)) | (Imm << Shift);
+                }
+                if (Rc(w)) {
+                    PpcUpdateCr1FromFpscr();
+                }
+                return EFI_SUCCESS;
+
+            case XOFP_MTFSB0:  // mtfsb0 crB
+                g_PpcContext.Fpscr &= ~(0x80000000U >> ((w >> 16) & 0x1F));
+                if (Rc(w)) {
+                    PpcUpdateCr1FromFpscr();
+                }
+                return EFI_SUCCESS;
+
+            case XOFP_MTFSB1:  // mtfsb1 crB
+                g_PpcContext.Fpscr |= (0x80000000U >> ((w >> 16) & 0x1F));
+                if (Rc(w)) {
+                    PpcUpdateCr1FromFpscr();
+                }
+                return EFI_SUCCESS;
+
+            case XOFP_MTFSF:   // mtfsf FM, frB
+                {
+                    UINT32 Fm  = (w >> 17) & 0xFF;
+                    UINT32 Frs = (UINT32)(g_PpcContext.Fpr[(w >> 16) & 0x1F] >> 32);
+                    if (Fm != 0) {
+                        UINT32 New = g_PpcContext.Fpscr;
+                        UINTN  I;
+                        for (I = 0; I < 8; I++) {
+                            if (Fm & (1 << (7 - I))) {
+                                UINT32 Shift = 28 - (UINT32)I * 4;
+                                New = (New & ~(0xFUL << Shift)) |
+                                      (((Frs >> Shift) & 0xF) << Shift);
+                            }
+                        }
+                        // FX/FEX/VX are derived from the exception bits actually set.
+                        New &= ~(PPC_FPSCR_FX | PPC_FPSCR_FEX | PPC_FPSCR_VX);
+                        if (New & PPC_FPSCR_VI_MASK) {
+                            New |= PPC_FPSCR_VX;
+                        }
+                        if (New & (PPC_FPSCR_OX | PPC_FPSCR_UX | PPC_FPSCR_ZX |
+                                   PPC_FPSCR_XX)) {
+                            New |= PPC_FPSCR_FX;
+                        }
+                        g_PpcContext.Fpscr = New;
+                        PpcUpdateFpscr();
+                    }
+                }
+                if (Rc(w)) {
+                    PpcUpdateCr1FromFpscr();
+                }
+                return EFI_SUCCESS;
+
+            default:
+                if (((w >> 1) & 0x1F) == XOFP_FSEL) {
+                    // fsel frD, frA, frB, frC: frA >= 0 ? frC : frB. The third
+                    // source (frC) rides in the FRC field, which overlaps the XO
+                    // bits used by the other X-form FP ops, so it is detected by
+                    // the 5-bit XO.
+                    R = (A >= 0.0) ? C : B;
+                    break;
+                }
+                return EFI_UNSUPPORTED;
+            }
+        }
+        break;
+    }
+
+    if (Single) {
+        R = (double)(float)R;
+    }
+    g_PpcContext.Fpr[Frt] = PpcFprBits(R);
+    if (Rc(w)) {
+        PpcUpdateCr1FromFpscr();
+    }
+    return EFI_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -629,6 +1128,21 @@ PpcExecuteInstruction (
 
     if (NextAddress == NULL) {
         return EFI_INVALID_PARAMETER;
+    }
+
+    // All floating-point instructions (opcodes 48-55, 59, 63) require MSR[FP].
+    // With the bit clear the FP-unavailable exception is raised (vector 0x800);
+    // the OS handler sets MSR[FP] and re-executes. The reserved FP opcodes
+    // (56-58, 60-62) stay EFI_UNSUPPORTED.
+    if (Op == 48 || Op == 49 || Op == 50 || Op == 51 || Op == 52 || Op == 53 ||
+        Op == 54 || Op == 55 || Op == 59 || Op == 63) {
+        if (!(g_PpcContext.Msr & PPC_MSR_FP)) {
+            g_PpcContext.ExceptionPending = PPC_EXCEPTION_FP_UNAVAILABLE;
+            g_PpcContext.Srr0 = CurrentAddress;
+            g_PpcContext.Srr1 = g_PpcContext.Msr;
+            *NextAddress = CurrentAddress;
+            return EFI_SUCCESS;
+        }
     }
 
     switch (Op) {
@@ -906,6 +1420,69 @@ PpcExecuteInstruction (
             }
         }
         break;
+
+    // -------- Floating-point loads / stores (D-form) --------
+    case 48: // lfs
+        g_PpcContext.Fpr[FRT(w)] = PpcFprBits((double)PpcLoadSingle(EaD(w, RA(w))));
+        break;
+
+    case 49: // lfsu
+        {
+            UINT32 Ea = EaD(w, RA(w));
+            g_PpcContext.Fpr[FRT(w)] = PpcFprBits((double)PpcLoadSingle(Ea));
+            g_PpcContext.Gpr[RA(w)] = Ea;
+        }
+        break;
+
+    case 50: // lfd
+        g_PpcContext.Fpr[FRT(w)] = PpcFprBits(PpcLoadDouble(EaD(w, RA(w))));
+        break;
+
+    case 51: // lfdu
+        {
+            UINT32 Ea = EaD(w, RA(w));
+            g_PpcContext.Fpr[FRT(w)] = PpcFprBits(PpcLoadDouble(Ea));
+            g_PpcContext.Gpr[RA(w)] = Ea;
+        }
+        break;
+
+    case 52: // stfs
+        PpcStoreSingle(EaD(w, RA(w)), PpcFprValue(RS(w)));
+        break;
+
+    case 53: // stfsu
+        {
+            UINT32 Ea = EaD(w, RA(w));
+            PpcStoreSingle(Ea, PpcFprValue(RS(w)));
+            g_PpcContext.Gpr[RA(w)] = Ea;
+        }
+        break;
+
+    case 54: // stfd
+        PpcStoreDouble(EaD(w, RA(w)), PpcFprValue(RS(w)));
+        break;
+
+    case 55: // stfdu
+        {
+            UINT32 Ea = EaD(w, RA(w));
+            PpcStoreDouble(Ea, PpcFprValue(RS(w)));
+            g_PpcContext.Gpr[RA(w)] = Ea;
+        }
+        break;
+
+    // -------- Floating-point X/A-form (opcode 59 single, 63 double) --------
+    // X-form ops (fadd/fsub/fdiv/...) plus A-form ops (fmul and the fused
+    // fmadd/fmsub/fnmadd/fnmsub family) all live in these two primary opcodes.
+    case 59:
+    case 63:
+        {
+            EFI_STATUS FpStatus = PpcExecuteFpXform(w, (Op == 59));
+            if (EFI_ERROR(FpStatus)) {
+                return FpStatus;
+            }
+            *NextAddress = Next;
+            return EFI_SUCCESS;
+        }
 
     // -------- X-form (opcode 31) --------
     case 31:
@@ -1519,6 +2096,63 @@ PpcDecodeInstruction (
     Buffer[0] = 0;
     if (Op < 48) {
         Name = g_DOpcodeNames[Op];
+    } else if (Op >= 48 && Op <= 63) {
+        switch (Op) {
+        case 48:  Name = L"lfs";    break;
+        case 49:  Name = L"lfsu";   break;
+        case 50:  Name = L"lfd";    break;
+        case 51:  Name = L"lfdu";   break;
+        case 52:  Name = L"stfs";   break;
+        case 53:  Name = L"stfsu";  break;
+        case 54:  Name = L"stfd";   break;
+        case 55:  Name = L"stfdu";  break;
+        case 59:
+        case 63:
+            {
+                UINT32 X5 = (w >> 1) & 0x1F;
+                BOOLEAN Sng = (Op == 59);
+
+                // A-form ops share the primary opcode with the X-form FP ops;
+                // they are recognised by their 5-bit XO (bits 26-30).
+                if (X5 == XOAF_FMUL) {
+                    Name = Sng ? L"fmuls" : L"fmul";
+                    break;
+                }
+                switch (X5) {
+                case XOAF_FMSUB:  Name = Sng ? L"fmsubs"  : L"fmsub";  break;
+                case XOAF_FMADD:  Name = Sng ? L"fmadds"  : L"fmadd";  break;
+                case XOAF_FNMSUB: Name = Sng ? L"fnmsubs" : L"fnmsub"; break;
+                case XOAF_FNMADD: Name = Sng ? L"fnmadds" : L"fnmadd"; break;
+                case XOFP_FSEL:   Name = L"fsel";   break;
+                default:
+                    switch (XO10(w)) {
+                    case XOFP_FCMPU:   Name = L"fcmpu";   break;
+                    case XOFP_FCMPO:   Name = L"fcmpo";   break;
+                    case XOFP_FCTIW:   Name = L"fctiw";   break;
+                    case XOFP_FCTIWZ:  Name = L"fctiwz";  break;
+                    case XOFP_FRSP:    Name = L"frsp";    break;
+                    case XOFP_MFFS:    Name = L"mffs";    break;
+                    case XOFP_MTFSF:   Name = L"mtfsf";   break;
+                    case XOFP_MTFSFI:  Name = L"mtfsfi";  break;
+                    case XOFP_MTFSB0:  Name = L"mtfsb0";  break;
+                    case XOFP_MTFSB1:  Name = L"mtfsb1";  break;
+                    case XOFP_FABS:    Name = L"fabs";    break;
+                    case XOFP_FNABS:   Name = L"fnabs";   break;
+                    case XOFP_FNEG:    Name = L"fneg";    break;
+                    case XOFP_FMR:     Name = L"fmr";     break;
+                    case XOFP_FDIV:    Name = Sng ? L"fdivs" : L"fdiv";  break;
+                    case XOFP_FSUB:    Name = Sng ? L"fsubs" : L"fsub";  break;
+                    case XOFP_FADD:    Name = Sng ? L"fadds" : L"fadd";  break;
+                    case XOFP_FSQRT:   Name = Sng ? L"fsqrts": L"fsqrt"; break;
+                    case XOFP_FRES:    Name = L"fres";    break;
+                    default:           Name = L"FP-op";   break;
+                    }
+                    break;
+                }
+            }
+            break;
+        default: Name = L"fpu/reserved"; break;
+        }
     } else {
         Name = L"fpu/reserved";
     }
