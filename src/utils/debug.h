@@ -92,4 +92,39 @@ PpcDebugGetLogLevel (
     OUT UINT32* Level
     );
 
+/**
+  Write a message to boot.log on the boot volume via real UEFI file I/O.
+  @param[in] Message  Message to write
+  @retval EFI_STATUS
+**/
+EFI_STATUS
+EFIAPI
+PpcDebugLogToFile (
+    IN CHAR16* Message
+    );
+
+/**
+  Start a performance timer (real UEFI monotonic counter)
+  @param[out] StartTime  Timestamp at start
+  @retval EFI_STATUS
+**/
+EFI_STATUS
+EFIAPI
+PpcDebugStartTimer (
+    OUT UINT64* StartTime
+    );
+
+/**
+  Stop a performance timer and return the elapsed time
+  @param[in]  StartTime  Timestamp when the timer was started
+  @param[out] ElapsedTime  Elapsed counts since start
+  @retval EFI_STATUS
+**/
+EFI_STATUS
+EFIAPI
+PpcDebugStopTimer (
+    IN  UINT64 StartTime,
+    OUT UINT64* ElapsedTime
+    );
+
 #endif // __PPC_DEBUG_H__

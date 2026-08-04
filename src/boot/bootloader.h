@@ -110,4 +110,33 @@ PpcSetupBootEnvironment (
     VOID
     );
 
+/**
+  Verify a loaded kernel image: bounds check against guest RAM and
+  read the first word to confirm the data was read correctly.
+  @param[in] KernelAddress Address of the loaded kernel
+  @param[in] KernelSize    Size of the loaded kernel
+  @retval EFI_STATUS
+**/
+EFI_STATUS
+EFIAPI
+PpcVerifyKernel (
+    IN  EFI_PHYSICAL_ADDRESS KernelAddress,
+    IN  UINT64               KernelSize
+    );
+
+/**
+  Load a system ROM image into memory
+  @param[in]  RomPath    Path to the ROM image
+  @param[out] RomBuffer  Pointer to store ROM buffer address
+  @param[out] RomSize    Pointer to store ROM size
+  @retval EFI_STATUS
+**/
+EFI_STATUS
+EFIAPI
+PpcLoadSystemRom (
+    IN  CHAR16* RomPath,
+    OUT VOID**  RomBuffer,
+    OUT UINT64* RomSize
+    );
+
 #endif // __PPC_BOOTLOADER_H__

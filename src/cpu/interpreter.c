@@ -136,12 +136,29 @@ PPC_CPU_CONTEXT g_PpcContext = {0};
 // ---------------------------------------------------------------------------
 // Memory access (default: identity-mapped, big-endian guest memory)
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Emulated guest RAM (default memory backing for the interpreter)
+//
+// When PpcSetGuestMemory() has been called, guest addresses inside
+// [GuestBase, GuestBase + Size) are backed by the host buffer. Addresses
+// outside the region read as zero and ignore writes.
+// ---------------------------------------------------------------------------
+static VOID*  g_GuestMemoryHostBase  = NULL;
+static UINT32 g_GuestMemoryGuestBase = 0;
+static UINT32 g_GuestMemorySize      = 0;
+
 static UINT8
 PpcDefaultReadByte (
     IN UINT32 Address
     )
 {
-    return *(volatile UINT8*)(UINTN)Address;
+    if (g_GuestMemoryHostBase != NULL &&
+        Address >= g_GuestMemoryGuestBase &&
+        (Address - g_GuestMemoryGuestBase) < g_GuestMemorySize) {
+        return *(volatile UINT8*)((UINTN)g_GuestMemoryHostBase +
+                                  (Address - g_GuestMemoryGuestBase));
+    }
+    return 0;  // Unmapped guest address reads as zero
 }
 
 static VOID
@@ -150,7 +167,12 @@ PpcDefaultWriteByte (
     IN UINT8  Value
     )
 {
-    *(volatile UINT8*)(UINTN)Address = Value;
+    if (g_GuestMemoryHostBase != NULL &&
+        Address >= g_GuestMemoryGuestBase &&
+        (Address - g_GuestMemoryGuestBase) < g_GuestMemorySize) {
+        *(volatile UINT8*)((UINTN)g_GuestMemoryHostBase +
+                           (Address - g_GuestMemoryGuestBase)) = Value;
+    }
 }
 
 static PPC_CPU_READ_MEMORY  g_ReadByte  = PpcDefaultReadByte;
@@ -165,6 +187,36 @@ PpcSetMemoryAccess (
     g_ReadByte  = (Read  != NULL) ? Read  : PpcDefaultReadByte;
     g_WriteByte = (Write != NULL) ? Write : PpcDefaultWriteByte;
     return EFI_SUCCESS;
+}
+
+EFI_STATUS
+PpcSetGuestMemory (
+    IN VOID*  HostBase,
+    IN UINT32 GuestBase,
+    IN UINT32 Size
+    )
+{
+    g_GuestMemoryHostBase  = HostBase;
+    g_GuestMemoryGuestBase = GuestBase;
+    g_GuestMemorySize      = Size;
+    return EFI_SUCCESS;
+}
+
+UINT8
+PpcReadGuestByte (
+    IN UINT32 Address
+    )
+{
+    return g_ReadByte(Address);
+}
+
+VOID
+PpcWriteGuestByte (
+    IN UINT32 Address,
+    IN UINT8  Value
+    )
+{
+    g_WriteByte(Address, Value);
 }
 
 static UINT32 CpuRead16 (UINT32 A) { return ((UINT32)g_ReadByte(A) << 8) | g_ReadByte(A + 1); }

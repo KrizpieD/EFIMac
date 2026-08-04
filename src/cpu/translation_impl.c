@@ -326,21 +326,28 @@ PpcHandleException (
     IN UINT32 ExceptionAddress
     )
 {
+    // Real 32-bit PowerPC exception semantics: the address of the faulting
+    // instruction goes to SRR0, the MSR at exception time is saved to SRR1,
+    // interrupts are disabled, and execution vectors to the exception handler.
+    UINT32 Vector;
     switch (ExceptionType) {
-        case PPC_EXCEPTION_INTERRUPT:
-            Print(L"Handling PowerPC interrupt at 0x%x\n", ExceptionAddress);
-            return EFI_SUCCESS;
-
-        case PPC_EXCEPTION_TRAP:
-            Print(L"Handling PowerPC trap at 0x%x\n", ExceptionAddress);
-            return EFI_SUCCESS;
-
-        case PPC_EXCEPTION_SYSTEM_CALL:
-            Print(L"Handling PowerPC system call at 0x%x\n", ExceptionAddress);
-            return EFI_SUCCESS;
-
+        case PPC_EXCEPTION_INTERRUPT:   Vector = PPC_EXCEPTION_VECTOR_INTERRUPT;   break;
+        case PPC_EXCEPTION_TRAP:        Vector = PPC_EXCEPTION_VECTOR_TRAP;        break;
+        case PPC_EXCEPTION_SYSTEM_CALL: Vector = PPC_EXCEPTION_VECTOR_SYSTEM_CALL; break;
         default:
             Print(L"Unhandled PowerPC exception type: %d\n", ExceptionType);
             return EFI_UNSUPPORTED;
     }
+
+    g_PpcContext.Srr0 = ExceptionAddress;
+    g_PpcContext.Srr1 = g_PpcContext.Msr;
+    g_PpcContext.Msr &= ~(PPC_MSR_EE | PPC_MSR_RI);
+    g_PpcContext.Pc = Vector;
+    g_PpcContext.ExceptionPending = 1;
+
+    Print(L"PowerPC exception %d at 0x%x: SRR0=0x%x SRR1=0x%x PC=0x%x\n",
+          ExceptionType, ExceptionAddress, g_PpcContext.Srr0,
+          g_PpcContext.Srr1, g_PpcContext.Pc);
+
+    return EFI_SUCCESS;
 }

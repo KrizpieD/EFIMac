@@ -57,6 +57,19 @@
 #define PPC_EXCEPTION_TRAP          2
 #define PPC_EXCEPTION_SYSTEM_CALL   3
 
+// PowerPC exception vector offsets (real 32-bit PPC)
+#define PPC_EXCEPTION_VECTOR_INTERRUPT   0x500
+#define PPC_EXCEPTION_VECTOR_TRAP        0x700
+#define PPC_EXCEPTION_VECTOR_SYSTEM_CALL 0xC00
+
+// MSR bit definitions (bit 0 = most significant)
+#define PPC_MSR_POW    0x00040000  // Power management
+#define PPC_MSR_ME     0x00001000  // Machine check enable
+#define PPC_MSR_RI     0x00000002  // Recoverable interrupt
+#define PPC_MSR_EE     0x00008000  // External interrupt enable
+#define PPC_MSR_IR     0x00000020  // Instruction address translation
+#define PPC_MSR_DR     0x00000010  // Data address translation
+
 // XER bit definitions (bit 0 = most significant)
 #define PPC_XER_SO      0x80000000  // Summary Overflow
 #define PPC_XER_OV      0x40000000  // Overflow
@@ -188,6 +201,53 @@ EFIAPI
 PpcSetMemoryAccess (
     IN PPC_CPU_READ_MEMORY   Read,
     IN PPC_CPU_WRITE_MEMORY  Write
+    );
+
+/**
+  Route the interpreter's default load/store path through an emulated
+  guest RAM region.
+
+  After this call, guest addresses in [GuestBase, GuestBase + Size) are
+  backed by the host buffer at HostBase (host = HostBase + guest - GuestBase).
+  Reads of unmapped guest addresses return zero; writes are dropped.
+
+  @param[in] HostBase   Host virtual address backing the region
+  @param[in] GuestBase  Guest-visible base address of the region
+  @param[in] Size       Size of the region in bytes
+  @retval EFI_STATUS
+**/
+EFI_STATUS
+EFIAPI
+PpcSetGuestMemory (
+    IN VOID*  HostBase,
+    IN UINT32 GuestBase,
+    IN UINT32 Size
+    );
+
+/**
+  Read a single byte from guest memory using the interpreter's active
+  memory path (the same one used by load instructions).
+
+  @param[in] Address  Guest address to read
+  @retval The byte value (zero for unmapped addresses)
+**/
+UINT8
+PpcReadGuestByte (
+    IN UINT32 Address
+    );
+
+/**
+  Write a single byte to guest memory using the interpreter's active
+  memory path (the same one used by store instructions). Writes to
+  unmapped addresses are dropped.
+
+  @param[in] Address  Guest address to write
+  @param[in] Value    Byte value to write
+**/
+VOID
+PpcWriteGuestByte (
+    IN UINT32 Address,
+    IN UINT8  Value
     );
 
 /**

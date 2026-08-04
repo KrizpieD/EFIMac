@@ -132,4 +132,77 @@ PpcSetVariable (
     IN     VOID* Data
     );
 
+/**
+  Get the Simple File System protocol for a device handle
+  @param[out] FileSystem    Pointer to store the file system interface
+  @param[in]  DeviceHandle  Device handle to query (NULL = boot device)
+  @retval EFI_STATUS
+**/
+EFI_STATUS
+EFIAPI
+PpcGetFileSystem (
+    OUT EFI_FILE_IO_INTERFACE** FileSystem,
+    IN  EFI_HANDLE              DeviceHandle
+    );
+
+/**
+  Load a file from a file system into a pool buffer (real UEFI file I/O)
+  @param[in]  FileSystem   Simple File System protocol instance
+  @param[in]  FileName     Path of the file to load
+  @param[out] FileBuffer   Allocated buffer with file contents
+  @param[out] FileSize     Size of the loaded file in bytes
+  @retval EFI_STATUS
+**/
+EFI_STATUS
+EFIAPI
+PpcLoadFile (
+    IN  EFI_FILE_IO_INTERFACE* FileSystem,
+    IN  CHAR16*                FileName,
+    OUT VOID**                 FileBuffer,
+    OUT UINTN*                 FileSize
+    );
+
+/**
+  Get the handle of the device this image was booted from
+  @param[out] DeviceHandle Pointer to store the boot device handle
+  @retval EFI_STATUS
+**/
+EFI_STATUS
+EFIAPI
+PpcGetBootDevice (
+    OUT EFI_HANDLE* DeviceHandle
+    );
+
+/**
+  Get system information from UEFI (real memory map walk)
+  @param[out] SystemTable Pointer to the EFI system table
+  @param[out] TotalMemory Total physical RAM reported by firmware
+  @param[out] FreeMemory  Usable (conventional/boot services) memory
+  @retval EFI_STATUS
+**/
+EFI_STATUS
+EFIAPI
+PpcGetSystemInformation (
+    OUT EFI_SYSTEM_TABLE** SystemTable,
+    OUT UINT64* TotalMemory,
+    OUT UINT64* FreeMemory
+    );
+
+/**
+  Reset the system via the UEFI runtime reset service
+  @param[in] ResetType   Type of reset to perform
+  @param[in] StatusCode  Status code for the reset
+  @param[in] DataSize    Size of ResetData
+  @param[in] ResetData   Optional data passed to the reset service
+  @retval EFI_STATUS
+**/
+EFI_STATUS
+EFIAPI
+PpcResetSystem (
+    IN EFI_RESET_TYPE ResetType,
+    IN EFI_STATUS     StatusCode,
+    IN UINTN          DataSize,
+    IN CHAR16*        ResetData OPTIONAL
+    );
+
 #endif // __PPC_UEFI_INTERFACE_H__

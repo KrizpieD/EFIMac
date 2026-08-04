@@ -1,6 +1,7 @@
 #include "debug.h"
 #include <efi.h>
 #include <efilib.h>
+#include <lib.h>
 #include "cpu/translation.h"
 
 // Debug context structure with enhanced functionality
@@ -199,12 +200,53 @@ PpcDebugLogToFile (
     if (Message == NULL) {
         return EFI_INVALID_PARAMETER;
     }
-    
-    // In a real implementation, this would write to the log file
-    // This is a placeholder for actual file I/O operations
-    
-    Print(L"[LOG] Writing to log file: %s\n", Message);
-    
+
+    // Open (creating if needed) a log file on the volume we booted from and
+    // append the message. This is real UEFI file I/O.
+    EFI_LOADED_IMAGE_PROTOCOL* LoadedImage = NULL;
+    EFI_STATUS Status = BS->HandleProtocol(LibImageHandle, &LoadedImageProtocol, (VOID**)&LoadedImage);
+    if (EFI_ERROR(Status) || LoadedImage == NULL || LoadedImage->DeviceHandle == NULL) {
+        Print(L"[LOG] failed to resolve boot device for logging\n");
+        return EFI_NOT_FOUND;
+    }
+
+    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL* Fs = NULL;
+    Status = BS->HandleProtocol(LoadedImage->DeviceHandle, &FileSystemProtocol, (VOID**)&Fs);
+    if (EFI_ERROR(Status) || Fs == NULL) {
+        return EFI_NOT_FOUND;
+    }
+
+    EFI_FILE_HANDLE Root = NULL;
+    Status = Fs->OpenVolume(Fs, &Root);
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+
+    EFI_FILE_HANDLE LogFile = NULL;
+    Status = Root->Open(Root, &LogFile, L"boot.log",
+                        EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE,
+                        0);
+    if (EFI_ERROR(Status) || LogFile == NULL) {
+        Root->Close(Root);
+        return (Status == EFI_SUCCESS) ? EFI_LOAD_ERROR : Status;
+    }
+
+    // Append to the end of the file.
+    LogFile->SetPosition(LogFile, (UINT64)-1);
+
+    UINTN Len = (StrLen(Message) + 1) * sizeof(CHAR16);
+    Status = LogFile->Write(LogFile, &Len, Message);
+    if (EFI_ERROR(Status)) {
+        LogFile->Close(LogFile);
+        Root->Close(Root);
+        return Status;
+    }
+
+    LogFile->Close(LogFile);
+    Root->Close(Root);
+
+    Print(L"[LOG] wrote to boot.log: %s\n", Message);
+
     return EFI_SUCCESS;
 }
 
@@ -263,12 +305,14 @@ PpcDebugStartTimer (
     if (StartTime == NULL) {
         return EFI_INVALID_PARAMETER;
     }
-    
-    // In a real implementation, this would use UEFI timer services
-    *StartTime = 0;  // Placeholder
-    
-    Print(L"Performance timer started\n");
-    
+
+    // Real monotonic counter from UEFI boot services (never wraps during boot).
+    EFI_STATUS Status = BS->GetNextMonotonicCount(StartTime);
+    if (EFI_ERROR(Status)) {
+        Print(L"Failed to start performance timer: %r\n", Status);
+        return Status;
+    }
+
     return EFI_SUCCESS;
 }
 
@@ -281,11 +325,17 @@ PpcDebugStopTimer (
     if (ElapsedTime == NULL) {
         return EFI_INVALID_PARAMETER;
     }
-    
-    // In a real implementation, this would calculate elapsed time using UEFI timer services
-    *ElapsedTime = 0;  // Placeholder
-    
-    Print(L"Performance timer stopped. Elapsed: %d cycles\n", *ElapsedTime);
-    
+
+    UINT64 EndTime = 0;
+    EFI_STATUS Status = BS->GetNextMonotonicCount(&EndTime);
+    if (EFI_ERROR(Status)) {
+        Print(L"Failed to stop performance timer: %r\n", Status);
+        return Status;
+    }
+
+    *ElapsedTime = EndTime - StartTime;
+
+    Print(L"Performance timer stopped. Elapsed: %d counts\n", *ElapsedTime);
+
     return EFI_SUCCESS;
 }

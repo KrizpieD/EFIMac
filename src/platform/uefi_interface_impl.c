@@ -239,48 +239,127 @@ PpcSetVariable (
 EFI_STATUS
 PpcGetFileSystem (
     OUT EFI_FILE_IO_INTERFACE** FileSystem,
-    IN  EFI_HANDLE DeviceHandle
+    IN  EFI_HANDLE              DeviceHandle
     )
 {
     if (FileSystem == NULL) {
         return EFI_INVALID_PARAMETER;
     }
-    
-    // In a real implementation:
-    // 1. Open the file system protocol on the device handle
-    // 2. Return the file system interface
-    
-    Print(L"Getting file system for device handle 0x%x\n", DeviceHandle);
-    
-    *FileSystem = NULL;
-    
-    return EFI_UNSUPPORTED;
+
+    // Default to the device this image was booted from.
+    if (DeviceHandle == NULL) {
+        if (g_UefiContext.LoadedImage == NULL || g_UefiContext.LoadedImage->DeviceHandle == NULL) {
+            return EFI_NOT_READY;
+        }
+        DeviceHandle = g_UefiContext.LoadedImage->DeviceHandle;
+    }
+
+    EFI_FILE_IO_INTERFACE* Fs = NULL;
+    EFI_STATUS Status = BS->HandleProtocol(DeviceHandle, &FileSystemProtocol, (VOID**)&Fs);
+    if (EFI_ERROR(Status) || Fs == NULL) {
+        Print(L"Failed to get file system for device handle 0x%x: %r\n", DeviceHandle, Status);
+        return EFI_NOT_FOUND;
+    }
+
+    *FileSystem = Fs;
+    return EFI_SUCCESS;
 }
 
 EFI_STATUS
 PpcLoadFile (
     IN  EFI_FILE_IO_INTERFACE* FileSystem,
-    IN  CHAR16* FileName,
-    OUT VOID** FileBuffer,
-    OUT UINTN* FileSize
+    IN  CHAR16*                FileName,
+    OUT VOID**                 FileBuffer,
+    OUT UINTN*                 FileSize
     )
 {
     if (FileSystem == NULL || FileName == NULL || FileBuffer == NULL || FileSize == NULL) {
         return EFI_INVALID_PARAMETER;
     }
-    
-    Print(L"Loading file: %s\n", FileName);
-    
-    // In a real implementation:
-    // 1. Open the file using UEFI file protocol
-    // 2. Read file contents into memory buffer
-    // 3. Return buffer pointer and size
-    
+
     *FileBuffer = NULL;
     *FileSize = 0;
-    
-    Print(L"File loading simulated\n");
-    
+
+    Print(L"Loading file: %s\n", FileName);
+
+    EFI_FILE_HANDLE Root = NULL;
+    EFI_STATUS Status = FileSystem->OpenVolume(FileSystem, &Root);
+    if (EFI_ERROR(Status)) {
+        Print(L"Failed to open volume: %r\n", Status);
+        return Status;
+    }
+
+    EFI_FILE_HANDLE File = NULL;
+    Status = Root->Open(Root, &File, FileName, EFI_FILE_MODE_READ, 0);
+    if (EFI_ERROR(Status) || File == NULL) {
+        Print(L"Failed to open '%s': %r\n", FileName, Status);
+        Root->Close(Root);
+        return (Status == EFI_SUCCESS) ? EFI_NOT_FOUND : Status;
+    }
+
+    // Query the file size through EFI_FILE_INFO.
+    UINTN FileInfoSize = SIZE_OF_EFI_FILE_INFO + 260 * sizeof(CHAR16);
+    EFI_FILE_INFO* FileInfo = AllocateZeroPool(FileInfoSize);
+    if (FileInfo == NULL) {
+        File->Close(File);
+        Root->Close(Root);
+        return EFI_OUT_OF_RESOURCES;
+    }
+    Status = File->GetInfo(File, &GenericFileInfo, &FileInfoSize, FileInfo);
+    if (EFI_ERROR(Status)) {
+        Print(L"Failed to get file info for '%s': %r\n", FileName, Status);
+        FreePool(FileInfo);
+        File->Close(File);
+        Root->Close(Root);
+        return Status;
+    }
+
+    UINT64 FileSize64 = FileInfo->FileSize;
+    FreePool(FileInfo);
+
+    if (FileSize64 == 0 || FileSize64 > (UINT64)0x7FFFFFFF) {
+        Print(L"File '%s' has invalid size %d\n", FileName, FileSize64);
+        File->Close(File);
+        Root->Close(Root);
+        return EFI_LOAD_ERROR;
+    }
+
+    VOID* Buffer = AllocatePool((UINTN)FileSize64);
+    if (Buffer == NULL) {
+        File->Close(File);
+        Root->Close(Root);
+        return EFI_OUT_OF_RESOURCES;
+    }
+
+    // Read may return partial data; loop until the whole file is read.
+    UINTN   BytesRead = 0;
+    UINT64  Remaining = FileSize64;
+    BOOLEAN Failed    = FALSE;
+    while (Remaining > 0) {
+        UINTN Chunk = (UINTN)Remaining;
+        Status = File->Read(File, &Chunk, (UINT8*)Buffer + BytesRead);
+        if (EFI_ERROR(Status) || Chunk == 0) {
+            Print(L"Failed while reading '%s': %r\n", FileName, Status);
+            Failed = TRUE;
+            break;
+        }
+        BytesRead += Chunk;
+        Remaining  -= Chunk;
+    }
+
+    File->Close(File);
+    Root->Close(Root);
+
+    if (Failed) {
+        FreePool(Buffer);
+        return EFI_LOAD_ERROR;
+    }
+
+    *FileBuffer = Buffer;
+    *FileSize = (UINTN)FileSize64;
+
+    Print(L"Loaded '%s': %d bytes at 0x%x\n", FileName, *FileSize, Buffer);
+
     return EFI_SUCCESS;
 }
 
@@ -292,15 +371,14 @@ PpcGetBootDevice (
     if (DeviceHandle == NULL) {
         return EFI_INVALID_PARAMETER;
     }
-    
-    // In a real implementation:
-    // 1. Determine the boot device from UEFI
-    // 2. Return handle to boot device
-    
-    *DeviceHandle = g_UefiContext.ImageHandle;
-    
+    if (g_UefiContext.LoadedImage == NULL || g_UefiContext.LoadedImage->DeviceHandle == NULL) {
+        return EFI_NOT_READY;
+    }
+
+    *DeviceHandle = g_UefiContext.LoadedImage->DeviceHandle;
+
     Print(L"Boot device handle: 0x%x\n", *DeviceHandle);
-    
+
     return EFI_SUCCESS;
 }
 
@@ -327,7 +405,7 @@ PpcGetFirmwareVersion (
 
 EFI_STATUS
 PpcGetSystemInformation (
-    OUT EFI_SYSTEM_TABLE* SystemTable,
+    OUT EFI_SYSTEM_TABLE** SystemTable,
     OUT UINT64* TotalMemory,
     OUT UINT64* FreeMemory
     )
@@ -335,21 +413,55 @@ PpcGetSystemInformation (
     if (SystemTable == NULL || TotalMemory == NULL || FreeMemory == NULL) {
         return EFI_INVALID_PARAMETER;
     }
-    
-    // In a real implementation:
-    // 1. Get system information from UEFI
-    // 2. Calculate memory usage statistics
-    
-    *SystemTable = *g_UefiContext.SystemTable;
-    
-    // Simulated memory information (in real world would query actual memory)
-    *TotalMemory = 0x10000000;  // 256MB
-    *FreeMemory = 0x08000000;   // 128MB free
-    
-    Print(L"System information retrieved\n");
-    Print(L"Total memory: %d bytes\n", *TotalMemory);
-    Print(L"Free memory: %d bytes\n", *FreeMemory);
-    
+
+    *SystemTable = g_UefiContext.SystemTable;
+
+    // Walk the real UEFI memory map to compute total and usable memory.
+    UINTN  MapSize  = 0;
+    UINTN  MapKey   = 0;
+    UINTN  DescSize = 0;
+    UINT32 DescVer  = 0;
+    EFI_STATUS Status = BS->GetMemoryMap(&MapSize, NULL, &MapKey, &DescSize, &DescVer);
+    if (EFI_ERROR(Status) && Status != EFI_BUFFER_TOO_SMALL) {
+        Print(L"Failed to size memory map: %r\n", Status);
+        return Status;
+    }
+
+    UINT8* MapBuffer = AllocatePool(MapSize + sizeof(EFI_MEMORY_DESCRIPTOR));
+    if (MapBuffer == NULL) {
+        return EFI_OUT_OF_RESOURCES;
+    }
+
+    Status = BS->GetMemoryMap(&MapSize, (EFI_MEMORY_DESCRIPTOR*)MapBuffer, &MapKey, &DescSize, &DescVer);
+    if (EFI_ERROR(Status)) {
+        Print(L"Failed to get memory map: %r\n", Status);
+        FreePool(MapBuffer);
+        return Status;
+    }
+
+    UINT64 Total = 0;
+    UINT64 Usable = 0;
+    EFI_MEMORY_DESCRIPTOR* Desc = (EFI_MEMORY_DESCRIPTOR*)MapBuffer;
+    for (UINTN i = 0; i < MapSize / DescSize; i++) {
+        UINT64 Bytes = Desc->NumberOfPages * EFI_PAGE_SIZE;
+        Total += Bytes;
+        if (Desc->Type == EfiConventionalMemory ||
+            Desc->Type == EfiLoaderData ||
+            Desc->Type == EfiLoaderCode ||
+            Desc->Type == EfiBootServicesCode ||
+            Desc->Type == EfiBootServicesData) {
+            Usable += Bytes;
+        }
+        Desc = (EFI_MEMORY_DESCRIPTOR*)((UINT8*)Desc + DescSize);
+    }
+
+    FreePool(MapBuffer);
+
+    *TotalMemory = Total;
+    *FreeMemory = Usable;
+
+    Print(L"System information: total %d bytes, usable %d bytes\n", Total, Usable);
+
     return EFI_SUCCESS;
 }
 

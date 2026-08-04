@@ -1,9 +1,11 @@
 #include "bootloader.h"
 #include <efi.h>
 #include <efilib.h>
+#include "cpu/interpreter.h"
 #include "cpu/translation.h"
 #include "memory/manager.h"
 #include "hardware/abstraction.h"
+#include "platform/uefi_interface.h"
 
 // Bootloader context structure with more complete implementation
 typedef struct {
@@ -57,34 +59,104 @@ PpcLoadKernel (
     if (ImagePath == NULL || KernelAddress == NULL || KernelSize == NULL) {
         return EFI_INVALID_PARAMETER;
     }
-    
+
     Print(L"Loading kernel from: %s\n", ImagePath);
-    
-    // In a real implementation, we would:
-    // 1. Locate the kernel image file using UEFI file system protocols
-    // 2. Read kernel data into memory
-    // 3. Parse kernel headers (if applicable)
-    // 4. Validate kernel integrity
-    // 5. Return load address and size
-    
-    // For now, simulate loading by setting default values
-    *KernelAddress = 0x10000000;  // Simulated kernel address
-    *KernelSize = 0x01000000;     // 16MB simulated kernel size
-    
+
+    // Real UEFI file I/O: resolve the file system of the boot device.
+    EFI_FILE_IO_INTERFACE* Fs = NULL;
+    EFI_STATUS Status = PpcGetFileSystem(&Fs, NULL);
+    if (EFI_ERROR(Status)) {
+        Print(L"Failed to get boot file system: %r\n", Status);
+        return Status;
+    }
+
+    EFI_FILE_HANDLE Root = NULL;
+    Status = Fs->OpenVolume(Fs, &Root);
+    if (EFI_ERROR(Status)) {
+        Print(L"Failed to open boot volume: %r\n", Status);
+        return Status;
+    }
+
+    EFI_FILE_HANDLE KernelFile = NULL;
+    Status = Root->Open(Root, &KernelFile, ImagePath, EFI_FILE_MODE_READ, 0);
+    if (EFI_ERROR(Status) || KernelFile == NULL) {
+        Print(L"Kernel image '%s' not found: %r\n", ImagePath, Status);
+        Root->Close(Root);
+        return (Status == EFI_SUCCESS) ? EFI_NOT_FOUND : Status;
+    }
+
+    // Get the kernel file size.
+    UINTN FileInfoSize = SIZE_OF_EFI_FILE_INFO + 260 * sizeof(CHAR16);
+    EFI_FILE_INFO* FileInfo = AllocateZeroPool(FileInfoSize);
+    if (FileInfo == NULL) {
+        KernelFile->Close(KernelFile);
+        Root->Close(Root);
+        return EFI_OUT_OF_RESOURCES;
+    }
+    Status = KernelFile->GetInfo(KernelFile, &GenericFileInfo, &FileInfoSize, FileInfo);
+    if (EFI_ERROR(Status)) {
+        Print(L"Failed to get kernel file info: %r\n", Status);
+        FreePool(FileInfo);
+        KernelFile->Close(KernelFile);
+        Root->Close(Root);
+        return Status;
+    }
+
+    UINT64 FileSize = FileInfo->FileSize;
+    FreePool(FileInfo);
+
+    if (FileSize == 0 || FileSize > 0x10000000) {
+        Print(L"Kernel image has invalid size %d\n", FileSize);
+        KernelFile->Close(KernelFile);
+        Root->Close(Root);
+        return EFI_LOAD_ERROR;
+    }
+
+    // Destination: the UEFI-allocated guest RAM region (guest base 0x10000000).
+    VOID*  GuestBuffer = NULL;
+    UINT64 GuestBase   = 0;
+    UINT64 GuestSize   = 0;
+    Status = PpcGetGuestMemoryRegion(&GuestBuffer, &GuestBase, &GuestSize);
+    if (EFI_ERROR(Status) || GuestBuffer == NULL || FileSize > GuestSize) {
+        Print(L"Guest RAM unavailable for kernel load\n");
+        KernelFile->Close(KernelFile);
+        Root->Close(Root);
+        return EFI_NOT_READY;
+    }
+
+    // Read the whole file into guest RAM (Read may return partial data).
+    UINTN   BytesRead = 0;
+    UINT64  Remaining = FileSize;
+    BOOLEAN Failed    = FALSE;
+    while (Remaining > 0) {
+        UINTN Chunk = (UINTN)Remaining;
+        Status = KernelFile->Read(KernelFile, &Chunk, (UINT8*)GuestBuffer + BytesRead);
+        if (EFI_ERROR(Status) || Chunk == 0) {
+            Print(L"Failed while reading kernel: %r\n", Status);
+            Failed = TRUE;
+            break;
+        }
+        BytesRead += Chunk;
+        Remaining  -= Chunk;
+    }
+
+    KernelFile->Close(KernelFile);
+    Root->Close(Root);
+
+    if (Failed) {
+        return EFI_LOAD_ERROR;
+    }
+
+    *KernelAddress = (EFI_PHYSICAL_ADDRESS)GuestBase;
+    *KernelSize = FileSize;
+
     g_BootContext.KernelAddress = *KernelAddress;
     g_BootContext.KernelSize = *KernelSize;
     g_BootContext.KernelLoaded = TRUE;
-    
-    Print(L"Kernel loaded at 0x%x (size: %d bytes)\n", *KernelAddress, *KernelSize);
-    
-    // Save the boot image path
-    UINTN PathLength = StrLen(ImagePath) + 1;
-    EFI_STATUS Status = BS->AllocatePool(EfiBootServicesData, PathLength * sizeof(CHAR16), (VOID**)&g_BootContext.BootImagePath);
-    if (!EFI_ERROR(Status)) {
-        StrCpy(g_BootContext.BootImagePath, ImagePath);
-        Print(L"Boot image path saved\n");
-    }
-    
+
+    Print(L"Kernel loaded: %d bytes into guest RAM at 0x%x\n",
+          FileSize, (UINT32)GuestBase);
+
     return EFI_SUCCESS;
 }
 
@@ -94,36 +166,28 @@ PpcBootSystem (
     IN UINT64               KernelSize
     )
 {
-    // In a real implementation:
-    // 1. Initialize system registers
-    // 2. Set up memory management
-    // 3. Transfer control to the kernel
-    // 4. Handle boot process
-    
-    Print(L"Booting system from kernel at 0x%x\n", KernelAddress);
-    
     if (!g_BootContext.KernelLoaded) {
         Print(L"Error: No kernel loaded for boot\n");
         return EFI_NOT_READY;
     }
-    
-    // Simulate boot process
-    Print(L"PowerPC system boot in progress...\n");
-    Print(L"Initializing PowerPC core...\n");
-    Print(L"Setting up memory management...\n");
-    Print(L"Loading system modules...\n");
-    
-    // In a real implementation, we would:
-    // 1. Initialize the CPU context
-    // 2. Set up the MMU
-    // 3. Load system files
-    // 4. Transfer control to kernel entry point
-    
-    Print(L"System boot complete.\n");
-    Print(L"Transferring control to PowerPC kernel...\n");
-    
+    if (KernelAddress == 0 || KernelSize == 0) {
+        return EFI_INVALID_PARAMETER;
+    }
+
+    // Configure the real CPU context for transfer of control to the kernel:
+    // PC = kernel entry, MSR enables machine-check handling, SRR0/SRR1 seeded.
+    g_PpcContext.Pc = (UINT32)KernelAddress;
+    g_PpcContext.Srr0 = (UINT32)KernelAddress;
+    g_PpcContext.Srr1 = g_PpcContext.Msr;
+    g_PpcContext.Msr = PPC_MSR_ME | PPC_MSR_RI;
+    g_PpcContext.ExceptionPending = 0;
+
+    Print(L"Booting system from kernel at 0x%x (size: %d bytes)\n", KernelAddress, KernelSize);
+    Print(L"PowerPC core configured: PC=0x%x MSR=0x%08x\n",
+          g_PpcContext.Pc, g_PpcContext.Msr);
+
     g_BootContext.SystemBooting = TRUE;
-    
+
     return EFI_SUCCESS;
 }
 
@@ -137,22 +201,26 @@ PpcLoadBootImage (
     if (ImagePath == NULL || ImageBuffer == NULL || ImageSize == NULL) {
         return EFI_INVALID_PARAMETER;
     }
-    
-    Print(L"Loading boot image: %s\n", ImagePath);
-    
-    // In a real implementation:
-    // 1. Locate the boot image file using UEFI file system protocols
-    // 2. Read image data into memory
-    // 3. Parse image headers (if applicable)
-    // 4. Validate image integrity
-    // 5. Return buffer and size
-    
-    // For now, we'll simulate loading
-    *ImageBuffer = NULL;
-    *ImageSize = 0;
-    
-    Print(L"Boot image loaded (simulated)\n");
-    
+
+    // Real UEFI file I/O into a pool buffer.
+    EFI_FILE_IO_INTERFACE* Fs = NULL;
+    EFI_STATUS Status = PpcGetFileSystem(&Fs, NULL);
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+
+    UINTN  Size = 0;
+    VOID*  Buffer = NULL;
+    Status = PpcLoadFile(Fs, ImagePath, &Buffer, &Size);
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+
+    *ImageBuffer = Buffer;
+    *ImageSize = Size;
+
+    Print(L"Boot image loaded: %d bytes at 0x%x\n", Size, Buffer);
+
     return EFI_SUCCESS;
 }
 
@@ -220,20 +288,65 @@ PpcLoadSystemRom (
     if (RomPath == NULL || RomBuffer == NULL || RomSize == NULL) {
         return EFI_INVALID_PARAMETER;
     }
-    
+
     Print(L"Loading system ROM from: %s\n", RomPath);
-    
-    // In a real implementation:
-    // 1. Locate and read the ROM image file
-    // 2. Parse ROM structure if needed
-    // 3. Validate ROM integrity
-    // 4. Return ROM buffer and size
-    
-    *RomBuffer = NULL;
-    *RomSize = 0;
-    
-    Print(L"System ROM loaded (simulated)\n");
-    
+
+    // Real UEFI file I/O into a pool buffer.
+    EFI_FILE_IO_INTERFACE* Fs = NULL;
+    EFI_STATUS Status = PpcGetFileSystem(&Fs, NULL);
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+
+    UINTN  Size = 0;
+    VOID*  Buffer = NULL;
+    Status = PpcLoadFile(Fs, RomPath, &Buffer, &Size);
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+
+    *RomBuffer = Buffer;
+    *RomSize = Size;
+
+    Print(L"System ROM loaded: %d bytes at 0x%x\n", Size, Buffer);
+
+    return EFI_SUCCESS;
+}
+
+EFI_STATUS
+PpcVerifyKernel (
+    IN  EFI_PHYSICAL_ADDRESS KernelAddress,
+    IN  UINT64               KernelSize
+    )
+{
+    Print(L"Verifying kernel at 0x%x (size: %d bytes)\n", KernelAddress, KernelSize);
+
+    // Real bounds check: the kernel must lie within the guest RAM region.
+    VOID*  GuestBuffer = NULL;
+    UINT64 GuestBase   = 0;
+    UINT64 GuestSize   = 0;
+    EFI_STATUS Status = PpcGetGuestMemoryRegion(&GuestBuffer, &GuestBase, &GuestSize);
+    if (EFI_ERROR(Status)) {
+        Print(L"Verification failed: guest RAM unavailable\n");
+        return EFI_NOT_READY;
+    }
+    if ((UINT64)KernelAddress < GuestBase ||
+        (UINT64)KernelAddress - GuestBase + KernelSize > GuestSize) {
+        Print(L"Verification failed: kernel outside guest RAM bounds\n");
+        return EFI_LOAD_ERROR;
+    }
+    if (KernelSize == 0) {
+        Print(L"Verification failed: kernel size is zero\n");
+        return EFI_LOAD_ERROR;
+    }
+
+    // Read the first word (big-endian) and report it as a sanity value.
+    UINT32 FirstWord = PpcReadGuestByte((UINT32)KernelAddress)     << 24 |
+                       PpcReadGuestByte((UINT32)KernelAddress + 1) << 16 |
+                       PpcReadGuestByte((UINT32)KernelAddress + 2) << 8  |
+                       PpcReadGuestByte((UINT32)KernelAddress + 3);
+    Print(L"Kernel verification: bounds OK, first word 0x%08x\n", FirstWord);
+
     return EFI_SUCCESS;
 }
 
@@ -279,25 +392,6 @@ PpcSetupBootEnvironment (
     }
     
     Print(L"Boot environment setup complete\n");
-    
-    return EFI_SUCCESS;
-}
-
-EFI_STATUS
-PpcVerifyKernel (
-    IN  EFI_PHYSICAL_ADDRESS KernelAddress,
-    IN  UINT64               KernelSize
-    )
-{
-    // In a real implementation:
-    // 1. Verify kernel integrity using checksums or signatures
-    // 2. Check kernel compatibility with target system
-    // 3. Validate kernel headers
-    
-    Print(L"Verifying kernel at 0x%x (size: %d bytes)\n", KernelAddress, KernelSize);
-    
-    // For now, just simulate verification
-    Print(L"Kernel verification passed (simulated)\n");
     
     return EFI_SUCCESS;
 }

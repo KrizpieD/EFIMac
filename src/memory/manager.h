@@ -135,4 +135,23 @@ PpcGetMemoryInfo (
     OUT PPC_MEMORY_INFO* MemoryInfo
     );
 
+/**
+  Get the UEFI-backed guest RAM region owned by the memory manager.
+  The guest-visible base is the address passed to PpcInitializeMemoryManager;
+  the host base is where UEFI actually placed the pages.
+
+  @param[out] HostBase    Host virtual address of the region (may be NULL)
+  @param[out] GuestBase   Guest-visible base address (may be NULL)
+  @param[out] Size        Size of the region in bytes (may be NULL)
+  @retval EFI_SUCCESS          Region is available
+  @retval EFI_NOT_READY        Memory manager has no allocated region
+**/
+EFI_STATUS
+EFIAPI
+PpcGetGuestMemoryRegion (
+    OUT VOID*  *HostBase,
+    OUT UINT64 *GuestBase,
+    OUT UINT64 *Size
+    );
+
 #endif // __PPC_MEMORY_MANAGER_H__
