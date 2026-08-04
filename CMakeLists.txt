@@ -26,22 +26,22 @@ set(SOURCES
     src/main.c
     
     # CPU Translation Layer
-    src/cpu/translation.c
+    src/cpu/translation_impl.c
     
     # Memory Management
-    src/memory/manager.c
+    src/memory/manager_impl.c
     
     # Hardware Abstraction
-    src/hardware/abstraction.c
+    src/hardware/abstraction_impl.c
     
     # Bootloader
-    src/boot/bootloader.c
+    src/boot/bootloader_impl.c
     
     # Utilities
-    src/utils/debug.c
+    src/utils/debug_impl.c
     
     # UEFI Interface
-    src/platform/uefi_interface.c
+    src/platform/uefi_interface_impl.c
 )
 
 # Create the EFI application

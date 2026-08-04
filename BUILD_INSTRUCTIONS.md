@@ -1,172 +1,115 @@
 # EFI-Mac-Emulator - Build Instructions
 
+## Status
+
+**The project does not build yet.** The source requires a real UEFI development
+environment (EDK II or GNU-EFI), and the UEFI headers/libraries it provides.
+The hand-written stub headers and demonstration build scripts that previously
+shipped with the repo have been removed. Until the modules are wired to a real
+UEFI toolchain (see [TODO.md](TODO.md), Phase 3), do not expect `EFI-Mac-Emulator.efi`
+to be produced.
+
 ## Prerequisites
 
-Before building the EFI-Mac-Emulator, you'll need:
+1. **UEFI Development Environment** (one of):
+   - EDK II (TianoCore) — https://github.com/tianocore/edk2
+   - GNU-EFI — https://sourceforge.net/projects/gnu-efi/
+2. **Compiler Toolchain**:
+   - A cross-compiler targeting x86_64 UEFI (e.g. EDK II's GCC5 toolchain, or
+     `x86_64-w64-mingw32-gcc` / clang for GNU-EFI)
+3. **CMake** (version 3.10 or higher) — only if using the provided CMakeLists.txt
+4. **Git** for version control
 
-1. **Windows 10/11** with PowerShell 7+ 
-2. **Git** for version control
-3. **CMake** (version 3.10 or higher)
-4. **GCC MinGW** toolchain for x86_64 cross-compilation
-5. **UEFI Development Tools**:
-   - EDK II (EDK II is required for UEFI development)
-   - UEFI SDK or similar toolchain
-6. **Visual Studio Build Tools** (optional, for Windows native builds)
+## Option 1: Build with CMake
 
-## Building the Project
+The provided `CMakeLists.txt` expects UEFI headers to be available. Provide the
+UEFI include paths via `EFI_INCLUDE_DIRS` and a suitable cross-compiler:
 
-### Step 1: Clone the Repository
-
-```powershell
-git clone https://github.com/your-repo/efimac-project.git
-cd efimac-project
-```
-
-### Step 2: Set up Environment Variables
-
-For UEFI development, you may need to set up EDK II environment:
-
-```powershell
-# If using EDK II, set the environment
-$env:EDK_TOOLS_PATH = "C:\edk2\EdkTools"
-$env:WORKSPACE = "C:\path\to\your\workspace"
-```
-
-### Step 3: Create Build Directory and Configure
-
-```powershell
+```bash
 mkdir build
 cd build
-cmake .. -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+cmake .. -G "MinGW Makefiles" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+    -DEFI_INCLUDE_DIRS=/path/to/gnu-efi/inc
+cmake --build .
 ```
 
-### Step 4: Compile the Project
+Note: a CMake build of a UEFI application normally needs to produce a PE32+
+image (GNU-EFI style) or be built as part of an EDK II package. The current
+CMakeLists.txt is a starting point, not a complete UEFI build.
 
-```powershell
-cmake --build . --config Release
-```
+## Option 2: Build with EDK II
 
-## Alternative Build Method (Using EDK II)
-
-If you're using EDK II for UEFI development:
-
-1. **Set up EDK II environment**
-2. **Create a UEFI application package** in EDK II structure
-3. **Compile with build command**:
-   ```powershell
+1. Set up the EDK II environment:
+   ```bash
+   source edksetup.sh
+   ```
+2. Create a UEFI application package (DSC + INF) that includes the sources in `src/`.
+3. Build:
+   ```bash
    build -p EFI-Mac-Emulator.dsc -b RELEASE -t GCC5
    ```
 
-## Prerequisites for Windows Development
+## Option 3: Build with GNU-EFI
 
-### Required Tools:
+Compile against GNU-EFI's headers and link with its startup code. For example:
 
-1. **MinGW-w64** (GCC compiler)
-2. **CMake** 
-3. **Git**
-4. **EDK II** (for native UEFI compilation)
-
-### Installation Steps:
-
-```powershell
-# Install required packages using Chocolatey
-choco install mingw cmake git
-
-# Or download and install manually:
-# 1. Download MinGW-w64
-# 2. Install CMake
-# 3. Install Git
+```bash
+gcc -ffreestanding -fno-stack-protector -fno-stack-check -fshort-wchar -mno-red-zone \
+    -maccumulate-outgoing-args -m64 -I/path/to/gnu-efi/inc \
+    -c src/main.c src/cpu/translation_impl.c src/memory/manager_impl.c \
+    src/hardware/abstraction_impl.c src/boot/bootloader_impl.c \
+    src/utils/debug_impl.c src/platform/uefi_interface_impl.c
+# then link with gnu-efi's crt0-efi-x86_64.o and libefi.a into a PE32+ image
 ```
 
-## Running the Emulator
+Note: the sources currently include EDK II style headers
+(`<Library/UefiLib.h>`, `<Library/BaseLib.h>`, etc.) and use globals such as
+`gBS`, `gST`, and `gRT`. They will need adjustment to build with GNU-EFI.
 
-### Prerequisites for Testing:
+## Testing
 
-1. **UEFI firmware capable of running EFI applications**
-2. **Virtual Machine** (like QEMU with UEFI support) or physical hardware with UEFI boot capability
-3. **Mac OS system files**:
+To test the emulator (once it builds):
+
+1. **UEFI-capable firmware** — QEMU with OVMF is recommended:
+   ```bash
+   qemu-system-x86_64 -bios /usr/share/ovmf/OVMF.fd -drive file=disk.img,format=raw
+   ```
+2. Run the EFI application from the UEFI shell.
+3. Provide classic Mac OS system files:
    - System 7, Mac OS 8, or Mac OS 9 ROM images
    - Kernel images for the respective systems
 
-### Test Procedure:
+## Troubleshooting
 
-1. **Boot into UEFI environment**
-2. **Load the EFI-Mac-Emulator application**
-3. **Configure boot parameters**
-4. **Load a Mac OS kernel image**
-5. **Execute the boot process**
-
-## Testing with QEMU (Recommended)
-
-To test the emulator without physical hardware:
-
-1. **Install QEMU**:
-   ```powershell
-   choco install qemu
-   ```
-
-2. **Create a UEFI-enabled VM**:
-   ```powershell
-   qemu-system-x86_64 -bios ovmf.fd -drive file=disk.img,format=raw
-   ```
-
-3. **Run the EFI application from UEFI shell**
+1. **CMake errors**: Ensure CMake version is at least 3.10.
+2. **Missing UEFI headers**: Install EDK II or GNU-EFI and point the build at
+   its include directory.
+3. **Linker errors**: A UEFI application must be linked as a PE32+ image with
+   UEFI startup code (EDK II or GNU-EFI); a plain host linker will not produce
+   a valid `.efi`.
 
 ## Directory Structure
 
 ```
-efimac-project/
+EFIMac/
 ├── src/                    # Source code files
 │   ├── main.c             # Main entry point
-│   ├── cpu/               # CPU translation components  
+│   ├── cpu/               # CPU translation components
 │   ├── memory/            # Memory management
 │   ├── hardware/          # Hardware abstraction
 │   ├── boot/              # Bootloader system
 │   ├── utils/             # Utility functions
 │   └── platform/          # UEFI interface
-├── CMakeLists.txt         # Build configuration
+├── CMakeLists.txt         # Build configuration file
 ├── README.md              # Project overview
-├── BUILD_INSTRUCTIONS.md  # This file
-└── TODO.md               # Implementation plan
+├── ARCHITECTURE.md        # Design notes
+├── TODO.md               # Implementation plan
+└── USER_GUIDE.md         # User documentation
 ```
-
-## Troubleshooting
-
-### Common Issues:
-
-1. **CMake errors**: Ensure CMake version is at least 3.10
-2. **Missing UEFI headers**: Install EDK II or UEFI SDK
-3. **MinGW compilation errors**: Make sure GCC is properly installed and in PATH
-4. **Linker errors**: May need to specify additional libraries for UEFI
-
-### Environment Setup:
-
-```powershell
-# Check if required tools are available
-cmake --version
-gcc --version
-git --version
-
-# Add MinGW to PATH if needed
-$env:PATH += ";C:\mingw64\bin"
-```
-
-## Build Artifacts
-
-The build process generates:
-- `EFI-Mac-Emulator.efi` - Main EFI application
-- Various object files and libraries
-- Debug symbols (if built with debug flags)
-
-## Next Steps
-
-1. **Install prerequisites**
-2. **Run the build commands**
-3. **Test in UEFI environment**
-4. **Load Mac OS kernel images**
-
-Note: This is an advanced project that requires proper UEFI development setup. For testing, QEMU with OVMF (Open Virtual Machine Firmware) is recommended as it provides a complete UEFI environment.
 
 ## License
 
-MIT License - See LICENSE file for details.
+This project is licensed under the GNU General Public License, version 3 or
+later. See the [LICENSE](LICENSE) file for details.

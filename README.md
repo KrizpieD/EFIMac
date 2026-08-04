@@ -1,6 +1,6 @@
 # EFI-Mac-Emulator
 
-A UEFI-based emulator for running classic Mac OS (OS 8, 9, and System 7) on modern Intel x86_64 computers.
+A UEFI-based emulator for running classic Mac OS (System 7, Mac OS 8, and Mac OS 9) on modern Intel x86_64 computers.
 
 ## Project Overview
 
@@ -39,84 +39,85 @@ This project creates a UEFI executable that provides:
   - Better compatibility with existing emulators like SheepShaver
   - More modern architecture than 68k
 
-## Implementation Status
+## Current Status
 
-This project has completed all phases of development:
+**Pre-alpha scaffolding.** The repository currently contains:
 
-### Phase 1: Research and Analysis
-- Analyzed existing Mac emulators (SheepShaver, Basilisk II, QEMU)
-- Studied PowerPC vs 68k architecture differences
-- Documented UEFI specifications and implementation guidelines
+- Module interfaces (headers) and partial, mostly placeholder implementations for the CPU translation layer, memory manager, hardware abstraction, bootloader, debug system, and UEFI interface (`src/*/*_impl.c`).
+- A CMake build configuration (`CMakeLists.txt`).
 
-### Phase 2: Core Framework Implementation
-- Implemented basic UEFI application framework
-- Developed CPU instruction set translator for PowerPC
-- Created memory manager with allocation/deallocation functions
-- Designed hardware abstraction interface for graphics, audio, storage, and networking
+What does **not** exist yet:
 
-### Phase 3: Full Compatibility Implementation  
-- Implemented complete CPU instruction translation logic
-- Developed comprehensive memory management system
-- Created full hardware abstraction layer
-- Implemented complete bootloader and boot process
-- Built comprehensive debugging and logging system
-- Implemented complete UEFI interface layer
+- No working PowerPC instruction translation — the current code only decodes a handful of opcodes and does not actually translate or execute anything.
+- No memory management, graphics, audio, storage, or network emulation beyond placeholder functions that mostly print status messages.
+- No bootloader that loads real Mac OS images — kernel loading is simulated.
+- **The code does not currently compile.** It requires a real UEFI development toolchain (EDK II or GNU-EFI) and the UEFI headers/libraries those provide; the stub headers that previously accompanied it were removed.
+
+See [TODO.md](TODO.md) for the phase-by-phase plan and what remains to be done.
+
+### Completed So Far
+
+- **Phase 1: Research and Analysis**
+  - Analyzed existing Mac emulators (SheepShaver, Basilisk II, QEMU, DingusPPC)
+  - Studied PowerPC vs 68k architecture differences
+  - Documented UEFI specifications and implementation guidelines
+- **Design**: Module interfaces (headers) and a starting skeleton for each subsystem.
+
+### Not Yet Implemented
+
+- Actual PowerPC instruction set translation / execution engine
+- Memory manager and MMU emulation
+- Real graphics, audio, storage, and network device emulation
+- Bootloader that loads and boots a real Mac OS image
+- Any buildable UEFI application
 
 ## Source Code Structure
 
 ```
 src/
-├── main.c                 # Main UEFI application entry point
-├── cpu/                   # CPU translation components
-│   ├── translation.h      # Header for translation functions
-│   ├── translation.c      # Basic translation skeleton (deprecated)
-│   └── translation_impl.c # Full implementation of translation logic
-├── memory/                # Memory management components  
-│   ├── manager.h          # Header for memory manager
-│   ├── manager.c          # Basic memory manager skeleton (deprecated)
-│   └── manager_impl.c     # Full implementation of memory manager
-├── hardware/              # Hardware abstraction components
-│   ├── abstraction.h      # Header for hardware abstraction
-│   ├── abstraction.c      # Basic abstraction skeleton (deprecated)
-│   └── abstraction_impl.c # Full implementation of hardware abstraction
-├── boot/                  # Bootloader and system loading components
-│   ├── bootloader.h       # Header for bootloader functions
-│   ├── bootloader.c       # Basic bootloader skeleton (deprecated)
-│   └── bootloader_impl.c  # Full implementation of bootloader
-├── utils/                 # Utility functions and debugging
-│   ├── debug.h            # Header for debugging functions  
-│   ├── debug.c            # Basic debugging skeleton (deprecated)
-│   └── debug_impl.c       # Full implementation of debugging system
-└── platform/              # UEFI interface components
-    ├── uefi_interface.h   # Header for UEFI interface functions
-    ├── uefi_interface.c   # Basic UEFI interface skeleton (deprecated)
-    └── uefi_interface_impl.c # Full implementation of UEFI interface
+├── main.c                       # Main UEFI application entry point
+├── cpu/
+│   ├── translation.h            # Header for translation functions
+│   └── translation_impl.c       # Partial implementation of translation logic
+├── memory/
+│   ├── manager.h                # Header for memory manager
+│   └── manager_impl.c           # Partial implementation of memory manager
+├── hardware/
+│   ├── abstraction.h            # Header for hardware abstraction
+│   └── abstraction_impl.c       # Partial implementation of hardware abstraction
+├── boot/
+│   ├── bootloader.h             # Header for bootloader functions
+│   └── bootloader_impl.c        # Partial implementation of bootloader
+├── utils/
+│   ├── debug.h                  # Header for debugging functions
+│   └── debug_impl.c             # Partial implementation of debugging system
+└── platform/
+    ├── uefi_interface.h         # Header for UEFI interface functions
+    └── uefi_interface_impl.c    # Partial implementation of UEFI interface
 
 CMakeLists.txt             # Build configuration file
-BUILD_INSTRUCTIONS.md      # Detailed build instructions
+ARCHITECTURE.md            # Design notes for the CPU translation layer
+BUILD_INSTRUCTIONS.md      # Build instructions
 USER_GUIDE.md              # User documentation
 TODO.md                    # Implementation plan and status
 ```
 
 ## Prerequisites for Building
 
-Building this project requires:
+Building this project requires a real UEFI development environment:
 
 1. **UEFI Development Environment**:
-   - EDK II (EDK II is required for UEFI development)
-   - UEFI SDK or similar toolchain
-   - Proper UEFI headers and libraries
+   - EDK II (TianoCore) or GNU-EFI
+   - Proper UEFI headers and libraries (Uefi.h, UefiLib.h, etc.)
 
 2. **Compiler Toolchain**:
-   - GCC MinGW-w64 or compatible C compiler
-   - CMake build system (version 3.10 or higher)
-   - Git for version control
+   - A cross-compiler targeting x86_64 UEFI (e.g. GCC x86_64 or the EDK II toolchain)
+   - CMake (version 3.10 or higher)
 
 ## Building Instructions
 
-### For UEFI Development Environment:
-
-The project is configured to use CMake with EDK II structure. To build:
+The project is configured to use CMake. It must be built against a real UEFI
+toolchain — set `EFI_INCLUDE_DIRS` (or otherwise provide UEFI headers) before configuring:
 
 ```bash
 mkdir build
@@ -125,45 +126,38 @@ cmake .. -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build .
 ```
 
-### Alternative Build Method (Using EDK II):
+Alternatively, port the sources into an EDK II package and build with the EDK II build tool:
 
-1. Set up EDK II environment
-2. Create a UEFI application package in EDK II structure
-3. Compile with build command:
-   ```bash
-   build -p EFI-Mac-Emulator.dsc -b RELEASE -t GCC5
-   ```
+```bash
+build -p EFI-Mac-Emulator.dsc -b RELEASE -t GCC5
+```
 
-## Testing Instructions
+See [BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md) for details.
 
-### Prerequisites for Testing:
+## Testing
 
-1. **UEFI firmware capable of running EFI applications**
-2. **Virtual Machine** (like QEMU with UEFI support) or physical hardware with UEFI boot capability
-3. **Mac OS system files**:
+There are currently no tests. Testing an emulator like this requires:
+
+1. **UEFI firmware capable of running EFI applications** (e.g. QEMU + OVMF)
+2. **Classic Mac OS system files**:
    - System 7, Mac OS 8, or Mac OS 9 ROM images
    - Kernel images for the respective systems
 
-### Test Procedure:
-
-1. **Boot into UEFI environment**
-2. **Load the EFI-Mac-Emulator application**
-3. **Configure boot parameters**
-4. **Load a Mac OS kernel image**
-5. **Execute the boot process**
-
 ## Important Notes
 
-This is an advanced emulator that requires:
-- A proper UEFI development environment
+This is an ambitious emulator that requires:
+- A proper UEFI development environment (EDK II or GNU-EFI)
 - Access to classic Mac OS system files (ROMs, kernels, etc.)
 - Understanding of both UEFI and PowerPC architectures
 
-The build process is complex because it requires a complete UEFI development toolchain with headers and libraries that are not typically available in standard Windows installations.
+The PowerPC translation layer, in particular, is a large undertaking. Existing
+open-source projects such as SheepShaver, Basilisk II, QEMU, and DingusPPC are
+valuable references.
 
 ## Future Development
 
 ### Planned Enhancements:
+- Real PowerPC instruction interpreter (and eventually dynamic translation)
 - Better audio subsystem
 - More comprehensive graphics support
 - Improved performance optimization
@@ -178,12 +172,13 @@ The build process is complex because it requires a complete UEFI development too
 
 ## License
 
-MIT License - See LICENSE file for details.
+This project is licensed under the GNU General Public License, version 3 or
+later. See the [LICENSE](LICENSE) file for details.
 
 ## Version Information
 
-- **Version**: 0.1 (Initial Release)
-- **Status**: Alpha - Functional but not fully complete
-- **Supported Platforms**: x86_64 UEFI systems
+- **Version**: 0.1 (Scaffolding)
+- **Status**: Pre-alpha - not yet buildable; interfaces and placeholders only
+- **Target Platforms**: x86_64 UEFI systems
 
-This is a work in progress and may contain bugs or incomplete features.
+This is a work in progress.

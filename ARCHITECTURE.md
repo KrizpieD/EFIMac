@@ -1,5 +1,10 @@
 # EFI-Mac-Emulator - CPU Translation Layer Architecture
 
+> **Status note:** This document is a *design reference* for the CPU
+> translation layer. None of the components described below are implemented
+> yet — the current code in `src/cpu/` is placeholder scaffolding. This
+> document describes the intended architecture, not current behavior.
+
 ## Overview
 
 The CPU translation layer is the core component of the EFI-Mac-Emulator that translates instructions between the host x86_64 architecture and the target PowerPC architecture. This layer must handle instruction set differences, register mapping, and execution context switching.

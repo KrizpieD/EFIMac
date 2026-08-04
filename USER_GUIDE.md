@@ -1,10 +1,20 @@
 # EFI-Mac-Emulator - User Guide
 
+## Status
+
+**This project is not usable yet.** It is pre-alpha scaffolding: the emulator
+does not build and does not boot Mac OS. This guide describes the intended
+behavior once the project is functional. Treat everything below as the target
+design, not current capability. See [TODO.md](TODO.md) for progress.
+
 ## Overview
 
-The EFI-Mac-Emulator is a UEFI-based application that enables running classic Mac OS versions (System 7, Mac OS 8, and Mac OS 9) on modern Intel x86_64 computers. It provides a complete emulation environment through the UEFI boot system.
+The EFI-Mac-Emulator is intended to be a UEFI-based application that runs
+classic Mac OS versions (System 7, Mac OS 8, and Mac OS 9) on modern Intel
+x86_64 computers, by providing an emulated PowerPC environment through the UEFI
+boot system.
 
-## System Requirements
+## System Requirements (Target)
 
 ### Hardware Requirements:
 - Intel x86_64 processor (modern CPU recommended)
@@ -14,69 +24,37 @@ The EFI-Mac-Emulator is a UEFI-based application that enables running classic Ma
 
 ### Software Requirements:
 - UEFI firmware that supports EFI applications
-- Operating system with UEFI boot capability (Windows 10/11, Linux with UEFI)
-- QEMU or similar for testing without physical hardware
+- QEMU (with OVMF) or similar for testing without physical hardware
 
-## Installation
+## Building (Target)
 
-### For Development Users:
-1. Clone the repository:
-   ```powershell
-   git clone https://github.com/your-repo/efimac-project.git
-   cd efimac-project
-   ```
+The project must be built with a real UEFI toolchain (EDK II or GNU-EFI). It
+does not build yet. See [BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md).
 
-2. Build the project using CMake:
-   ```powershell
-   mkdir build
-   cd build
-   cmake .. -G "MinGW Makefiles"
-   cmake --build .
-   ```
+Once buildable, the result would be an EFI application
+(`EFI-Mac-Emulator.efi`) that you copy to a FAT32 USB drive or EFI system
+partition, or run from the UEFI shell in QEMU.
 
-3. The EFI application will be generated as `EFI-Mac-Emulator.efi`
+## Configuration (Planned)
 
-### For End Users:
-1. Download the pre-built EFI application from the releases page
-2. Copy to a FAT32 formatted USB drive or EFI system partition
-3. Ensure your UEFI firmware supports loading EFI applications
-
-## Configuration
-
-### Boot Parameters:
-The emulator accepts various boot parameters that can be configured before booting:
+The emulator is intended to accept boot parameters configured before booting:
 
 - **Boot Mode**: Normal, Recovery, Diagnostic
-- **Memory Size**: Amount of RAM to allocate (in MB)
+- **Memory Size**: Amount of guest RAM to allocate (in MB)
 - **Video Mode**: Display resolution settings
 - **Debug Mode**: Enable detailed logging output
 
-### Configuration Options:
-```ini
-# Example configuration file (not implemented yet)
-[boot]
-mode = normal
-memory = 256
-video = 1024x768
-debug = true
+None of this configuration is implemented yet.
 
-[hardware]
-graphics = enabled
-audio = enabled
-storage = 1
-network = 1
-```
-
-## Usage Instructions
+## Usage Instructions (Planned)
 
 ### Method 1: Direct UEFI Boot
 1. Copy `EFI-Mac-Emulator.efi` to your EFI system partition or bootable USB
 2. Reboot and enter UEFI setup
 3. Select the emulator from the boot menu
-4. The emulator will initialize and display status information
 
 ### Method 2: UEFI Shell Testing
-1. Boot into UEFI shell
+1. Boot into the UEFI shell
 2. Navigate to the location of `EFI-Mac-Emulator.efi`
 3. Execute:
    ```
@@ -88,45 +66,46 @@ network = 1
 2. Create a virtual machine with UEFI firmware
 3. Boot the emulator within the VM
 
-## Loading Mac OS Systems
+## Loading Mac OS Systems (Planned)
 
 ### Required Files:
-To run classic Mac OS versions, you'll need:
+To run classic Mac OS versions, you will need:
 
-1. **Mac OS ROM images** - System ROM files for the target Mac OS version
-2. **Kernel images** - Kernel files for each system version
-3. **System folders** - Complete system files and applications
+1. **Mac OS ROM images** — System ROM files for the target Mac OS version
+2. **Kernel images** — Kernel files for each system version
+3. **System folders** — Complete system files and applications
 
-### Loading Process:
-1. The emulator will initialize the PowerPC environment
-2. It will load the specified kernel image
+### Loading Process (Planned):
+1. The emulator initializes the PowerPC environment
+2. It loads the specified ROM and kernel images
 3. Hardware abstractions are set up
 4. System files are mounted and initialized
 5. Control is transferred to the Mac OS kernel
 
-## Features and Capabilities
+## Features and Capabilities (Planned)
 
-### Supported Systems:
+### Supported Systems (Target):
 - **System 7** (7.0 - 7.6)
 - **Mac OS 8** (8.0 - 8.6)
 - **Mac OS 9** (9.0 - 9.2)
 
-### Hardware Support:
+### Hardware Support (Target):
 - **Graphics**: 640x480, 800x600, 1024x768, and 1280x1024 resolutions
 - **Audio**: Basic audio subsystem support
 - **Storage**: Multiple storage device emulation
 - **Networking**: Network interface abstraction
 
-### Emulation Features:
-- **CPU Translation**: Full PowerPC instruction set translation
-- **Memory Management**: Virtual memory handling
+### Emulation Features (Target):
+- **CPU Translation**: PowerPC to x86_64 instruction translation
+- **Memory Management**: Guest memory handling
 - **Hardware Abstraction**: Consistent hardware interfaces
-- **Boot Process**: Complete boot sequence emulation
-- **Debugging**: Comprehensive logging and debugging capabilities
+- **Boot Process**: Boot sequence emulation
+- **Debugging**: Logging and debugging capabilities
 
-## Troubleshooting
+## Troubleshooting (Planned)
 
-### Common Issues:
+None of the features below are currently available. When the project is
+functional, common issues are expected to include:
 
 1. **Emulator fails to load**:
    - Check that you're running on UEFI-capable hardware
@@ -142,53 +121,32 @@ To run classic Mac OS versions, you'll need:
    - Try different video modes in boot parameters
    - Ensure your UEFI firmware supports the resolution requested
 
-### Debugging:
-Enable debug mode to get detailed output:
-```
-# In boot parameters or configuration file
-debug = true
-log_level = 4
-```
-
-## Performance Tips
-
-1. **Memory Allocation**: Allocate sufficient RAM (256MB+ recommended)
-2. **Storage**: Use fast storage for system files
-3. **CPU**: Modern multi-core processors perform better
-4. **Video**: Lower resolutions reduce overhead
-
 ## Limitations
 
 ### Current Limitations:
-- Requires UEFI-capable hardware or virtual environment
-- Full system compatibility depends on available ROM images
+- The emulator does not build or run yet (pre-alpha)
+- Requires UEFI-capable hardware or a virtual environment
+- Full system compatibility will depend on available ROM images
 - Performance may be lower than native execution
 - Some advanced Mac OS features may not be fully supported
 
 ### Planned Enhancements:
+- Real PowerPC instruction interpreter (and dynamic translation later)
 - Better audio subsystem
 - More comprehensive graphics support
 - Improved performance optimization
 - Additional hardware device emulation
 - Enhanced debugging capabilities
 
-## Support and Feedback
-
-For issues or questions about the EFI-Mac-Emulator:
-
-1. **GitHub Issues**: Report bugs and feature requests
-2. **Documentation**: Check the project wiki for updates
-3. **Community**: Join Mac OS emulation forums for support
-4. **Contributing**: Contribute improvements to the codebase
-
 ## License
 
-MIT License - See LICENSE file for details.
+This project is licensed under the GNU General Public License, version 3 or
+later. See the [LICENSE](LICENSE) file for details.
 
 ## Version Information
 
-- **Version**: 0.1 (Initial Release)
-- **Status**: Alpha - Functional but not fully complete
-- **Supported Platforms**: x86_64 UEFI systems
+- **Version**: 0.1 (Scaffolding)
+- **Status**: Pre-alpha - not yet buildable
+- **Target Platforms**: x86_64 UEFI systems
 
-This is a work in progress and may contain bugs or incomplete features.
+This is a work in progress.
