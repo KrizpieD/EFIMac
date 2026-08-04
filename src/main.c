@@ -1,9 +1,8 @@
-#include <Uefi.h>
-#include <Library/UefiLib.h>
-#include <Library/BaseLib.h>
-#include <Library/BaseMemoryLib.h>
-#include <Library/UefiBootServicesTableLib.h>
-#include <Protocol/LoadedImage.h>
+#include <efi.h>
+#include <efilib.h>
+
+// MS ABI CRT symbol: signals the linker that floating-point is in use.
+UINT32 _fltused = 0;
 
 // Include all our module headers
 #include "cpu/translation.h"
@@ -14,17 +13,15 @@
 #include "platform/uefi_interface.h"
 
 EFI_STATUS
-EFIAPI
-UefiMain (
+efi_main (
   IN EFI_HANDLE        ImageHandle,
   IN EFI_SYSTEM_TABLE  *SystemTable
   )
 {
   EFI_STATUS Status;
   
-  // Initialize the system table
-  gBS = SystemTable;
-  gST = SystemTable;
+  // Initialize the GNU-EFI library
+  InitializeLib(ImageHandle, SystemTable);
   
   // Print welcome message
   Print(L"EFI-Mac-Emulator v0.1\n");

@@ -1,7 +1,7 @@
 #ifndef __PPC_BOOTLOADER_H__
 #define __PPC_BOOTLOADER_H__
 
-#include <Uefi.h>
+#include <efi.h>
 
 // Boot modes
 #define PPC_BOOT_MODE_NORMAL    0
@@ -98,6 +98,16 @@ EFI_STATUS
 EFIAPI
 PpcGetBootInfo (
     OUT PPC_BOOT_INFO* BootInfo
+    );
+
+/**
+  Set up the boot environment for the PowerPC system
+  @retval EFI_STATUS
+**/
+EFI_STATUS
+EFIAPI
+PpcSetupBootEnvironment (
+    VOID
     );
 
 #endif // __PPC_BOOTLOADER_H__

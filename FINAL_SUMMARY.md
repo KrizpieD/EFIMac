@@ -36,9 +36,9 @@ Mac OS 9) on modern Intel x86_64 computers.
   print status but do not emulate hardware.
 - **No working bootloader.** Kernel loading is simulated with hard-coded values;
   nothing loads a real Mac OS ROM or kernel image.
-- **It does not build.** The code requires a real UEFI toolchain (EDK II or
-  GNU-EFI). The stub headers and demo build scripts that gave the impression of
-  buildability have been removed.
+- **Emulation does not run yet.** The project builds a valid x86_64 UEFI
+  application (`build/EFI-Mac-Emulator.efi`) via GNU-EFI + clang/lld-link, but
+  the application only initializes scaffolding and prints status.
 
 ## Source Code Structure
 

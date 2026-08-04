@@ -1,7 +1,7 @@
 #ifndef __PPC_TRANSLATION_H__
 #define __PPC_TRANSLATION_H__
 
-#include <Uefi.h>
+#include <efi.h>
 
 // PowerPC register definitions
 #define PPC_GPR0    0
@@ -41,6 +41,13 @@
 #define PPC_MSR_REG     32
 #define PPC_SRR0_REG    33
 #define PPC_SRR1_REG    34
+
+// PowerPC special register numbers (used by PpcGetRegisterValue/PpcSetRegisterValue)
+#define PPC_REG_MSR     32
+#define PPC_REG_SRR0    33
+#define PPC_REG_SRR1    34
+#define PPC_REG_CTR     35
+#define PPC_REG_LR      36
 
 // PowerPC exception types
 #define PPC_EXCEPTION_INTERRUPT     1
@@ -128,6 +135,27 @@ EFI_STATUS
 EFIAPI
 PpcSetRegisterValue (
     IN UINT8  RegisterNumber,
+    IN UINT32 Value
+    );
+
+/**
+  Get value of a PowerPC general purpose register
+  @param[in] RegisterNumber   Number of the register to get
+  @retval Register value
+**/
+UINT32
+PpcGetGprValue (
+    IN UINT8 RegisterNumber
+    );
+
+/**
+  Set value of a PowerPC general purpose register
+  @param[in] RegisterNumber   Number of the register to set
+  @param[in] Value            Value to set in the register
+**/
+VOID
+PpcSetGprValue (
+    IN UINT8 RegisterNumber,
     IN UINT32 Value
     );
 

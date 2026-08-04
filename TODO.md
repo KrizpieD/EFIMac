@@ -5,8 +5,9 @@
 The repository contains interface headers and partial (largely placeholder)
 implementations for the CPU translation layer, memory manager, hardware
 abstraction, bootloader, debug system, and UEFI interface. Nothing actually
-translates or executes PowerPC code yet, and the project does not currently
-build (it needs a real UEFI toolchain such as EDK II or GNU-EFI).
+translates or executes PowerPC code yet, but the project now builds with a real
+toolchain: GNU-EFI + clang/lld-link on macOS (see
+[BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md)).
 
 ## Phase 1: Research and Analysis
 - [x] Analyze existing Mac emulators (SheepShaver, Basilisk II, QEMU, DingusPPC)
@@ -21,7 +22,7 @@ build (it needs a real UEFI toolchain such as EDK II or GNU-EFI).
 - [ ] Plan memory management approach (UEFI pool vs. guest memory regions)
 
 ## Phase 3: Core Implementation
-- [ ] Get the UEFI application to build with a real toolchain (EDK II or GNU-EFI)
+- [x] Get the UEFI application to build with a real toolchain (GNU-EFI + clang/lld-link)
 - [ ] Implement CPU instruction decoder and interpreter (PowerPC)
 - [ ] Implement register file and special-purpose registers (MSR, SRR0/1, CTR, LR)
 - [ ] Implement memory manager backed by UEFI allocation

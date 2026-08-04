@@ -1,9 +1,7 @@
 #include "debug.h"
-#include <Uefi.h>
-#include <Library/UefiLib.h>
-#include <Library/BaseLib.h>
-#include <Library/BaseMemoryLib.h>
-#include <Library/UefiBootServicesTableLib.h>
+#include <efi.h>
+#include <efilib.h>
+#include "cpu/translation.h"
 
 // Debug context structure with enhanced functionality
 typedef struct {
@@ -11,7 +9,7 @@ typedef struct {
     UINT32  LogLevel;
     BOOLEAN LogToFile;
     CHAR16* LogFilePath;
-    EFI_FILE_HANDLELogFile;
+    EFI_FILE_HANDLE LogFile;
 } PPC_DEBUG_CONTEXT;
 
 // Global debug context

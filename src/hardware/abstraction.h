@@ -1,7 +1,7 @@
 #ifndef __PPC_HARDWARE_ABSTRACTION_H__
 #define __PPC_HARDWARE_ABSTRACTION_H__
 
-#include <Uefi.h>
+#include <efi.h>
 
 // Graphics modes
 #define PPC_GRAPHICS_MODE_DEFAULT   0

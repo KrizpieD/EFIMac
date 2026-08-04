@@ -1,16 +1,13 @@
 #include "uefi_interface.h"
-#include <Uefi.h>
-#include <Library/UefiLib.h>
-#include <Library/BaseLib.h>
-#include <Library/BaseMemoryLib.h>
-#include <Library/UefiBootServicesTableLib.h>
+#include <efi.h>
+#include <efilib.h>
 
 // UEFI interface context with enhanced functionality
 typedef struct {
     BOOLEAN IsInitialized;
     EFI_SYSTEM_TABLE* SystemTable;
     EFI_HANDLE ImageHandle;
-    EFI_LOADED_IMAGE* LoadedImage;
+    EFI_LOADED_IMAGE_PROTOCOL* LoadedImage;
     EFI_GUID* VendorGuid;
 } PPC_UEFI_CONTEXT;
 
@@ -31,7 +28,7 @@ PpcInitializeUefiInterface (
     g_UefiContext.SystemTable = SystemTable;
     
     // Get the loaded image protocol
-    EFI_STATUS Status = g_BS->HandleProtocol(
+    EFI_STATUS Status = BS->HandleProtocol(
         ImageHandle,
         &gEfiLoadedImageProtocolGuid,
         (VOID**)&g_UefiContext.LoadedImage
@@ -42,8 +39,8 @@ PpcInitializeUefiInterface (
         return Status;
     }
     
-    // Get the vendor GUID from the loaded image
-    g_UefiContext.VendorGuid = &g_UefiContext.LoadedImage->ParentHandle;
+    // Vendor GUID not currently populated
+    g_UefiContext.VendorGuid = NULL;
     
     Print(L"PowerPC UEFI Interface initialized\n");
     Print(L"Image handle: 0x%x\n", ImageHandle);
@@ -83,7 +80,7 @@ PpcGetImageHandle (
 
 EFI_STATUS
 PpcAllocatePool (
-    IN  EFI_ALLOCATE_TYPE PoolType,
+    IN  EFI_MEMORY_TYPE PoolType,
     IN  UINTN Size,
     OUT VOID** Buffer
     )
@@ -92,7 +89,7 @@ PpcAllocatePool (
         return EFI_INVALID_PARAMETER;
     }
     
-    EFI_STATUS Status = g_BS->AllocatePool(
+    EFI_STATUS Status = BS->AllocatePool(
         PoolType,
         Size,
         Buffer
@@ -120,7 +117,7 @@ PpcFreePool (
         return EFI_INVALID_PARAMETER;
     }
     
-    EFI_STATUS Status = g_BS->FreePool(Buffer);
+    EFI_STATUS Status = BS->FreePool(Buffer);
     
     if (EFI_ERROR(Status)) {
         Print(L"Failed to free pool: %r\n", Status);
@@ -142,7 +139,7 @@ PpcGetMemoryMap (
     )
 {
     // Get the memory map from UEFI
-    EFI_STATUS Status = g_BS->GetMemoryMap(
+    EFI_STATUS Status = BS->GetMemoryMap(
         MemoryMapSize,
         MemoryMap,
         MapKey,
@@ -170,7 +167,7 @@ PpcOutputString (
     }
     
     // Output string via UEFI console
-    g_ST->ConOut->OutputString(g_ST->ConOut, String);
+    ST->ConOut->OutputString(ST->ConOut, String);
     
     return EFI_SUCCESS;
 }
@@ -188,7 +185,7 @@ PpcGetVariable (
         return EFI_INVALID_PARAMETER;
     }
     
-    EFI_STATUS Status = g_BS->GetVariable(
+    EFI_STATUS Status = RT->GetVariable(
         VariableName,
         VendorGuid,
         Attributes,
@@ -219,7 +216,7 @@ PpcSetVariable (
         return EFI_INVALID_PARAMETER;
     }
     
-    EFI_STATUS Status = g_BS->SetVariable(
+    EFI_STATUS Status = RT->SetVariable(
         VariableName,
         VendorGuid,
         Attributes,
@@ -321,7 +318,7 @@ PpcGetFirmwareVersion (
     // 1. Get firmware version from UEFI system table
     // 2. Format version string
     
-    StrCpyS(VersionString, StringSize, L"EFI-Mac-Emulator v0.1");
+    StrCpy(VersionString, L"EFI-Mac-Emulator v0.1");
     
     Print(L"Firmware version: %s\n", VersionString);
     
@@ -370,5 +367,5 @@ PpcResetSystem (
     // 1. Save system state if needed
     // 2. Perform system reset using UEFI ResetSystem protocol
     
-    return g_RT->ResetSystem(ResetType, StatusCode, DataSize, ResetData);
+    return RT->ResetSystem(ResetType, StatusCode, DataSize, ResetData);
 }

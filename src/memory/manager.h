@@ -1,7 +1,7 @@
 #ifndef __PPC_MEMORY_MANAGER_H__
 #define __PPC_MEMORY_MANAGER_H__
 
-#include <Uefi.h>
+#include <efi.h>
 
 // Memory protection flags
 #define PPC_MEMORY_READ     0x01
@@ -20,6 +20,13 @@ typedef struct {
     EFI_PHYSICAL_ADDRESS BaseAddress;
     UINT64               Size;
     BOOLEAN              IsInitialized;
+    VOID*                VirtualBase;
+    EFI_MEMORY_DESCRIPTOR* MemoryMap;
+    UINTN                MapKey;
+    UINTN                DescriptorSize;
+    UINT32               DescriptorVersion;
+    UINTN                MapSize;
+    BOOLEAN              UseUefiMemory;
 } PPC_MEMORY_MANAGER_CONTEXT;
 
 /**

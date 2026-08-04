@@ -1,7 +1,7 @@
 #ifndef __PPC_DEBUG_H__
 #define __PPC_DEBUG_H__
 
-#include <Uefi.h>
+#include <efi.h>
 
 // Debug log levels
 #define PPC_DEBUG_LEVEL_NONE    0

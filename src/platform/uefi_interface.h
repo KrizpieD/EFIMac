@@ -1,7 +1,7 @@
 #ifndef __PPC_UEFI_INTERFACE_H__
 #define __PPC_UEFI_INTERFACE_H__
 
-#include <Uefi.h>
+#include <efi.h>
 
 /**
   Initialize PowerPC UEFI interface
@@ -48,7 +48,7 @@ PpcGetImageHandle (
 EFI_STATUS
 EFIAPI
 PpcAllocatePool (
-    IN  EFI_ALLOCATE_TYPE PoolType,
+    IN  EFI_MEMORY_TYPE PoolType,
     IN  UINTN Size,
     OUT VOID** Buffer
     );

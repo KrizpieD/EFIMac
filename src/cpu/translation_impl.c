@@ -1,8 +1,6 @@
 #include "translation.h"
-#include <Uefi.h>
-#include <Library/UefiLib.h>
-#include <Library/BaseLib.h>
-#include <Library/BaseMemoryLib.h>
+#include <efi.h>
+#include <efilib.h>
 
 // PowerPC instruction formats and operation definitions
 #define PPC_OPCODE_MASK     0xFC000000

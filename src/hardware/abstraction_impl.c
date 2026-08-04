@@ -1,9 +1,6 @@
 #include "abstraction.h"
-#include <Uefi.h>
-#include <Library/UefiLib.h>
-#include <Library/BaseLib.h>
-#include <Library/BaseMemoryLib.h>
-#include <Library/UefiBootServicesTableLib.h>
+#include <efi.h>
+#include <efilib.h>
 
 // Hardware abstraction context with more complete implementation
 typedef struct {
@@ -76,7 +73,7 @@ PpcInitializeGraphics (
     
     // Allocate a simple video buffer for demonstration purposes
     UINT64 BufferSize = Width * Height * (ColorDepth / 8);
-    EFI_STATUS Status = g_BS->AllocatePool(EfiBootServicesData, BufferSize, &g_HardwareContext.VideoBuffer);
+    EFI_STATUS Status = BS->AllocatePool(EfiBootServicesData, BufferSize, &g_HardwareContext.VideoBuffer);
     
     if (EFI_ERROR(Status)) {
         Print(L"Failed to allocate video buffer: %r\n", Status);

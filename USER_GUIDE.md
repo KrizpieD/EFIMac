@@ -3,9 +3,9 @@
 ## Status
 
 **This project is not usable yet.** It is pre-alpha scaffolding: the emulator
-does not build and does not boot Mac OS. This guide describes the intended
-behavior once the project is functional. Treat everything below as the target
-design, not current capability. See [TODO.md](TODO.md) for progress.
+builds a UEFI application but does not boot Mac OS. This guide describes the
+intended behavior once the project is functional. Treat everything below as the
+target design, not current capability. See [TODO.md](TODO.md) for progress.
 
 ## Overview
 
@@ -26,14 +26,15 @@ boot system.
 - UEFI firmware that supports EFI applications
 - QEMU (with OVMF) or similar for testing without physical hardware
 
-## Building (Target)
+## Building
 
-The project must be built with a real UEFI toolchain (EDK II or GNU-EFI). It
-does not build yet. See [BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md).
+Build with `make` on macOS (requires `brew install llvm lld`; GNU-EFI is
+cloned automatically). Output: `build/EFI-Mac-Emulator.efi`. See
+[BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md).
 
-Once buildable, the result would be an EFI application
-(`EFI-Mac-Emulator.efi`) that you copy to a FAT32 USB drive or EFI system
-partition, or run from the UEFI shell in QEMU.
+The result is an EFI application that you copy to a FAT32 USB drive or EFI
+system partition, or run from the UEFI shell in QEMU. It currently only prints
+status and does not boot Mac OS.
 
 ## Configuration (Planned)
 
@@ -124,7 +125,7 @@ functional, common issues are expected to include:
 ## Limitations
 
 ### Current Limitations:
-- The emulator does not build or run yet (pre-alpha)
+- The emulator builds but does not run emulation yet (pre-alpha; it only prints status)
 - Requires UEFI-capable hardware or a virtual environment
 - Full system compatibility will depend on available ROM images
 - Performance may be lower than native execution
@@ -146,7 +147,7 @@ later. See the [LICENSE](LICENSE) file for details.
 ## Version Information
 
 - **Version**: 0.1 (Scaffolding)
-- **Status**: Pre-alpha - not yet buildable
+- **Status**: Pre-alpha - builds a UEFI app; emulation not yet functional
 - **Target Platforms**: x86_64 UEFI systems
 
 This is a work in progress.

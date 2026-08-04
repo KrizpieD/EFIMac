@@ -41,17 +41,16 @@ This project creates a UEFI executable that provides:
 
 ## Current Status
 
-**Pre-alpha scaffolding.** The repository currently contains:
+**Pre-alpha scaffolding, but it builds.** The repository currently contains:
 
 - Module interfaces (headers) and partial, mostly placeholder implementations for the CPU translation layer, memory manager, hardware abstraction, bootloader, debug system, and UEFI interface (`src/*/*_impl.c`).
-- A CMake build configuration (`CMakeLists.txt`).
+- A working build: `make` produces a valid x86_64 UEFI application (`build/EFI-Mac-Emulator.efi`) using GNU-EFI headers/runtime with a clang + lld-link cross-toolchain (see [BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md)).
 
 What does **not** exist yet:
 
 - No working PowerPC instruction translation — the current code only decodes a handful of opcodes and does not actually translate or execute anything.
 - No memory management, graphics, audio, storage, or network emulation beyond placeholder functions that mostly print status messages.
 - No bootloader that loads real Mac OS images — kernel loading is simulated.
-- **The code does not currently compile.** It requires a real UEFI development toolchain (EDK II or GNU-EFI) and the UEFI headers/libraries those provide; the stub headers that previously accompanied it were removed.
 
 See [TODO.md](TODO.md) for the phase-by-phase plan and what remains to be done.
 
@@ -69,7 +68,6 @@ See [TODO.md](TODO.md) for the phase-by-phase plan and what remains to be done.
 - Memory manager and MMU emulation
 - Real graphics, audio, storage, and network device emulation
 - Bootloader that loads and boots a real Mac OS image
-- Any buildable UEFI application
 
 ## Source Code Structure
 
@@ -95,7 +93,7 @@ src/
     ├── uefi_interface.h         # Header for UEFI interface functions
     └── uefi_interface_impl.c    # Partial implementation of UEFI interface
 
-CMakeLists.txt             # Build configuration file
+Makefile                # Build configuration (make -> build/EFI-Mac-Emulator.efi)
 ARCHITECTURE.md            # Design notes for the CPU translation layer
 BUILD_INSTRUCTIONS.md      # Build instructions
 USER_GUIDE.md              # User documentation
@@ -104,34 +102,19 @@ TODO.md                    # Implementation plan and status
 
 ## Prerequisites for Building
 
-Building this project requires a real UEFI development environment:
+Building this project requires a macOS host with Homebrew:
 
-1. **UEFI Development Environment**:
-   - EDK II (TianoCore) or GNU-EFI
-   - Proper UEFI headers and libraries (Uefi.h, UefiLib.h, etc.)
-
-2. **Compiler Toolchain**:
-   - A cross-compiler targeting x86_64 UEFI (e.g. GCC x86_64 or the EDK II toolchain)
-   - CMake (version 3.10 or higher)
+1. **UEFI headers/runtime**: GNU-EFI — cloned automatically by the Makefile into `third_party/gnu-efi/`
+2. **Toolchain**: `brew install llvm lld` (clang cross-compiles to PE/COFF; lld-link links the UEFI image)
 
 ## Building Instructions
 
-The project is configured to use CMake. It must be built against a real UEFI
-toolchain — set `EFI_INCLUDE_DIRS` (or otherwise provide UEFI headers) before configuring:
-
 ```bash
-mkdir build
-cd build
-cmake .. -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
-cmake --build .
+brew install llvm lld
+make
 ```
 
-Alternatively, port the sources into an EDK II package and build with the EDK II build tool:
-
-```bash
-build -p EFI-Mac-Emulator.dsc -b RELEASE -t GCC5
-```
-
+Output: `build/EFI-Mac-Emulator.efi`. Verify the image with `make check`.
 See [BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md) for details.
 
 ## Testing
@@ -178,7 +161,7 @@ later. See the [LICENSE](LICENSE) file for details.
 ## Version Information
 
 - **Version**: 0.1 (Scaffolding)
-- **Status**: Pre-alpha - not yet buildable; interfaces and placeholders only
+- **Status**: Pre-alpha — builds a UEFI application, but emulation is scaffolding/placeholders only
 - **Target Platforms**: x86_64 UEFI systems
 
 This is a work in progress.

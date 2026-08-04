@@ -1,10 +1,9 @@
 #include "bootloader.h"
-#include <Uefi.h>
-#include <Library/UefiLib.h>
-#include <Library/BaseLib.h>
-#include <Library/BaseMemoryLib.h>
-#include <Library/UefiBootServicesTableLib.h>
-#include <Protocol/LoadedImage.h>
+#include <efi.h>
+#include <efilib.h>
+#include "cpu/translation.h"
+#include "memory/manager.h"
+#include "hardware/abstraction.h"
 
 // Bootloader context structure with more complete implementation
 typedef struct {
@@ -15,7 +14,7 @@ typedef struct {
     BOOLEAN KernelLoaded;
     BOOLEAN SystemBooting;
     PPC_BOOT_PARAMETERS BootParams;
-    EFI_LOADED_IMAGE* LoadedImage;
+    EFI_LOADED_IMAGE_PROTOCOL* LoadedImage;
 } PPC_BOOTLOADER_CONTEXT;
 
 // Global bootloader context
@@ -80,9 +79,9 @@ PpcLoadKernel (
     
     // Save the boot image path
     UINTN PathLength = StrLen(ImagePath) + 1;
-    EFI_STATUS Status = g_BS->AllocatePool(EfiBootServicesData, PathLength * sizeof(CHAR16), (VOID**)&g_BootContext.BootImagePath);
+    EFI_STATUS Status = BS->AllocatePool(EfiBootServicesData, PathLength * sizeof(CHAR16), (VOID**)&g_BootContext.BootImagePath);
     if (!EFI_ERROR(Status)) {
-        StrCpyS(g_BootContext.BootImagePath, PathLength, ImagePath);
+        StrCpy(g_BootContext.BootImagePath, ImagePath);
         Print(L"Boot image path saved\n");
     }
     

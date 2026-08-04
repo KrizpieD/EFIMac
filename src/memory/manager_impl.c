@@ -1,23 +1,6 @@
 #include "manager.h"
-#include <Uefi.h>
-#include <Library/UefiLib.h>
-#include <Library/BaseLib.h>
-#include <Library/BaseMemoryLib.h>
-#include <Library/UefiBootServicesTableLib.h>
-
-// Memory management structure with more complete implementation
-typedef struct {
-    EFI_PHYSICAL_ADDRESS BaseAddress;
-    UINT64               Size;
-    BOOLEAN              IsInitialized;
-    VOID*                VirtualBase;
-    EFI_MEMORY_DESCRIPTOR* MemoryMap;
-    UINTN                MapKey;
-    UINTN                DescriptorSize;
-    UINT32               DescriptorVersion;
-    UINTN                MapSize;
-    BOOLEAN              UseUefiMemory;
-} PPC_MEMORY_MANAGER_CONTEXT;
+#include <efi.h>
+#include <efilib.h>
 
 // Global memory manager context
 STATIC PPC_MEMORY_MANAGER_CONTEXT g_MemoryManager = {0};
@@ -41,7 +24,7 @@ PpcInitializeMemoryManager (
     Print(L"Size: %d bytes\n", Size);
     
     // Get the current memory map
-    EFI_STATUS Status = g_BS->GetMemoryMap(
+    EFI_STATUS Status = BS->GetMemoryMap(
         &g_MemoryManager.MapSize,
         NULL,
         &g_MemoryManager.MapKey,
@@ -56,14 +39,14 @@ PpcInitializeMemoryManager (
     
     // Allocate buffer for memory map
     EFI_MEMORY_DESCRIPTOR* MemoryMap = NULL;
-    Status = g_BS->AllocatePool(EfiBootServicesData, g_MemoryManager.MapSize, (VOID**)&MemoryMap);
+    Status = BS->AllocatePool(EfiBootServicesData, g_MemoryManager.MapSize, (VOID**)&MemoryMap);
     if (EFI_ERROR(Status)) {
         Print(L"Failed to allocate memory map buffer: %r\n", Status);
         return Status;
     }
     
     // Get the actual memory map
-    Status = g_BS->GetMemoryMap(
+    Status = BS->GetMemoryMap(
         &g_MemoryManager.MapSize,
         MemoryMap,
         &g_MemoryManager.MapKey,
@@ -73,7 +56,7 @@ PpcInitializeMemoryManager (
     
     if (EFI_ERROR(Status)) {
         Print(L"Failed to get memory map: %r\n", Status);
-        g_BS->FreePool(MemoryMap);
+        BS->FreePool(MemoryMap);
         return Status;
     }
     
@@ -101,7 +84,7 @@ PpcAllocateMemory (
     // 3. Map to physical memory
     // 4. Return allocated addresses
     
-    EFI_STATUS Status = g_BS->AllocatePages(
+    EFI_STATUS Status = BS->AllocatePages(
         AllocateAnyPages,
         EfiBootServicesData,
         (Size + EFI_PAGE_SIZE - 1) / EFI_PAGE_SIZE,
@@ -141,7 +124,7 @@ PpcFreeMemory (
     
     UINTN Pages = (Size + EFI_PAGE_SIZE - 1) / EFI_PAGE_SIZE;
     
-    EFI_STATUS Status = g_BS->FreePages(PhysicalAddress, Pages);
+    EFI_STATUS Status = BS->FreePages(PhysicalAddress, Pages);
     
     if (EFI_ERROR(Status)) {
         Print(L"Failed to free pages: %r\n", Status);
@@ -267,7 +250,7 @@ PpcAllocateKernelMemory (
     Print(L"Allocating kernel memory: %d bytes\n", Size);
     
     // Allocate memory for kernel with special properties
-    EFI_STATUS Status = g_BS->AllocatePages(
+    EFI_STATUS Status = BS->AllocatePages(
         AllocateAnyPages,
         EfiRuntimeServicesData,  // Use runtime services data for kernel
         (Size + EFI_PAGE_SIZE - 1) / EFI_PAGE_SIZE,
@@ -303,7 +286,7 @@ PpcAllocateBootMemory (
     Print(L"Allocating boot memory: %d bytes\n", Size);
     
     // Allocate memory for boot process with specific attributes
-    EFI_STATUS Status = g_BS->AllocatePages(
+    EFI_STATUS Status = BS->AllocatePages(
         AllocateAnyPages,
         EfiBootServicesData,  // Boot services memory for boot process
         (Size + EFI_PAGE_SIZE - 1) / EFI_PAGE_SIZE,
