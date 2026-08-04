@@ -2,8 +2,27 @@
 
 ## Current State
 
-Phase 4 (Emulation Components) is complete and verified in a single QEMU/OVMF
-run alongside the Phase 3 work.
+Phase 5 (Boot Process) first deliverable is implemented: the classic Mac OS boot
+memory map, ROM loading, and system initialization routines.
+
+**Phase 5 recap:** The CPU guest memory map is now multi-region
+(`PpcAddGuestMemoryRegion` in `src/cpu/interpreter.c`): the primary 256 MB guest
+RAM at guest 0x10000000, a dedicated read/write low-memory globals region at
+guest 0x00000000 (16 KB), and a read-only system ROM window at guest 0xFFF00000.
+`PpcInstallLowMemory`/`PpcInstallSystemRom`/`PpcInstallDemoRom` in
+`src/boot/bootloader_impl.c` install the regions; the demo ROM is a
+self-contained image with a reset-vector program. `PpcPrepareSystemForBoot`
+resets the CPU to the ROM reset vector with `MSR = ME|RI` and writes an emulator
+boot info block (magic + RAM/ROM geometry) into low memory.
+`PpcRunBootSelfTest` verifies: low-memory read/write, ROM magic word `ROM1`
+readable, ROM read-only enforcement, and a cross-region ROM -> RAM program
+executed from the reset vector. `src/main.c` wires the Phase 5 sequence
+(install low memory -> install ROM with demo fallback -> self-test -> prepare ->
+report). Code is written against GNU-EFI idioms; a build/run on macOS
+(`make clean && make`, then QEMU/OVMF) is still required to verify.
+
+**Phase 4 recap** (complete and verified in a single QEMU/OVMF run alongside
+the Phase 3 work):
 
 **Phase 3 recap:** All `_impl.c` files use real UEFI services. Interpreter passes
 an 18-check self-test. Memory manager allocates 256 MB of guest RAM via
@@ -87,10 +106,11 @@ demo, kernel load/verify/execute, boot.log). Build is clean with
 - [x] Implement basic networking
 
 ## Phase 5: Boot Process
-- [ ] Create bootloader for Mac OS (load ROM image, set up guest memory map)
-- [ ] Implement system initialization routines
+- [x] Create bootloader for Mac OS (load ROM image, set up guest memory map) - first deliverable: multi-region guest memory map (RAM + low-memory globals + read-only ROM window), ROM load from volume with demo-ROM fallback
+- [x] Implement system initialization routines - CPU reset to ROM reset vector (MSR ME|RI), boot info block in low memory, `PpcRunBootSelfTest` (low-memory R/W, ROM read-only, cross-region ROM->RAM execution)
 - [ ] Add support for system files and drivers
 - [ ] Test boot process with various Mac OS versions
+- [ ] Verify Phase 5 on macOS (`make clean && make`) and in QEMU/OVMF
 
 ## Phase 6: Testing and Optimization
 - [ ] Test with Mac OS 7, 8, and 9

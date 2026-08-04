@@ -225,6 +225,33 @@ PpcSetGuestMemory (
     );
 
 /**
+  Map an additional region into the interpreter's default memory path.
+
+  PpcSetGuestMemory() installs the primary guest RAM region; this adds further
+  regions such as the classic Mac OS ROM window (guest 0xFFF00000, read-only)
+  or the low-memory globals page (guest 0x00000000). Regions are looked up in
+  insertion order and the first region that contains an address wins. A
+  read-only region satisfies guest loads but drops guest stores.
+
+  @param[in] HostBase   Host virtual address backing the region
+  @param[in] GuestBase  Guest-visible base address of the region
+  @param[in] Size       Size of the region in bytes
+  @param[in] ReadOnly   TRUE if guest stores to the region must be dropped
+  @retval EFI_SUCCESS            Region installed
+  @retval EFI_INVALID_PARAMETER  HostBase is NULL or Size is zero
+  @retval EFI_ALREADY_STARTED    A region already covers GuestBase
+  @retval EFI_OUT_OF_RESOURCES   No free region slot
+**/
+EFI_STATUS
+EFIAPI
+PpcAddGuestMemoryRegion (
+    IN VOID*   HostBase,
+    IN UINT32  GuestBase,
+    IN UINT32  Size,
+    IN BOOLEAN ReadOnly
+    );
+
+/**
   Read a single byte from guest memory using the interpreter's active
   memory path (the same one used by load instructions).
 

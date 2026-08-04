@@ -15,12 +15,151 @@ typedef struct {
     UINT64 KernelSize;
     BOOLEAN KernelLoaded;
     BOOLEAN SystemBooting;
+    BOOLEAN SystemReady;
     PPC_BOOT_PARAMETERS BootParams;
     EFI_LOADED_IMAGE_PROTOCOL* LoadedImage;
+    // Phase 5: classic Mac OS guest memory map state
+    BOOLEAN LowMemoryInstalled;
+    UINT64  LowMemoryAddress;
+    UINT64  LowMemorySize;
+    BOOLEAN RomLoaded;
+    UINT64  RomAddress;
+    UINT64  RomSize;
+    VOID*   RomHostBuffer;
 } PPC_BOOTLOADER_CONTEXT;
 
 // Global bootloader context
 STATIC PPC_BOOTLOADER_CONTEXT g_BootContext = {0};
+
+// ---------------------------------------------------------------------------
+// File load helper: read a whole file from the boot volume into a page-aligned
+// buffer (UEFI pool allocations are limited to ~128 KB; Mac OS ROM images are
+// several MB, so ROM/ROM-like blobs are page-backed).
+// ---------------------------------------------------------------------------
+STATIC
+EFI_STATUS
+BootReadFileToPages (
+    IN  CHAR16* FilePath,
+    OUT VOID**  Buffer,
+    OUT UINTN*  Size
+    )
+{
+    EFI_FILE_IO_INTERFACE* Fs = NULL;
+    EFI_STATUS Status = PpcGetFileSystem(&Fs, NULL);
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+
+    EFI_FILE_HANDLE Root = NULL;
+    Status = Fs->OpenVolume(Fs, &Root);
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+
+    EFI_FILE_HANDLE File = NULL;
+    Status = Root->Open(Root, &File, FilePath, EFI_FILE_MODE_READ, 0);
+    if (EFI_ERROR(Status) || File == NULL) {
+        Root->Close(Root);
+        return (Status == EFI_SUCCESS) ? EFI_NOT_FOUND : Status;
+    }
+
+    UINTN FileInfoSize = SIZE_OF_EFI_FILE_INFO + 260 * sizeof(CHAR16);
+    EFI_FILE_INFO* Info = AllocateZeroPool(FileInfoSize);
+    if (Info == NULL) {
+        File->Close(File);
+        Root->Close(Root);
+        return EFI_OUT_OF_RESOURCES;
+    }
+    Status = File->GetInfo(File, &GenericFileInfo, &FileInfoSize, Info);
+    if (EFI_ERROR(Status)) {
+        FreePool(Info);
+        File->Close(File);
+        Root->Close(Root);
+        return Status;
+    }
+
+    UINT64 FileSize = Info->FileSize;
+    FreePool(Info);
+
+    if (FileSize == 0 || FileSize > PPC_ROM_MAX_SIZE) {
+        File->Close(File);
+        Root->Close(Root);
+        Print(L"File '%s' has invalid size %d for ROM load\n", FilePath, FileSize);
+        return EFI_LOAD_ERROR;
+    }
+
+    UINTN Pages = (UINTN)((FileSize + EFI_PAGE_SIZE - 1) / EFI_PAGE_SIZE);
+    EFI_PHYSICAL_ADDRESS Base = 0;
+    Status = BS->AllocatePages(AllocateAnyPages, EfiBootServicesData, Pages, &Base);
+    if (EFI_ERROR(Status)) {
+        File->Close(File);
+        Root->Close(Root);
+        Print(L"Failed to allocate %d pages for '%s': %r\n", Pages, FilePath, Status);
+        return Status;
+    }
+
+    VOID* Dst = (VOID*)(UINTN)Base;
+    UINT64 Remaining = FileSize;
+    UINTN  BytesRead = 0;
+    BOOLEAN Failed = FALSE;
+    while (Remaining > 0) {
+        UINTN Chunk = (UINTN)Remaining;
+        Status = File->Read(File, &Chunk, (UINT8*)Dst + BytesRead);
+        if (EFI_ERROR(Status) || Chunk == 0) {
+            Print(L"Failed while reading '%s': %r\n", FilePath, Status);
+            Failed = TRUE;
+            break;
+        }
+        BytesRead += Chunk;
+        Remaining -= Chunk;
+    }
+
+    File->Close(File);
+    Root->Close(Root);
+
+    if (Failed) {
+        BS->FreePages(Base, Pages);
+        return EFI_LOAD_ERROR;
+    }
+
+    *Buffer = Dst;
+    *Size = (UINTN)FileSize;
+    return EFI_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// Boot self-test bookkeeping (mirrors the CPU self-test style)
+// ---------------------------------------------------------------------------
+STATIC UINTN g_BootTestPasses   = 0;
+STATIC UINTN g_BootTestFailures = 0;
+
+STATIC VOID
+BootSelfTestCheck (
+    IN BOOLEAN Ok,
+    IN CHAR16* Name
+    )
+{
+    if (Ok) {
+        g_BootTestPasses++;
+        Print(L"  [PASS] %s\n", Name);
+    } else {
+        g_BootTestFailures++;
+        Print(L"  [FAIL] %s\n", Name);
+    }
+}
+
+// Write a big-endian 32-bit word into guest memory.
+STATIC VOID
+BootWriteWord32 (
+    IN UINT32 Address,
+    IN UINT32 Value
+    )
+{
+    PpcWriteGuestByte(Address + 0, (UINT8)(Value >> 24));
+    PpcWriteGuestByte(Address + 1, (UINT8)(Value >> 16));
+    PpcWriteGuestByte(Address + 2, (UINT8)(Value >> 8));
+    PpcWriteGuestByte(Address + 3, (UINT8)Value);
+}
 
 EFI_STATUS
 PpcInitializeBootloader (
@@ -272,6 +411,15 @@ PpcGetBootInfo (
     BootInfo->KernelAddress = g_BootContext.KernelAddress;
     BootInfo->KernelSize = g_BootContext.KernelSize;
     BootInfo->KernelLoaded = g_BootContext.KernelLoaded;
+    BootInfo->SystemReady = g_BootContext.SystemReady;
+
+    BootInfo->MemoryMap.RomInstalled = g_BootContext.RomLoaded;
+    BootInfo->MemoryMap.RomBase = g_BootContext.RomAddress;
+    BootInfo->MemoryMap.RomSize = g_BootContext.RomSize;
+    BootInfo->MemoryMap.LowMemoryInstalled = g_BootContext.LowMemoryInstalled;
+    BootInfo->MemoryMap.LowMemoryBase = g_BootContext.LowMemoryAddress;
+    BootInfo->MemoryMap.LowMemorySize = g_BootContext.LowMemorySize;
+    BootInfo->MemoryMap.Ready = g_BootContext.SystemReady;
     
     return EFI_SUCCESS;
 }
@@ -285,30 +433,194 @@ PpcLoadSystemRom (
     OUT UINT64* RomSize
     )
 {
+    VOID*  Buffer = NULL;
+    UINTN  Size   = 0;
+    EFI_STATUS Status;
+
     if (RomPath == NULL || RomBuffer == NULL || RomSize == NULL) {
         return EFI_INVALID_PARAMETER;
     }
 
     Print(L"Loading system ROM from: %s\n", RomPath);
 
-    // Real UEFI file I/O into a pool buffer.
-    EFI_FILE_IO_INTERFACE* Fs = NULL;
-    EFI_STATUS Status = PpcGetFileSystem(&Fs, NULL);
-    if (EFI_ERROR(Status)) {
-        return Status;
-    }
-
-    UINTN  Size = 0;
-    VOID*  Buffer = NULL;
-    Status = PpcLoadFile(Fs, RomPath, &Buffer, &Size);
+    Status = BootReadFileToPages(RomPath, &Buffer, &Size);
     if (EFI_ERROR(Status)) {
         return Status;
     }
 
     *RomBuffer = Buffer;
-    *RomSize = Size;
+    *RomSize = (UINT64)Size;
 
     Print(L"System ROM loaded: %d bytes at 0x%x\n", Size, Buffer);
+
+    return EFI_SUCCESS;
+}
+
+EFI_STATUS
+PpcInstallSystemRom (
+    IN  CHAR16* RomPath,
+    OUT UINT64* RomAddress,
+    OUT UINT64* RomSize
+    )
+{
+    VOID*  Buffer = NULL;
+    UINT64 Size   = 0;
+    EFI_STATUS Status;
+
+    if (g_BootContext.RomLoaded) {
+        if (RomAddress != NULL) { *RomAddress = g_BootContext.RomAddress; }
+        if (RomSize != NULL) { *RomSize = g_BootContext.RomSize; }
+        return EFI_ALREADY_STARTED;
+    }
+
+    Status = PpcLoadSystemRom(RomPath, &Buffer, &Size);
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+
+    // Map the ROM into the guest memory map as a read-only region.
+    Status = PpcAddGuestMemoryRegion(Buffer, PPC_ROM_GUEST_BASE, (UINT32)Size, TRUE);
+    if (EFI_ERROR(Status)) {
+        PpcFreeMemory(Buffer, Size);
+        Print(L"Failed to map ROM into guest memory: %r\n", Status);
+        return Status;
+    }
+
+    g_BootContext.RomLoaded = TRUE;
+    g_BootContext.RomAddress = PPC_ROM_GUEST_BASE;
+    g_BootContext.RomSize = Size;
+    g_BootContext.RomHostBuffer = Buffer;
+
+    if (RomAddress != NULL) { *RomAddress = PPC_ROM_GUEST_BASE; }
+    if (RomSize != NULL) { *RomSize = Size; }
+
+    Print(L"System ROM installed: %d bytes at guest 0x%x\n",
+          (UINT64)Size, PPC_ROM_GUEST_BASE);
+
+    return EFI_SUCCESS;
+}
+
+EFI_STATUS
+PpcInstallDemoRom (
+    OUT UINT64* RomAddress,
+    OUT UINT64* RomSize
+    )
+{
+    // lis r3, 0xFFF0     ; r3 = 0xFFF00000
+    // lwz r4, 0(r3)      ; r4 = ROM[0] = 'ROM1'
+    // addi r5, r4, 1     ; r5 = 'ROM1' + 1
+    // stw r5, 0(r1)      ; store to guest RAM via r1
+    STATIC const UINT32 DemoProgram[4] = {
+        0x3C60FFF0,
+        0x80830000,
+        0x38A40001,
+        0x90A10000
+    };
+
+    UINTN Pages;
+    EFI_PHYSICAL_ADDRESS Base = 0;
+    EFI_STATUS Status;
+    UINT8* Rom;
+    UINTN I;
+
+    if (g_BootContext.RomLoaded) {
+        if (RomAddress != NULL) { *RomAddress = g_BootContext.RomAddress; }
+        if (RomSize != NULL) { *RomSize = g_BootContext.RomSize; }
+        return EFI_ALREADY_STARTED;
+    }
+
+    Pages = PPC_ROM_MAX_SIZE / EFI_PAGE_SIZE;
+    Status = BS->AllocatePages(AllocateAnyPages, EfiBootServicesData, Pages, &Base);
+    if (EFI_ERROR(Status)) {
+        Print(L"Failed to allocate demo ROM pages: %r\n", Status);
+        return Status;
+    }
+    Rom = (UINT8*)(UINTN)Base;
+    ZeroMem(Rom, PPC_ROM_MAX_SIZE);
+
+    // Magic word at the ROM base: 'R' 'O' 'M' '1'.
+    Rom[0] = 'R';
+    Rom[1] = 'O';
+    Rom[2] = 'M';
+    Rom[3] = '1';
+
+    // Reset-vector program, stored big-endian (guest byte order).
+    UINT8* Prog = Rom + (PPC_RESET_VECTOR - PPC_ROM_GUEST_BASE);
+    for (I = 0; I < 4; I++) {
+        UINT32 W = DemoProgram[I];
+        Prog[I * 4 + 0] = (UINT8)(W >> 24);
+        Prog[I * 4 + 1] = (UINT8)(W >> 16);
+        Prog[I * 4 + 2] = (UINT8)(W >> 8);
+        Prog[I * 4 + 3] = (UINT8)W;
+    }
+
+    Status = PpcAddGuestMemoryRegion(Rom, PPC_ROM_GUEST_BASE, PPC_ROM_MAX_SIZE, TRUE);
+    if (EFI_ERROR(Status)) {
+        BS->FreePages(Base, Pages);
+        Print(L"Failed to map demo ROM into guest memory: %r\n", Status);
+        return Status;
+    }
+
+    g_BootContext.RomLoaded = TRUE;
+    g_BootContext.RomAddress = PPC_ROM_GUEST_BASE;
+    g_BootContext.RomSize = PPC_ROM_MAX_SIZE;
+    g_BootContext.RomHostBuffer = Rom;
+
+    if (RomAddress != NULL) { *RomAddress = PPC_ROM_GUEST_BASE; }
+    if (RomSize != NULL) { *RomSize = PPC_ROM_MAX_SIZE; }
+
+    Print(L"Demo system ROM installed: %d bytes at guest 0x%x\n",
+          (UINT64)PPC_ROM_MAX_SIZE, PPC_ROM_GUEST_BASE);
+
+    return EFI_SUCCESS;
+}
+
+EFI_STATUS
+PpcInstallLowMemory (
+    OUT UINT64* LowMemAddress,
+    OUT UINT64* LowMemSize
+    )
+{
+    // Classic Mac OS low-memory globals live at physical address 0. Guest RAM
+    // is mapped at guest 0x10000000, so low memory is a dedicated read/write
+    // region below the kernel base.
+    UINTN Pages;
+    EFI_PHYSICAL_ADDRESS Base = 0;
+    EFI_STATUS Status;
+
+    if (g_BootContext.LowMemoryInstalled) {
+        if (LowMemAddress != NULL) { *LowMemAddress = g_BootContext.LowMemoryAddress; }
+        if (LowMemSize != NULL) { *LowMemSize = g_BootContext.LowMemorySize; }
+        return EFI_ALREADY_STARTED;
+    }
+
+    Pages = PPC_LOW_MEM_SIZE / EFI_PAGE_SIZE;
+    Status = BS->AllocatePages(AllocateAnyPages, EfiBootServicesData, Pages, &Base);
+    if (EFI_ERROR(Status)) {
+        Print(L"Failed to allocate low-memory pages: %r\n", Status);
+        return Status;
+    }
+    ZeroMem((VOID*)(UINTN)Base, PPC_LOW_MEM_SIZE);
+
+    Status = PpcAddGuestMemoryRegion((VOID*)(UINTN)Base,
+                                     PPC_LOW_MEM_GUEST_BASE,
+                                     PPC_LOW_MEM_SIZE,
+                                     FALSE);
+    if (EFI_ERROR(Status)) {
+        BS->FreePages(Base, Pages);
+        Print(L"Failed to map low memory into guest memory: %r\n", Status);
+        return Status;
+    }
+
+    g_BootContext.LowMemoryInstalled = TRUE;
+    g_BootContext.LowMemoryAddress = PPC_LOW_MEM_GUEST_BASE;
+    g_BootContext.LowMemorySize = PPC_LOW_MEM_SIZE;
+
+    if (LowMemAddress != NULL) { *LowMemAddress = PPC_LOW_MEM_GUEST_BASE; }
+    if (LowMemSize != NULL) { *LowMemSize = PPC_LOW_MEM_SIZE; }
+
+    Print(L"Low-memory region installed: %d bytes at guest 0x%x\n",
+          (UINT64)PPC_LOW_MEM_SIZE, PPC_LOW_MEM_GUEST_BASE);
 
     return EFI_SUCCESS;
 }
@@ -401,15 +713,121 @@ PpcPrepareSystemForBoot (
     VOID
     )
 {
+    UINT64 RamBase = 0;
+    UINT64 RamSize = 0;
+    UINTN  I;
+    EFI_STATUS Status;
+
     Print(L"Preparing system for boot\n");
-    
-    // In a real implementation:
-    // 1. Finalize system state
-    // 2. Save any required state information
-    // 3. Set up registers and memory for kernel startup
-    // 4. Prepare interrupt vectors
-    
-    Print(L"System preparation complete\n");
-    
+
+    // The guest memory map must be ready before the CPU can start.
+    if (!g_BootContext.LowMemoryInstalled) {
+        PpcInstallLowMemory(NULL, NULL);
+    }
+    if (!g_BootContext.RomLoaded) {
+        Print(L"Warning: no system ROM installed; boot would fail at the reset vector\n");
+    }
+
+    Status = PpcGetGuestMemoryRegion(NULL, &RamBase, &RamSize);
+    if (EFI_ERROR(Status) || RamSize == 0) {
+        Print(L"System preparation failed: guest RAM unavailable\n");
+        return EFI_NOT_READY;
+    }
+
+    // Reset the CPU to the classic Mac OS boot state: PC at the ROM reset
+    // vector with machine-check and recoverable-interrupt handling enabled.
+    ZeroMem(&g_PpcContext, sizeof(g_PpcContext));
+    for (I = 0; I < 32; I++) {
+        g_PpcContext.Gpr[I] = 0;
+    }
+    g_PpcContext.Msr = PPC_MSR_ME | PPC_MSR_RI;
+    g_PpcContext.Pc = PPC_RESET_VECTOR;
+    g_PpcContext.Srr0 = PPC_RESET_VECTOR;
+    g_PpcContext.Srr1 = g_PpcContext.Msr;
+    g_PpcContext.ExceptionPending = 0;
+
+    // Write the emulator boot info block into low memory: magic, then
+    // RAM base, RAM size, ROM base, and installed ROM size (big-endian).
+    BootWriteWord32(PPC_LOW_MEM_GUEST_BASE + PPC_LOW_MEM_MAGIC_OFFSET, 0x45464921);
+    BootWriteWord32(PPC_LOW_MEM_GUEST_BASE + PPC_LOW_MEM_BOOTINFO_OFFSET + 0, (UINT32)RamBase);
+    BootWriteWord32(PPC_LOW_MEM_GUEST_BASE + PPC_LOW_MEM_BOOTINFO_OFFSET + 4, (UINT32)RamSize);
+    BootWriteWord32(PPC_LOW_MEM_GUEST_BASE + PPC_LOW_MEM_BOOTINFO_OFFSET + 8, PPC_ROM_GUEST_BASE);
+    BootWriteWord32(PPC_LOW_MEM_GUEST_BASE + PPC_LOW_MEM_BOOTINFO_OFFSET + 12,
+                    (UINT32)(g_BootContext.RomLoaded ? g_BootContext.RomSize : 0));
+
+    g_BootContext.SystemReady = TRUE;
+    g_BootContext.SystemBooting = TRUE;
+
+    Print(L"System prepared: PC=0x%x MSR=0x%08x SRR0=0x%x SRR1=0x%x\n",
+          g_PpcContext.Pc, g_PpcContext.Msr, g_PpcContext.Srr0, g_PpcContext.Srr1);
+    Print(L"Boot info block written to low memory at 0x%x\n",
+          PPC_LOW_MEM_GUEST_BASE + PPC_LOW_MEM_BOOTINFO_OFFSET);
+
     return EFI_SUCCESS;
+}
+
+EFI_STATUS
+PpcRunBootSelfTest (
+    VOID
+    )
+{
+    UINT64 RamBase = 0;
+    UINT64 RamSize = 0;
+    UINTN  Executed = 0;
+    EFI_STATUS Status;
+    UINT32 MagicPlusOne;
+
+    g_BootTestPasses = 0;
+    g_BootTestFailures = 0;
+
+    Print(L"--- Boot Memory Map / System Init Self-Test ---\n");
+
+    Status = PpcGetGuestMemoryRegion(NULL, &RamBase, &RamSize);
+    BootSelfTestCheck(Status == EFI_SUCCESS && RamSize > 0,
+                      L"guest RAM region available");
+
+    // Low-memory globals: writable and readable.
+    PpcWriteGuestByte(PPC_LOW_MEM_GUEST_BASE + 0x08, 0xAA);
+    BootSelfTestCheck(
+        PpcReadGuestByte(PPC_LOW_MEM_GUEST_BASE + 0x08) == 0xAA,
+        L"low-memory globals read/write (guest 0x00000000)");
+
+    // ROM: magic word readable through the interpreter's memory path.
+    BootSelfTestCheck(
+        PpcReadGuestByte(PPC_ROM_GUEST_BASE + 0) == 'R' &&
+        PpcReadGuestByte(PPC_ROM_GUEST_BASE + 1) == 'O' &&
+        PpcReadGuestByte(PPC_ROM_GUEST_BASE + 2) == 'M' &&
+        PpcReadGuestByte(PPC_ROM_GUEST_BASE + 3) == '1',
+        L"ROM magic word 'ROM1' readable at guest 0xFFF00000");
+
+    // ROM is read-only to guest stores.
+    PpcWriteGuestByte(PPC_ROM_GUEST_BASE + 0, 0xEE);
+    BootSelfTestCheck(
+        PpcReadGuestByte(PPC_ROM_GUEST_BASE + 0) == 'R',
+        L"ROM rejects guest writes (read-only)");
+
+    // Cross-region execution: run the reset-vector program in the ROM; it
+    // loads the ROM magic word and stores its successor into guest RAM.
+    PpcSetGprValue(1, (UINT32)RamBase);
+    PpcSetGprValue(3, 0);
+    PpcSetGprValue(4, 0);
+    PpcSetGprValue(5, 0);
+    Status = PpcExecuteBlock((UINT32*)(UINTN)PPC_RESET_VECTOR, 4, &Executed);
+
+    MagicPlusOne = 0x524F4D31 + 1;
+    BootSelfTestCheck(Status == EFI_SUCCESS && Executed == 4,
+                      L"reset-vector program ran cleanly");
+    BootSelfTestCheck(PpcGetGprValue(4) == 0x524F4D31,
+                      L"program read ROM word (r4 = 'ROM1')");
+    BootSelfTestCheck(
+        PpcReadGuestByte((UINT32)RamBase + 0) == (UINT8)(MagicPlusOne >> 24) &&
+        PpcReadGuestByte((UINT32)RamBase + 1) == (UINT8)(MagicPlusOne >> 16) &&
+        PpcReadGuestByte((UINT32)RamBase + 2) == (UINT8)(MagicPlusOne >> 8) &&
+        PpcReadGuestByte((UINT32)RamBase + 3) == (UINT8)MagicPlusOne,
+        L"program stored result to guest RAM");
+
+    Print(L"--- Boot self-test complete: %d passed, %d failed ---\n",
+          g_BootTestPasses, g_BootTestFailures);
+
+    return (g_BootTestFailures == 0) ? EFI_SUCCESS : EFI_LOAD_ERROR;
 }

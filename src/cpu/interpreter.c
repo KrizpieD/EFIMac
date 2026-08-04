@@ -137,26 +137,42 @@ PPC_CPU_CONTEXT g_PpcContext = {0};
 // Memory access (default: identity-mapped, big-endian guest memory)
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
-// Emulated guest RAM (default memory backing for the interpreter)
+// Emulated guest memory (default memory backing for the interpreter)
 //
-// When PpcSetGuestMemory() has been called, guest addresses inside
-// [GuestBase, GuestBase + Size) are backed by the host buffer. Addresses
-// outside the region read as zero and ignore writes.
+// The primary guest RAM region is installed with PpcSetGuestMemory() and
+// occupies slot 0. Additional regions (the classic Mac OS ROM window at
+// 0xFFF00000, low-memory globals at 0x00000000) are added with
+// PpcAddGuestMemoryRegion(). Addresses not covered by any region read as
+// zero and ignore writes.
 // ---------------------------------------------------------------------------
-static VOID*  g_GuestMemoryHostBase  = NULL;
-static UINT32 g_GuestMemoryGuestBase = 0;
-static UINT32 g_GuestMemorySize      = 0;
+#define PPC_MAX_GUEST_REGIONS 4
+
+typedef struct {
+    VOID*   HostBase;   // Host virtual address backing the region
+    UINT32  GuestBase;  // Guest-visible base address of the region
+    UINT32  Size;       // Region size in bytes
+    BOOLEAN ReadOnly;   // TRUE: guest stores are dropped
+    BOOLEAN Active;     // TRUE: slot is in use
+} PPC_GUEST_REGION;
+
+// Guest memory map. Lookup is in insertion order; the first region that
+// contains an address wins.
+static PPC_GUEST_REGION g_GuestRegions[PPC_MAX_GUEST_REGIONS];
 
 static UINT8
 PpcDefaultReadByte (
     IN UINT32 Address
     )
 {
-    if (g_GuestMemoryHostBase != NULL &&
-        Address >= g_GuestMemoryGuestBase &&
-        (Address - g_GuestMemoryGuestBase) < g_GuestMemorySize) {
-        return *(volatile UINT8*)((UINTN)g_GuestMemoryHostBase +
-                                  (Address - g_GuestMemoryGuestBase));
+    UINTN I;
+
+    for (I = 0; I < PPC_MAX_GUEST_REGIONS; I++) {
+        if (g_GuestRegions[I].Active &&
+            Address >= g_GuestRegions[I].GuestBase &&
+            (UINT64)(Address - g_GuestRegions[I].GuestBase) < g_GuestRegions[I].Size) {
+            return *(volatile UINT8*)((UINTN)g_GuestRegions[I].HostBase +
+                                      (Address - g_GuestRegions[I].GuestBase));
+        }
     }
     return 0;  // Unmapped guest address reads as zero
 }
@@ -167,11 +183,18 @@ PpcDefaultWriteByte (
     IN UINT8  Value
     )
 {
-    if (g_GuestMemoryHostBase != NULL &&
-        Address >= g_GuestMemoryGuestBase &&
-        (Address - g_GuestMemoryGuestBase) < g_GuestMemorySize) {
-        *(volatile UINT8*)((UINTN)g_GuestMemoryHostBase +
-                           (Address - g_GuestMemoryGuestBase)) = Value;
+    UINTN I;
+
+    for (I = 0; I < PPC_MAX_GUEST_REGIONS; I++) {
+        if (g_GuestRegions[I].Active &&
+            Address >= g_GuestRegions[I].GuestBase &&
+            (UINT64)(Address - g_GuestRegions[I].GuestBase) < g_GuestRegions[I].Size) {
+            if (!g_GuestRegions[I].ReadOnly) {
+                *(volatile UINT8*)((UINTN)g_GuestRegions[I].HostBase +
+                                   (Address - g_GuestRegions[I].GuestBase)) = Value;
+            }
+            return;  // First matching region decides the target
+        }
     }
 }
 
@@ -196,10 +219,52 @@ PpcSetGuestMemory (
     IN UINT32 Size
     )
 {
-    g_GuestMemoryHostBase  = HostBase;
-    g_GuestMemoryGuestBase = GuestBase;
-    g_GuestMemorySize      = Size;
-    return EFI_SUCCESS;
+    return PpcAddGuestMemoryRegion(HostBase, GuestBase, Size, FALSE);
+}
+
+EFI_STATUS
+PpcAddGuestMemoryRegion (
+    IN VOID*   HostBase,
+    IN UINT32  GuestBase,
+    IN UINT32  Size,
+    IN BOOLEAN ReadOnly
+    )
+{
+    UINTN I;
+
+    if (HostBase == NULL || Size == 0) {
+        return EFI_INVALID_PARAMETER;
+    }
+
+    // Reject a region that would overlap an already installed one.
+    for (I = 0; I < PPC_MAX_GUEST_REGIONS; I++) {
+        if (!g_GuestRegions[I].Active) {
+            continue;
+        }
+        if (GuestBase < g_GuestRegions[I].GuestBase) {
+            if ((UINT64)GuestBase + Size > g_GuestRegions[I].GuestBase) {
+                return EFI_ALREADY_STARTED;
+            }
+        } else {
+            if ((UINT64)(GuestBase - g_GuestRegions[I].GuestBase) <
+                g_GuestRegions[I].Size) {
+                return EFI_ALREADY_STARTED;
+            }
+        }
+    }
+
+    for (I = 0; I < PPC_MAX_GUEST_REGIONS; I++) {
+        if (!g_GuestRegions[I].Active) {
+            g_GuestRegions[I].HostBase  = HostBase;
+            g_GuestRegions[I].GuestBase = GuestBase;
+            g_GuestRegions[I].Size      = Size;
+            g_GuestRegions[I].ReadOnly  = ReadOnly;
+            g_GuestRegions[I].Active    = TRUE;
+            return EFI_SUCCESS;
+        }
+    }
+
+    return EFI_OUT_OF_RESOURCES;
 }
 
 UINT8

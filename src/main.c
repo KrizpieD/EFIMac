@@ -515,6 +515,61 @@ efi_main (
     Print(L"Kernel not found on volume (%r) — skipping kernel execution\n", Status);
   }
   
+  // Phase 5: classic Mac OS boot memory map, ROM, and system initialization.
+  {
+    UINT64 LowMemAddress = 0, LowMemSize = 0;
+    UINT64 RomAddress = 0, RomSize = 0;
+    EFI_STATUS BootStatus;
+
+    Print(L"\n--- Boot memory map / system initialization ---\n");
+
+    // 1. Low-memory globals at guest 0x00000000 (16 KB, read/write).
+    BootStatus = PpcInstallLowMemory(&LowMemAddress, &LowMemSize);
+    Print(L"Low-memory region: %s (guest 0x%x, %d bytes)\n",
+          EFI_ERROR(BootStatus) ? L"FAIL" : L"OK",
+          (UINT32)LowMemAddress, (UINT64)LowMemSize);
+
+    // 2. System ROM at guest 0xFFF00000. Load a real ROM image from the boot
+    //    volume if present; otherwise install a self-contained demo ROM so the
+    //    full ROM -> guest-memory-map -> execution path is still exercised.
+    BootStatus = PpcInstallSystemRom(PPC_ROM_DEFAULT_PATH, &RomAddress, &RomSize);
+    if (EFI_ERROR(BootStatus) && BootStatus != EFI_ALREADY_STARTED) {
+      if (BootStatus == EFI_NOT_FOUND) {
+        Print(L"System ROM not found on volume, installing demo ROM\n");
+      } else {
+        Print(L"System ROM install failed (%r), installing demo ROM\n", BootStatus);
+      }
+      BootStatus = PpcInstallDemoRom(&RomAddress, &RomSize);
+    }
+    Print(L"System ROM: %s (guest 0x%x, %d bytes)\n",
+          EFI_ERROR(BootStatus) ? L"FAIL" : L"OK",
+          (UINT32)RomAddress, (UINT64)RomSize);
+
+    // 3. Self-test the memory map: ROM read-only, low memory R/W, and a
+    //    cross-region ROM -> RAM program executed from the reset vector.
+    BootStatus = PpcRunBootSelfTest();
+    Print(L"Boot memory map self-test: %s\n",
+          EFI_ERROR(BootStatus) ? L"FAIL" : L"PASS");
+
+    // 4. Configure the CPU for entry at the ROM reset vector and write the
+    //    boot info block into low memory.
+    BootStatus = PpcPrepareSystemForBoot();
+    Print(L"System initialization: %s\n",
+          EFI_ERROR(BootStatus) ? L"FAIL" : L"PASS");
+
+    // 5. Report the final boot state.
+    PPC_BOOT_INFO BootInfo;
+    if (!EFI_ERROR(PpcGetBootInfo(&BootInfo))) {
+      Print(L"Boot state: ready=%d, kernel=%d, ROM at 0x%x (%d bytes), "
+            L"low mem at 0x%x (%d bytes)\n",
+            BootInfo.SystemReady, BootInfo.KernelLoaded,
+            (UINT32)BootInfo.MemoryMap.RomBase,
+            (UINT64)BootInfo.MemoryMap.RomSize,
+            (UINT32)BootInfo.MemoryMap.LowMemoryBase,
+            (UINT64)BootInfo.MemoryMap.LowMemorySize);
+    }
+  }
+
   Print(L"\n=== EFI-Mac-Emulator Ready ===\n");
   
   return EFI_SUCCESS;

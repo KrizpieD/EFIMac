@@ -17,12 +17,37 @@ typedef struct {
     CHAR16* CommandLine;
 } PPC_BOOT_PARAMETERS;
 
+// Classic Mac OS PPC boot memory map (guest-visible addresses)
+#define PPC_ROM_GUEST_BASE      0xFFF00000  // ROM window (classic PPC Macs)
+#define PPC_ROM_MAX_SIZE        0x00400000  // 4 MB ROM window
+#define PPC_ROM_DEFAULT_PATH    L"\\System\\MacOS\\ROM"
+#define PPC_RESET_VECTOR        (PPC_ROM_GUEST_BASE + 0x100)
+#define PPC_LOW_MEM_GUEST_BASE  0x00000000  // Low-memory globals
+#define PPC_LOW_MEM_SIZE        0x4000      // 16 KB
+
+// Low-memory global offsets (emulator-defined boot info block)
+#define PPC_LOW_MEM_MAGIC_OFFSET    0x0000
+#define PPC_LOW_MEM_BOOTINFO_OFFSET 0x0100
+
+// Guest memory map as installed for a classic Mac OS boot
+typedef struct {
+    BOOLEAN RomInstalled;
+    UINT64  RomBase;
+    UINT64  RomSize;
+    BOOLEAN LowMemoryInstalled;
+    UINT64  LowMemoryBase;
+    UINT64  LowMemorySize;
+    BOOLEAN Ready;
+} PPC_GUEST_MEMORY_MAP;
+
 // Boot information structure
 typedef struct {
     BOOLEAN IsInitialized;
     EFI_PHYSICAL_ADDRESS KernelAddress;
     UINT64 KernelSize;
     BOOLEAN KernelLoaded;
+    BOOLEAN SystemReady;
+    PPC_GUEST_MEMORY_MAP MemoryMap;
 } PPC_BOOT_INFO;
 
 /**
@@ -137,6 +162,78 @@ PpcLoadSystemRom (
     IN  CHAR16* RomPath,
     OUT VOID**  RomBuffer,
     OUT UINT64* RomSize
+    );
+
+/**
+  Load a system ROM image from the boot volume and map it into guest memory
+  at PPC_ROM_GUEST_BASE as a read-only region.
+  @param[in]  RomPath     Path to the ROM image on the boot volume
+  @param[out] RomAddress  Guest address of the installed ROM (may be NULL)
+  @param[out] RomSize     Installed ROM size in bytes (may be NULL)
+  @retval EFI_SUCCESS          ROM installed
+  @retval EFI_NOT_FOUND        ROM file not present on the volume
+  @retval EFI_ALREADY_STARTED  A ROM is already installed
+**/
+EFI_STATUS
+EFIAPI
+PpcInstallSystemRom (
+    IN  CHAR16* RomPath,
+    OUT UINT64* RomAddress,
+    OUT UINT64* RomSize
+    );
+
+/**
+  Install a self-contained demo ROM at PPC_ROM_GUEST_BASE (read-only). The
+  demo ROM contains a small reset-vector program that reads the ROM magic
+  word and stores its successor into guest RAM.
+  @param[out] RomAddress  Guest address of the installed ROM (may be NULL)
+  @param[out] RomSize     Installed ROM size in bytes (may be NULL)
+  @retval EFI_STATUS
+**/
+EFI_STATUS
+EFIAPI
+PpcInstallDemoRom (
+    OUT UINT64* RomAddress,
+    OUT UINT64* RomSize
+    );
+
+/**
+  Install the classic Mac OS low-memory globals region at guest 0x00000000
+  (16 KB, read/write) as a dedicated region below the kernel base.
+  @param[out] LowMemAddress  Guest address of the region (may be NULL)
+  @param[out] LowMemSize     Region size in bytes (may be NULL)
+  @retval EFI_STATUS
+**/
+EFI_STATUS
+EFIAPI
+PpcInstallLowMemory (
+    OUT UINT64* LowMemAddress,
+    OUT UINT64* LowMemSize
+    );
+
+/**
+  Run the boot memory map / system initialization self-test: low-memory
+  read/write, ROM read-only enforcement, and a cross-region ROM -> RAM
+  program executed from the reset vector.
+  @retval EFI_SUCCESS       All checks passed
+  @retval EFI_LOAD_ERROR    One or more checks failed
+**/
+EFI_STATUS
+EFIAPI
+PpcRunBootSelfTest (
+    VOID
+    );
+
+/**
+  Prepare the system for boot: ensure the guest memory map is installed,
+  reset the CPU to the ROM reset vector with a boot-ready MSR, and write
+  the emulator boot info block into low memory.
+  @retval EFI_STATUS
+**/
+EFI_STATUS
+EFIAPI
+PpcPrepareSystemForBoot (
+    VOID
     );
 
 #endif // __PPC_BOOTLOADER_H__
