@@ -48,11 +48,25 @@
 #define PPC_REG_SRR1    34
 #define PPC_REG_CTR     35
 #define PPC_REG_LR      36
+#define PPC_REG_CR      37
+#define PPC_REG_XER     38
+#define PPC_REG_PC      39
 
 // PowerPC exception types
 #define PPC_EXCEPTION_INTERRUPT     1
 #define PPC_EXCEPTION_TRAP          2
 #define PPC_EXCEPTION_SYSTEM_CALL   3
+
+// XER bit definitions (bit 0 = most significant)
+#define PPC_XER_SO      0x80000000  // Summary Overflow
+#define PPC_XER_OV      0x40000000  // Overflow
+#define PPC_XER_CA      0x20000000  // Carry
+
+// Condition Register field bit definitions
+#define PPC_CR_LT       0x8         // Negative (less than)
+#define PPC_CR_GT       0x4         // Positive (greater than)
+#define PPC_CR_EQ       0x2         // Zero (equal)
+#define PPC_CR_SO       0x1         // Summary overflow copy
 
 // PowerPC instruction formats
 #define PPC_FORMAT_INVALID  0
@@ -84,6 +98,96 @@ EFIAPI
 PpcTranslateInstruction (
     IN  UINT32  PpcInstruction,
     OUT UINT64* X86Instruction
+    );
+
+/**
+  Decode a single PowerPC instruction into a short mnemonic string
+  @param[in]  Instruction  The PowerPC instruction to decode
+  @param[out] Buffer       Buffer to receive the mnemonic (NUL terminated)
+  @param[in]  BufferSize   Size of Buffer in bytes (must be >= 16)
+  @retval EFI_STATUS
+**/
+EFI_STATUS
+EFIAPI
+PpcDecodeInstruction (
+    IN  UINT32 Instruction,
+    OUT CHAR16* Buffer,
+    IN  UINTN   BufferSize
+    );
+
+/**
+  Fetch a PowerPC instruction from guest memory
+  @param[in]  Address  Guest address to fetch from
+  @retval The fetched instruction word
+**/
+UINT32
+PpcFetchInstruction (
+    IN UINT32 Address
+    );
+
+/**
+  Execute a single PowerPC instruction against the CPU context
+  @param[in]  Instruction     The instruction word to execute
+  @param[in]  CurrentAddress  Address of the instruction (PC)
+  @param[out] NextAddress     Address of the next instruction to execute
+  @retval EFI_SUCCESS        Instruction executed
+  @retval EFI_UNSUPPORTED    Instruction is not implemented by the interpreter
+**/
+EFI_STATUS
+EFIAPI
+PpcExecuteInstruction (
+    IN  UINT32  Instruction,
+    IN  UINT32  CurrentAddress,
+    OUT UINT32* NextAddress
+    );
+
+/**
+  Execute a stream of PowerPC instructions (fetch/decode/execute loop)
+  @param[in]  InstructionStream  Pointer to the instruction stream in guest memory
+  @param[in]  MaxInstructions    Maximum number of instructions to execute
+  @param[out] ExecutedCount      Number of instructions actually executed
+  @retval EFI_STATUS
+**/
+EFI_STATUS
+EFIAPI
+PpcExecuteBlock (
+    IN  UINT32* InstructionStream,
+    IN  UINTN   MaxInstructions,
+    OUT UINTN*  ExecutedCount
+    );
+
+/**
+  Run the CPU self-test suite
+  @retval EFI_SUCCESS       All tests passed
+  @retval EFI_LOAD_ERROR    One or more tests failed
+**/
+EFI_STATUS
+EFIAPI
+PpcRunSelfTest (
+    VOID
+    );
+
+/**
+  Memory access callbacks used by the interpreter for load/store instructions
+
+  The default implementation performs an identity-mapped (physical == virtual)
+  access into guest memory. A platform layer can override this to route loads
+  and stores through the memory manager.
+**/
+typedef UINT8 (*PPC_CPU_READ_MEMORY)   (IN UINT32 Address);
+typedef VOID  (*PPC_CPU_WRITE_MEMORY)  (IN UINT32 Address, IN UINT8 Value);
+
+/**
+  Override the interpreter memory access callbacks
+  @param[in] Read   Byte read callback (NULL restores the default)
+  @param[in] Write  Byte write callback (NULL restores the default)
+  @retval EFI_STATUS
+**/
+EFI_STATUS
+EFIAPI
+PpcSetMemoryAccess (
+    IN PPC_CPU_READ_MEMORY   Read,
+    IN PPC_CPU_WRITE_MEMORY  Write
     );
 
 /**

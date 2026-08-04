@@ -48,6 +48,13 @@ efi_main (
     return Status;
   }
   
+  // Run the CPU self-test suite
+  Status = PpcRunSelfTest();
+  if (EFI_ERROR(Status)) {
+    Print(L"PowerPC CPU self-test FAILED: %r\n", Status);
+    return Status;
+  }
+  
   // Initialize memory manager
   Status = PpcInitializeMemoryManager(0x00000000, 0x10000000);  // 256MB
   if (EFI_ERROR(Status)) {
