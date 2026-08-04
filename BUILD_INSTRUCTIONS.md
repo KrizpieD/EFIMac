@@ -80,18 +80,35 @@ The sources use GNU-EFI idioms:
 
 ## Testing
 
-Run the EFI application from a UEFI shell under QEMU + OVMF:
+The EFI application has been smoke-tested under QEMU + OVMF: it boots, runs
+all of its initialization (UEFI pool allocation, memory map, loaded-image
+protocol, console output), prints its status report, and returns cleanly to the
+firmware.
+
+To reproduce:
 
 ```bash
-brew install qemu edk2-ovmf    # or download OVMF.fd
+# 1. Get OVMF firmware. There is no Homebrew formula; download the Debian package:
+mkdir -p /tmp/ovmf && cd /tmp/ovmf
+curl -sL -o ovmf.deb \
+  "http://ftp.us.debian.org/debian/pool/main/e/edk2/ovmf_2025.02-8+deb13u1_all.deb"
+ar x ovmf.deb && tar -xf data.tar.xz ./usr/share/ovmf/OVMF.fd
+
+# 2. Put the app on a FAT "ESP" directory and boot it
 mkdir -p esp/EFI/BOOT
 cp build/EFI-Mac-Emulator.efi esp/EFI/BOOT/BOOTX64.EFI
-qemu-system-x86_64 -bios $(brew --prefix edk2-ovmf)/share/edk2-ovmf/OVMF.fd \
-    -drive file=fat:rw:esp,format=raw -net none
+qemu-system-x86_64 \
+  -bios /tmp/ovmf/usr/share/ovmf/OVMF.fd \
+  -m 512 \
+  -drive file=fat:rw:esp,format=raw \
+  -net none \
+  -serial stdio \
+  -display none
 ```
 
-Boot the shell (or let it auto-boot `BOOTX64.EFI`) and observe the emulator's
-status output.
+OVMF will boot `\EFI\BOOT\BOOTX64.EFI` and the app's output appears on the
+serial console (`-serial stdio`). The newest Debian OVMF version can be looked
+up via the Debian packages site (`https://packages.debian.org/trixie/all/ovmf/download`).
 
 ## Directory Structure
 

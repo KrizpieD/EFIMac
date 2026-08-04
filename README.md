@@ -119,7 +119,11 @@ See [BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md) for details.
 
 ## Testing
 
-There are currently no tests. Testing an emulator like this requires:
+The EFI application boots and runs under QEMU + OVMF (verified): it initializes
+all subsystems, prints its status report, and returns cleanly to the firmware.
+See [BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md) for the exact steps.
+
+Testing an emulator like this requires:
 
 1. **UEFI firmware capable of running EFI applications** (e.g. QEMU + OVMF)
 2. **Classic Mac OS system files**:
