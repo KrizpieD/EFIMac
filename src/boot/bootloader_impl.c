@@ -248,6 +248,9 @@ BootDirectoryExists (
     if (EFI_ERROR(Status) || Dir == NULL) {
         Root->Close(Root);
         if (Exists != NULL) { *Exists = FALSE; }
+        if (Status == EFI_NOT_FOUND) {
+            return EFI_SUCCESS;
+        }
         return (Status == EFI_SUCCESS) ? EFI_SUCCESS : Status;
     }
 

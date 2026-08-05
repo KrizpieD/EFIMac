@@ -22,9 +22,11 @@ single/double loads/stores. FP accessors (`PpcGet/SetFprValue`,
 `PpcGet/SetFpscrValue`) are wired into the register API. `PpcHandleException`
 maps FP-unavailable to 0x800 and program to 0x700. The self-test gained 17 FP
 checks (#17-33), including fmul/fmadd A-form and mtfsfi RN. `PpcDecodeInstruction`
-has FP mnemonics for opcodes 48-55 and 59/63. **Remaining:** a macOS build/run
-(`make clean && make`, then QEMU/OVMF) is required; a Windows host cannot run
-the clang/lld-link GNU-EFI toolchain.
+has FP mnemonics for opcodes 48-55 and 59/63. The FPU core is **verified**: the
+cross-toolchain (clang/lld-link GNU-EFI) now builds and boots on a Windows host
+(chocolatey LLVM 22.1.7 + QEMU/OVMF), and the CPU self-test runs 35/35 checks
+including all 17 FP checks (#17-33). **Remaining:** a macOS build/run
+(`make clean && make`, then QEMU/OVMF) and real Mac OS boot testing.
 
 **Phase 5 recap:** The CPU guest memory map is now multi-region
 (`PpcAddGuestMemoryRegion` in `src/cpu/interpreter.c`, up to 8 regions): the
@@ -52,8 +54,13 @@ staged files read back through the interpreter memory path, driver readback, and
 that the low-memory boot info survives staging. `src/main.c` wires the Phase 5
 sequence (install low memory -> install ROM with demo fallback -> memory-map
 self-test -> prepare -> scan/stage system files and drivers -> self-test ->
-report). Code is written against GNU-EFI idioms; a build/run on macOS
-(`make clean && make`, then QEMU/OVMF) is still required to verify.
+report). Fixed `BootDirectoryExists` to treat `EFI_NOT_FOUND` as a graceful
+"directory absent" outcome (mirroring `BootFileExists`) instead of aborting the
+System Folder scan, so the scan runs and records itself even when no System
+Folder exists; the system-files self-test now passes 5/5 on a minimal test
+volume. Verified end-to-end under QEMU/OVMF on Windows: CPU self-test 35/35,
+boot self-test 7/7, system-files self-test 5/5, then clean boot to the firmware
+UI. A macOS build/run is still pending.
 
 **Phase 4 recap** (complete and verified in a single QEMU/OVMF run alongside
 the Phase 3 work):
@@ -144,7 +151,8 @@ demo, kernel load/verify/execute, boot.log). Build is clean with
 - [x] Implement system initialization routines - CPU reset to ROM reset vector (MSR ME|RI), boot info block in low memory, `PpcRunBootSelfTest` (low-memory R/W, ROM read-only, cross-region ROM->RAM execution)
 - [x] Add support for system files and drivers - System Folder scan (`\System Folder` + System/Finder/Extensions/Mac OS ROM detection), guest staging areas (system 0x20000000, drivers 0x21000000) mapped via the multi-region memory map, Extensions directory enumeration with a driver registry, `PpcRunSystemFilesSelfTest`, and Mac OS ROM file fallback in the ROM loader
 - [ ] Test boot process with various Mac OS versions
-- [ ] Verify Phase 5 on macOS (`make clean && make`) and in QEMU/OVMF
+- [x] Verify Phase 5 build and boot under QEMU/OVMF on Windows (chocolatey LLVM + clang/lld-link; CPU 35/35, boot 7/7, system files 5/5 self-tests pass)
+- [ ] Verify Phase 5 on macOS (`make clean && make`)
 
 ## Phase 6: Testing and Optimization
 - [ ] Test with Mac OS 7, 8, and 9

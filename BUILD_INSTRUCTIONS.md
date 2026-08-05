@@ -3,9 +3,14 @@
 ## Status
 
 **The project builds.** `make` produces a valid PE32+ UEFI application image
-(`build/EFI-Mac-Emulator.efi`). The application is still pre-alpha — it
-initializes the emulator scaffolding and prints status, but does not yet
-translate or execute PowerPC code.
+(`build/EFI-Mac-Emulator.efi`). The application is still pre-alpha: it
+initializes the emulator scaffolding, runs a 35-check PowerPC CPU self-test
+(including the FPU core), sets up guest memory (RAM, low-memory globals, system
+ROM, staging areas), executes a PowerPC program from guest RAM, initializes
+graphics/audio/storage/network, runs the Phase 5 boot memory map self-test and
+System Folder / driver staging self-test, then reports ready. The full boot
+sequence has been verified under QEMU + OVMF on both the primary host and a
+Windows host (CPU 35/35, boot 7/7, system files 5/5 self-test passes).
 
 ## Overview
 
@@ -31,6 +36,20 @@ emit the `efi-app-x86_64` BFD target on this setup.
 
 `binutils` is optional (only the `make check` target uses it via
 `llvm-objdump`, which actually comes with `llvm`).
+
+### Windows
+
+The same clang/lld-link flow also builds and boots on Windows (chocolatey):
+
+```powershell
+choco install llvm qemu
+```
+
+- **llvm** (22.1.x, installed to `C:\Program Files\LLVM\bin`)
+- **qemu** (installed to `C:\Program Files\qemu`)
+- **git-bash** (installed to `C:\Program Files\Git`) to run `make`
+
+Build and boot scripts are in `scripts/` (see "Building on Windows").
 
 ## Building
 
@@ -109,6 +128,27 @@ qemu-system-x86_64 \
 OVMF will boot `\EFI\BOOT\BOOTX64.EFI` and the app's output appears on the
 serial console (`-serial stdio`). The newest Debian OVMF version can be looked
 up via the Debian packages site (`https://packages.debian.org/trixie/all/ovmf/download`).
+
+### Windows (chocolatey LLVM + QEMU)
+
+```powershell
+# 1. Build (git-bash), then copy the image and unpack OVMF once:
+bash scripts/build-windows.sh
+
+# 2. OVMF: download the Debian ovmf package and extract OVMF_CODE_4M.fd /
+#    OVMF_VARS_4M.fd. Use Windows tar, not git-bash tar, for the .deb/.tar.xz:
+#    (paths below match scripts/run-qemu-windows.ps1 defaults)
+#    C:\Users\...\AppData\Local\Temp\opencode\ovmf\usr\share\OVMF\OVMF_CODE_4M.fd
+
+# 3. Boot under QEMU (PowerShell); captures serial output to boot_out.txt:
+powershell -ExecutionPolicy Bypass -File scripts/run-qemu-windows.ps1
+
+# 4. Check the self-test results:
+Select-String -Path "$env:TEMP\opencode\boot_out.txt" -Pattern "self-test complete"
+```
+
+Expect CPU self-test 35/35, boot self-test 7/7, and system-files self-test 5/5,
+then a clean handoff to the OVMF UI.
 
 ## Directory Structure
 

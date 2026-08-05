@@ -798,7 +798,9 @@ PpcFpTruncToInt32 (
         g_PpcContext.Fpscr |= PPC_FPSCR_VXCVI;  // |D| >= 2^31 (or infinity)
         return Neg ? (INT32)0x80000000 : (INT32)0x7FFFFFFF;
     }
-    Result = (INT32)((Mant | 0x1000000000000ULL) >> (52 - Exp));
+    // Rebuild the significand with the implicit leading 1 (2^52) and shift the
+    // binary point left by 52-Exp to truncate the fraction.
+    Result = (INT32)((Mant | 0x10000000000000ULL) >> (52 - Exp));
     return Neg ? -Result : Result;
 }
 

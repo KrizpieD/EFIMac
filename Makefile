@@ -1,21 +1,36 @@
 # EFI-Mac-Emulator build
 #
-# Cross-builds a UEFI x86_64 application (EFI-Mac-Emulator.efi) on a macOS host
-# using a clang/LLVM toolchain targeting PE/COFF, linked with lld-link.
-# GNU-EFI provides the UEFI headers and a small runtime library.
+# Cross-builds a UEFI x86_64 application (EFI-Mac-Emulator.efi) using a
+# clang/LLVM toolchain targeting PE/COFF, linked with lld-link. GNU-EFI
+# provides the UEFI headers and a small runtime library.
 #
 # Requirements:
-#   brew install llvm lld binutils
-#   (binutils is optional; it is only used for the `check` target via objdump)
+#   macOS:  brew install llvm lld  (llvm-objdump comes with llvm)
+#   Windows: chocolatey install llvm (or add LLVM\bin to PATH), GNU make,
+#            git-bash on PATH so `make` finds /bin/sh
+#   Linux:  apt install clang lld
+#
+# Host detection: on macOS the Homebrew prefix is used if available; other
+# hosts resolve clang/lld-link from PATH. Override via
+# make CC=/path/to/clang LLD=/path/to/lld-link
 
-SHELL   := /bin/zsh
+SHELL   := /bin/sh
 
 # --- Toolchain discovery (override via make CC=/path/to/clang LLD=/path/to/lld-link) ---
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
 LLVM_PREFIX := $(shell brew --prefix llvm 2>/dev/null || echo /opt/homebrew/opt/llvm)
 LLD_PREFIX  := $(shell brew --prefix lld  2>/dev/null || echo /opt/homebrew/opt/lld)
 CC      = $(LLVM_PREFIX)/bin/clang
 LLD     ?= $(LLD_PREFIX)/bin/lld-link
-OBJDUMP ?= $(LLVM_PREFIX)/bin/llvm-objdump
+OBJDUMP = $(LLVM_PREFIX)/bin/llvm-objdump
+else
+# Plain "?=" would let a host environment CC (e.g. git-bash's CC=cc) leak in;
+# use ":=" so the PATH-resolved clang wins unless overridden on the command line.
+CC      := clang
+LLD     := lld-link
+OBJDUMP := llvm-objdump
+endif
 
 # --- Layout ---
 GNUEFI_DIR  := third_party/gnu-efi
