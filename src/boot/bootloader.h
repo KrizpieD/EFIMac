@@ -25,6 +25,15 @@ typedef struct {
 #define PPC_LOW_MEM_GUEST_BASE  0x00000000  // Low-memory globals
 #define PPC_LOW_MEM_SIZE        0x4000      // 16 KB
 
+// Which kind of system ROM is installed. Old World is a classic PowerPC
+// firmware dump (System 7 through early Mac OS 8); New World is the
+// "Mac OS ROM" file (Mac OS 8.5 and later, CHRP-style <CHRP-BOOT> header);
+// DEMO is the self-contained fallback image with no Mac firmware.
+#define PPC_ROM_TYPE_UNKNOWN    0
+#define PPC_ROM_TYPE_OLD_WORLD  1
+#define PPC_ROM_TYPE_NEW_WORLD  2
+#define PPC_ROM_TYPE_DEMO       3
+
 // Low-memory global offsets (emulator-defined boot info block)
 #define PPC_LOW_MEM_MAGIC_OFFSET    0x0000
 #define PPC_LOW_MEM_BOOTINFO_OFFSET 0x0100
@@ -48,14 +57,14 @@ typedef struct {
 #define PPC_SYSTEM_AREA_GUEST_BASE  0x20000000  // System + Finder + Mac OS ROM
 #define PPC_SYSTEM_AREA_SIZE        0x01000000  // 16 MB
 #define PPC_DRIVER_AREA_GUEST_BASE  0x21000000  // Extensions (drivers)
-#define PPC_DRIVER_AREA_SIZE        0x00800000  // 8 MB
+#define PPC_DRIVER_AREA_SIZE        0x02000000  // 32 MB
 
 // Limits for the system file / driver registry
 #define PPC_SYSTEM_FOLDER_PATH_MAX  256
 #define PPC_SYSTEM_FILE_NAME_MAX    64
 #define PPC_SYSTEM_FILE_PATH_MAX    260
 #define PPC_MAX_SYSTEM_FILES        6
-#define PPC_MAX_DRIVERS             24
+#define PPC_MAX_DRIVERS             64
 
 // Types of classic Mac OS system files
 typedef enum {
@@ -75,6 +84,7 @@ typedef struct {
     UINT64  FileSize;      // size on disk
     UINT64  GuestAddress;  // guest address where staged (0 if not loaded)
     UINT64  StagedSize;    // bytes staged into guest memory
+    UINT32  HfsId;         // catalog ID when sourced from the HFS reader (0 otherwise)
 } PPC_SYSTEM_FILE;
 
 // Aggregate report of the System Folder scan / staging results
@@ -99,6 +109,7 @@ typedef struct {
     BOOLEAN RomInstalled;
     UINT64  RomBase;
     UINT64  RomSize;
+    UINT32  RomType;           // PPC_ROM_TYPE_* (OLD_WORLD / NEW_WORLD / DEMO)
     BOOLEAN LowMemoryInstalled;
     UINT64  LowMemoryBase;
     UINT64  LowMemorySize;

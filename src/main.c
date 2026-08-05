@@ -59,6 +59,21 @@ GopFrameIsSolid (
   return TRUE;
 }
 
+// Short label for an installed ROM type.
+STATIC
+CHAR16*
+BootRomTypeName (
+  IN UINT32 RomType
+  )
+{
+  switch (RomType) {
+  case PPC_ROM_TYPE_NEW_WORLD: return L"New World (Mac OS ROM)";
+  case PPC_ROM_TYPE_OLD_WORLD: return L"Old World (classic firmware dump)";
+  case PPC_ROM_TYPE_DEMO:      return L"demo (no Mac firmware)";
+  default:                     return L"unknown";
+  }
+}
+
 EFI_STATUS
 efi_main (
   IN EFI_HANDLE        ImageHandle,
@@ -71,8 +86,9 @@ efi_main (
   InitializeLib(ImageHandle, SystemTable);
   
   // Print welcome message
-  Print(L"EFI-Mac-Emulator v0.1\n");
-  Print(L"Initializing PowerPC emulation environment...\n");
+  Print(L"EFI Mac OS Boot Layer v0.2\n");
+  Print(L"Heavy bootloader for classic Mac OS (System 7, Mac OS 8/9) via UEFI\n");
+  Print(L"Initializing PowerPC environment...\n");
   
   // Initialize UEFI interface
   Status = PpcInitializeUefiInterface(ImageHandle, SystemTable);
@@ -574,13 +590,22 @@ efi_main (
     // 5. Report the final boot state.
     PPC_BOOT_INFO BootInfo;
     if (!EFI_ERROR(PpcGetBootInfo(&BootInfo))) {
-      Print(L"Boot state: ready=%d, kernel=%d, ROM at 0x%x (%d bytes), "
+      Print(L"Boot state: ready=%d, kernel=%d, ROM at 0x%x (%d bytes, %s), "
             L"low mem at 0x%x (%d bytes)\n",
             BootInfo.SystemReady, BootInfo.KernelLoaded,
             (UINT32)BootInfo.MemoryMap.RomBase,
             (UINT64)BootInfo.MemoryMap.RomSize,
+            BootRomTypeName(BootInfo.MemoryMap.RomType),
             (UINT32)BootInfo.MemoryMap.LowMemoryBase,
             (UINT64)BootInfo.MemoryMap.LowMemorySize);
+      if (!BootInfo.MemoryMap.RomInstalled) {
+        Print(L"NOTE: no system ROM is installed; the demo ROM will not boot a real OS.\n");
+      } else if (BootInfo.MemoryMap.RomType == PPC_ROM_TYPE_DEMO) {
+        Print(L"NOTE: running the demo ROM. For a real boot, place a ROM image on the\n"
+              L"  boot volume at \\System\\MacOS\\ROM (Old World dump) or\n"
+              L"  \\System Folder\\Extensions\\Mac OS ROM (New World file), or attach a\n"
+              L"  Mac OS 8.5+ disc that contains the 'Mac OS ROM' file.\n");
+      }
     }
   }
 
@@ -634,7 +659,7 @@ efi_main (
     }
   }
 
-  Print(L"\n=== EFI-Mac-Emulator Ready ===\n");
+  Print(L"\n=== EFI Mac OS Boot Layer ready ===\n");
   
   return EFI_SUCCESS;
 }

@@ -136,6 +136,41 @@ PpcHfsOpenPath (
     );
 
 /**
+  Find the New World "Mac OS ROM" file anywhere on the mounted volume. The
+  file ships inside a System Folder and, on install discs, inside an
+  install-image System Folder (e.g. "Power Mac G4 Install:System Folder:Mac OS
+  ROM"), so this searches the whole catalog instead of a fixed path and
+  returns the largest non-empty match.
+  @param[out] Entry  Matching file entry
+  @retval EFI_SUCCESS       Entry found
+  @retval EFI_NOT_FOUND     No "Mac OS ROM" file on the volume
+  @retval EFI_NOT_READY     No volume mounted
+**/
+EFI_STATUS
+EFIAPI
+PpcHfsFindMacOsRom (
+    OUT PPC_HFS_ENTRY* Entry
+    );
+
+/**
+  Resolve a catalog entry by its file/directory ID (FlNum or DirID).
+  Unlike PpcHfsOpenPath, this matches the exact catalog record, so names
+  containing separator characters (e.g. "Apple 10/100 Fast Ethernet") resolve
+  correctly. Prefer this when the entry came from PpcHfsListChildren.
+  @param[in]  Id     Catalog file number or directory ID to find
+  @param[out] Entry  Matching entry
+  @retval EFI_SUCCESS        Entry resolved
+  @retval EFI_NOT_FOUND      No entry with that ID
+  @retval EFI_NOT_READY      No volume mounted
+**/
+EFI_STATUS
+EFIAPI
+PpcHfsGetEntryById (
+    IN  UINT32         Id,
+    OUT PPC_HFS_ENTRY* Entry
+    );
+
+/**
   Read the data fork of a file into a buffer.
   @param[in]  Entry    File entry (IsDirectory must be FALSE)
   @param[out] Buffer   Destination buffer

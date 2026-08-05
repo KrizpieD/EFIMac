@@ -1,160 +1,164 @@
-# EFI-Mac-Emulator - CPU Translation Layer Architecture
+# EFI Mac OS Boot Layer — Architecture
 
-> **Status note:** This document is a *design reference* for the CPU
-> translation layer. None of the components described below are implemented
-> yet — the current code in `src/cpu/` is placeholder scaffolding. This
-> document describes the intended architecture, not current behavior.
+This document describes how the project actually works today: a heavy UEFI
+bootloader that stages a classic PowerPC Mac boot environment from UEFI standard
+protocols, plus the design decisions behind it.
 
 ## Overview
 
-The CPU translation layer is the core component of the EFI-Mac-Emulator that translates instructions between the host x86_64 architecture and the target PowerPC architecture. This layer must handle instruction set differences, register mapping, and execution context switching.
+Classic Mac OS (System 7 through Mac OS 9) boots from firmware that owns a
+PowerPC Mac: a read-only ROM window at `0xFFF00000`, low-memory system globals
+at `0x0`, a boot volume containing the System Folder, and hardware devices.
+This project supplies that firmware-side environment as an EFI application:
 
-## Design Requirements
+1. **UEFI is the hardware.** GOP is the display, Block I/O / Simple File System
+   is storage, Simple Network Protocol is the network, and UEFI pool/allocation
+   services are memory. Simulated Mac devices (framebuffer, audio ring) are
+   buffers inside guest RAM that the bootloader copies to/from the real UEFI
+   devices.
+2. **A classic Mac boot volume is read in place.** An in-emulator HFS reader
+   parses the attached disc directly (no host mount required), so the bootloader
+   works on raw floppy/disc images as QEMU would see them.
+3. **Firmware is installed into the guest image.** A ROM is loaded (boot-volume
+   path, ESP file, or HFS `Mac OS ROM` discovery), mapped read-only into the
+   guest map, and identified as Old World / New World / demo.
+4. **A PowerPC interpreter executes guest code.** Fixed 32-bit opcodes are
+   decoded and interpreted against guest memory (with a multi-region map and
+   read-only ROM enforcement), including a full FPU core and exception support.
 
-### Instruction Set Translation
-- Translate PowerPC instructions to equivalent x86_64 operations
-- Handle differences in instruction formats and encoding
-- Support all necessary PowerPC instructions for Mac OS compatibility
-- Implement efficient translation with minimal performance overhead
+## Boot Flow
 
-### Register Mapping
-- Map PowerPC registers to x86_64 register space
-- Handle 32-bit vs 64-bit register differences
-- Manage special-purpose registers (SPR, MSR, etc.)
-- Ensure proper preservation of state during context switches
+```
+efi_main (src/main.c)
+  PpcInitializeUefiInterface      # LoadedImage, Boot Services, console
+  PpcInitializeDebug              # boot.log + monotonic timer
+  PpcInitializeTranslationContext # PPC register file, MSR/SRR0/1/CTR/LR
+  PpcRunSelfTest                  # 35 checks incl. FPU core
+  PpcInitializeMemoryManager      # 256 MB guest RAM @ 0x10000000
+  PpcSetGuestMemory               # wire UEFI pages into interpreter
+  [RAM-resident PPC program demo] # addi/mullw/stw through the memory path
+  PpcInitializeHardwareAbstraction# GOP, Block I/O, SNP, audio ring
+  PpcInitializeBootloader
+  PpcSetupBootEnvironment
+  PpcInitializeGraphics           # GOP mode + guest framebuffer window
+  [Graphics self-checks]          # full-screen frames verified on the GOP buffer
+  PpcInstallLowMemory             # 16 KB globals @ 0x0
+  PpcInstallSystemRom             # \System\MacOS\ROM -> HFS "Mac OS ROM" -> demo
+  PpcRunBootSelfTest              # region map, read-only ROM, reset vector
+  PpcPrepareSystemForBoot         # PC = reset vector, MSR = ME|RI, boot info block
+  PpcLocateSystemFolder / PpcLoadSystemFiles / PpcScanExtensionsDirectory /
+    PpcLoadDrivers                # stage System, Finder, Mac OS ROM, Extensions
+  PpcRunSystemFilesSelfTest       # staged bytes read back via interpreter
+  PpcGetBootInfo -> status report
+```
 
-### Execution Context
-- Maintain execution state across translation boundaries
-- Handle interrupt and exception processing
-- Support cooperative multitasking requirements
-- Implement memory management unit (MMU) simulation
+## ROM Sourcing and Types
 
-## Architecture Components
+Priority order (implemented in `PpcInstallSystemRom` /
+`PpcLoadSystemRom` / `BootLoadHfsRomToPages`):
 
-### 1. Translation Engine
-The main translation component that:
-- Receives PowerPC instructions from the emulated system
-- Translates them into equivalent x86_64 operations
-- Manages translation cache for performance optimization
-- Handles instruction boundary detection and alignment
+1. `\System\MacOS\ROM` on the boot volume — an Old World firmware dump
+   (System 7 needs one of these).
+2. `\System Folder\Extensions\Mac OS ROM` on the ESP.
+3. `Mac OS ROM` found anywhere on an attached Mac disc via
+   `PpcHfsFindMacOsRom` (whole-catalog search, largest non-empty match). This is
+   how a real Mac OS 9.2.2 install disc yields its 2,763,530-byte New World ROM
+   from `Power Mac G4 Install:System Folder:Mac OS ROM`.
+4. `PpcInstallDemoRom` — a 4 MB self-contained image with a reset-vector
+   program, used to keep the full install + self-test path alive without
+   firmware.
 
-### 2. Register Manager
-Manages register state mapping between architectures:
-- 32-bit GPRs (General Purpose Registers) mapping
-- Special Purpose Registers (SPRs) translation
-- Status/Control Registers (MSR) handling
-- Stack pointer management
-- Floating-point register handling (when needed)
+`BootIdentifyRomType` classifies by signature: a leading `<CHRP-BOOT>\r` means
+New World (PPC, Mac OS 8.5+), otherwise Old World, and the guest boot-info block
+records the type. The boot self-test adapts to the ROM: the `ROM1` magic and
+reset-vector execution checks run only for the demo ROM, while a real ROM is
+verified for region presence (and the CHRP signature when New World) plus
+read-only enforcement.
 
-### 3. Memory Manager Interface
-Provides memory access abstraction:
-- Virtual to physical address translation
-- Memory protection simulation
-- Cache coherency handling
-- Alignment requirements for x86_64
+## Guest Memory Map
 
-### 4. Exception Handler
-Manages exception and interrupt processing:
-- Trap instruction handling
-- System call interface
-- Interrupt vector dispatching
-- Context switching between modes
+Managed by `PpcAddGuestMemoryRegion` (multi-region map in the interpreter,
+read-only flag per region):
 
-### 5. Performance Optimizer
-Enhances translation efficiency:
-- Dynamic recompilation cache
-- Translation block fusion
-- Branch prediction
-- Hot code identification
+| Region              | Guest address | Size       | Access |
+|---------------------|---------------|------------|--------|
+| Low-memory globals  | `0x00000000`  | 16 KB      | R/W    |
+| Guest RAM           | `0x10000000`  | 256 MB     | R/W    |
+| Framebuffer window  | `0x18000000`  | 640x480x32 | R/W    |
+| Audio ring buffer   | `0x18800000`  | 8 KB       | R/W    |
+| System area         | `0x20000000`  | 16 MB      | R/W    |
+| Driver area         | `0x21000000`  | 32 MB      | R/W    |
+| System ROM          | `0xFFF00000`  | 4 MB       | R (ROM) |
 
-## PowerPC to x86_64 Mapping Details
+The bootloader-defined boot-info block in low memory (magic `"EFI!"` at `0x0`,
+then RAM base/size, ROM base/size, ROM type) is entirely host-defined — it is
+not a real Mac OS ROM globals table.
 
-### General Purpose Registers (GPRs)
-PowerPC has 32 GPRs (r0-r31), while x86_64 has 16 registers.
-- Map GPRs r0-r15 to x86_64 registers
-- Use stack or memory for r16-r31 when needed
-- Implement register spilling when necessary
+## In-Emulator HFS Reader
 
-### Special Purpose Registers (SPRs)
-PowerPC has many SPRs that don't have direct x86_64 equivalents:
-- MSR (Machine State Register) - must be simulated
-- DAR (Data Address Register) - for data-related exceptions
-- SRR0/SRR1 (Save/Restore Registers) - for exception handling
-- Implement these as memory-mapped values or software emulated
+`src/fs/hfs.c` parses classic HFS volumes without the host mounting them:
 
-### Instruction Set Differences
-Key differences to handle:
-- PowerPC uses fixed-length 32-bit instructions vs x86_64 variable length
-- PowerPC is RISC vs x86_64 CISC architecture
-- Different addressing modes and instruction formats
-- PowerPC has fewer but more complex instructions vs x86_64 simpler instructions
+- **Block-size auto-detection** so raw floppy images (512 B blocks), CD ISO
+  images (2048 B blocks), and HFS-with-2-KB-cluster layouts all work.
+- **Catalog-based lookup** (`PpcHfsGetEntryById`) that resolves files by their
+  catalog FlNum/DirID, so names containing `/` or `:` are handled correctly and
+  are not ambiguous with path separators.
+- **Extent handling** with multi-overflow-extent support for large files.
+- Used by the System Folder probe (`PpcHfsProbeBootFiles`), the whole-catalog
+  `Mac OS ROM` search, and driver enumeration (`BootEnumerateExtensionsHfs`).
 
-## UEFI Integration Points
+The reader has been exercised against System 7.5.3 (raw HFS image), Mac OS 8.1
+(ISO with non-zero block base), and Mac OS 9.2.2 (ISO with multi-overflow
+extents).
 
-### Boot Process
-1. UEFI application initializes hardware
-2. Sets up translation environment
-3. Loads PowerPC ROM image
-4. Transfers control to PowerPC bootloader
+## System Folder and Driver Staging
 
-### Runtime Environment
-- Memory allocation through UEFI services
-- Hardware access via UEFI protocols
-- System information through UEFI tables
-- Console I/O management
+- `PpcLocateSystemFolder` finds the System Folder on the boot volume (ESP FAT or
+  attached HFS disc) and detects System, Finder, Extensions, and the Mac OS ROM.
+- `PpcLoadSystemFiles` stages System and Finder (empty files are skipped; System
+  7.5.3's `Finder` is a genuine 0-byte stub) into the system area at
+  `0x20000000`.
+- `PpcScanExtensionsDirectory` / `PpcLoadDrivers` enumerate and stage up to 64
+  Extensions (drivers) into the driver area at `0x21000000`; empty data forks
+  are skipped. Every non-empty extension stages with 0 failures on the test
+  discs (7.5.3: 2/2, 8.1: 18/18, 9.2.2: 25/25).
 
-### Resource Management
-- Allocate memory for translation cache
-- Manage CPU resources for translation
-- Handle UEFI memory map for system resources
-- Implement proper cleanup on exit
+## Device Simulation on UEFI
 
-## Implementation Strategy
+- **Graphics:** `PpcInitializeGraphics` selects a GOP mode and carves a
+  640x480x32 guest framebuffer window. Guest code writes big-endian `0xRRGGBB00`
+  pixels there; `PpcGraphicsBlitToDisplay` converts and copies to the real GOP
+  framebuffer (byte-exact for RGB and BGR layouts). Verified with full-screen
+  solid frames checked pixel-by-pixel on the GOP buffer, band boundaries,
+  corners, and out-of-bounds write rejection.
+- **Storage:** `PpcInitializeBlockIo` enumerates every Block I/O handle and
+  reports real geometry; `PpcReadDiskBlock` issues real `ReadBlocks` calls. The
+  HFS reader is layered on top of this.
+- **Network:** `PpcInitializeNetwork` starts and initializes every Simple
+  Network Protocol interface, snapshots real mode (MAC, media state), and
+  transmits a real frame via `Transmit`/`GetStatus`.
+- **Audio:** no UEFI audio standard exists, so the device is a fixed ring buffer
+  in guest RAM; the host reads PCM samples back and advances a play cursor.
 
-### Phase 1: Basic Translation
-- Implement core register mapping
-- Translate basic arithmetic and logic instructions
-- Handle simple control flow (branches)
-- Support essential system calls
+## PowerPC Interpreter
 
-### Phase 2: Enhanced Features
-- Add floating-point instruction support
-- Implement memory management simulation
-- Add exception/interrupt handling
-- Optimize translation performance
+`src/cpu/interpreter.c` decodes and executes fixed 32-bit big-endian PowerPC
+opcodes with a register file (32 GPRs, CR, CTR, LR, MSR, SRR0/1, FP registers +
+FPSCR), big-endian guest memory access, FPU core (opcodes 48-63, gated on
+MSR[FP] with the FP-unavailable exception at `0x800`), and exception dispatch
+(program `0x700`, FP `0x800`). Execution today is block-at-a-time
+(`PpcExecuteBlock`): small hand-checked programs run from guest RAM and the
+demo ROM's reset vector. There is no MMU, no timer/interrupt injection, and no
+continuous fetch-execute loop — the ROM window is never executed for real.
 
-### Phase 3: Full Compatibility
-- Support complete PowerPC instruction set
-- Implement MMU simulation
-- Add advanced features like AltiVec
-- Ensure compatibility with Mac OS system calls
+## Build and Run
 
-## Performance Considerations
+See [BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md) for the clang/lld-link
+GNU-EFI cross-build (Windows git-bash script or macOS `make`) and
+[USER_GUIDE.md](USER_GUIDE.md) for the QEMU/OVMF boot and disc attachment.
 
-### Translation Overhead
-- Minimize translation cache misses
-- Use block-based translation for better performance
-- Implement hot code detection and optimization
-- Cache translated blocks for reuse
+## Open Work
 
-### Memory Usage
-- Balance translation cache size vs memory consumption
-- Implement efficient cache replacement policies
-- Manage register state efficiently
-- Consider memory alignment for x86_64 requirements
-
-## Testing Approach
-
-### Unit Testing
-- Individual instruction translation tests
-- Register mapping verification
-- Memory access pattern testing
-- Exception handling validation
-
-### Integration Testing
-- End-to-end boot process testing
-- System call compatibility verification
-- Performance benchmarking
-- Compatibility with Mac OS applications
-
-This architecture provides a foundation for developing the CPU translation layer that will enable running classic Mac OS on modern x86_64 hardware through UEFI.
+See [TODO.md](TODO.md). The short list: continuous guest execution, MMU and
+exception delivery to real firmware, Mac device register emulation in the guest
+map, Old World ROM boot testing with System 7, and New World ROM execution.

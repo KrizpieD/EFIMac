@@ -27,6 +27,7 @@ typedef struct {
     UINT64  RomAddress;
     UINT64  RomSize;
     VOID*   RomHostBuffer;
+    UINT32  RomType;
     // Phase 5: system files and drivers (classic Mac OS System Folder)
     BOOLEAN SystemFolderScanned;
     BOOLEAN SystemFolderFound;
@@ -688,6 +689,7 @@ BootEnumerateExtensionsHfs (
         D->Type = PPC_SYSTEM_FILE_TYPE_DRIVER;
         D->Loaded = FALSE;
         D->FileSize = Children[I].Size;
+        D->HfsId = Children[I].Id;
         BootCopyString(D->Name, Children[I].Name, PPC_SYSTEM_FILE_NAME_MAX);
         BootCopyString(D->Path, PPC_HFS_SYSTEM_FOLDER_PATH L":Extensions:",
                        PPC_SYSTEM_FILE_PATH_MAX);
@@ -980,6 +982,7 @@ PpcGetBootInfo (
     BootInfo->MemoryMap.RomInstalled = g_BootContext.RomLoaded;
     BootInfo->MemoryMap.RomBase = g_BootContext.RomAddress;
     BootInfo->MemoryMap.RomSize = g_BootContext.RomSize;
+    BootInfo->MemoryMap.RomType = g_BootContext.RomType;
     BootInfo->MemoryMap.LowMemoryInstalled = g_BootContext.LowMemoryInstalled;
     BootInfo->MemoryMap.LowMemoryBase = g_BootContext.LowMemoryAddress;
     BootInfo->MemoryMap.LowMemorySize = g_BootContext.LowMemorySize;
@@ -991,6 +994,27 @@ PpcGetBootInfo (
 }
 
 // Additional bootloader functions for PowerPC-specific boot requirements
+
+// Distinguish the installed ROM image. New World "Mac OS ROM" files (Mac OS
+// 8.5+) are CHRP-style and begin with the <CHRP-BOOT> marker; classic Old
+// World PowerPC firmware dumps (System 7 through early Mac OS 8) do not, so
+// any other non-empty image the user supplies is treated as Old World.
+STATIC UINT32
+BootIdentifyRomType (
+    IN const UINT8* Rom,
+    IN UINTN        Size
+    )
+{
+    STATIC const UINT8 ChrpBoot[11] = { '<', 'C', 'H', 'R', 'P', '-',
+                                        'B', 'O', 'O', 'T', '>' };
+    if (Rom == NULL || Size == 0) {
+        return PPC_ROM_TYPE_UNKNOWN;
+    }
+    if (Size >= sizeof(ChrpBoot) && CompareMem(Rom, ChrpBoot, sizeof(ChrpBoot)) == 0) {
+        return PPC_ROM_TYPE_NEW_WORLD;
+    }
+    return PPC_ROM_TYPE_OLD_WORLD;
+}
 
 EFI_STATUS
 PpcLoadSystemRom (
@@ -1022,9 +1046,12 @@ PpcLoadSystemRom (
     return EFI_SUCCESS;
 }
 
-// Load the "Mac OS ROM" file from the System Folder of the attached Mac OS
-// disc (in-emulator HFS/HFS+ reader) into a page-aligned buffer. Used as a
-// fallback when the boot volume has no ROM file.
+// Load the "Mac OS ROM" file from the attached Mac OS disc (in-emulator
+// HFS/HFS+ reader) into a page-aligned buffer. The file ships inside a
+// System Folder and, on install discs, inside an install-image System Folder
+// (e.g. "Power Mac G4 Install:System Folder:Mac OS ROM"), so it is located by
+// a whole-catalog search rather than a fixed path. Used as a fallback when
+// the boot volume has no ROM file.
 STATIC EFI_STATUS
 BootLoadHfsRomToPages (
     OUT VOID**  Buffer,
@@ -1045,7 +1072,7 @@ BootLoadHfsRomToPages (
     }
 
     PPC_HFS_ENTRY RomEntry;
-    Status = PpcHfsOpenPath(PPC_HFS_ROM_FILE_PATH, &RomEntry);
+    Status = PpcHfsFindMacOsRom(&RomEntry);
     if (EFI_ERROR(Status)) {
         return Status;
     }
@@ -1125,12 +1152,16 @@ PpcInstallSystemRom (
     g_BootContext.RomAddress = PPC_ROM_GUEST_BASE;
     g_BootContext.RomSize = Size;
     g_BootContext.RomHostBuffer = Buffer;
+    g_BootContext.RomType = BootIdentifyRomType((const UINT8*)Buffer, (UINTN)Size);
 
     if (RomAddress != NULL) { *RomAddress = PPC_ROM_GUEST_BASE; }
     if (RomSize != NULL) { *RomSize = Size; }
 
-    Print(L"System ROM installed: %d bytes at guest 0x%x\n",
-          (UINT64)Size, PPC_ROM_GUEST_BASE);
+    Print(L"System ROM installed: %d bytes at guest 0x%x (%s)\n",
+          (UINT64)Size, PPC_ROM_GUEST_BASE,
+          g_BootContext.RomType == PPC_ROM_TYPE_NEW_WORLD ? L"New World" :
+          g_BootContext.RomType == PPC_ROM_TYPE_OLD_WORLD ? L"Old World" :
+          L"unknown type");
 
     return EFI_SUCCESS;
 }
@@ -1200,6 +1231,7 @@ PpcInstallDemoRom (
     g_BootContext.RomAddress = PPC_ROM_GUEST_BASE;
     g_BootContext.RomSize = PPC_ROM_MAX_SIZE;
     g_BootContext.RomHostBuffer = Rom;
+    g_BootContext.RomType = PPC_ROM_TYPE_DEMO;
 
     if (RomAddress != NULL) { *RomAddress = PPC_ROM_GUEST_BASE; }
     if (RomSize != NULL) { *RomSize = PPC_ROM_MAX_SIZE; }
@@ -1382,13 +1414,16 @@ PpcPrepareSystemForBoot (
     g_PpcContext.ExceptionPending = 0;
 
     // Write the emulator boot info block into low memory: magic, then
-    // RAM base, RAM size, ROM base, and installed ROM size (big-endian).
+    // RAM base, RAM size, ROM base, installed ROM size, and ROM type
+    // (big-endian).
     BootWriteWord32(PPC_LOW_MEM_GUEST_BASE + PPC_LOW_MEM_MAGIC_OFFSET, 0x45464921);
     BootWriteWord32(PPC_LOW_MEM_GUEST_BASE + PPC_LOW_MEM_BOOTINFO_OFFSET + 0, (UINT32)RamBase);
     BootWriteWord32(PPC_LOW_MEM_GUEST_BASE + PPC_LOW_MEM_BOOTINFO_OFFSET + 4, (UINT32)RamSize);
     BootWriteWord32(PPC_LOW_MEM_GUEST_BASE + PPC_LOW_MEM_BOOTINFO_OFFSET + 8, PPC_ROM_GUEST_BASE);
     BootWriteWord32(PPC_LOW_MEM_GUEST_BASE + PPC_LOW_MEM_BOOTINFO_OFFSET + 12,
                     (UINT32)(g_BootContext.RomLoaded ? g_BootContext.RomSize : 0));
+    BootWriteWord32(PPC_LOW_MEM_GUEST_BASE + PPC_LOW_MEM_BOOTINFO_OFFSET + 16,
+                    g_BootContext.RomType);
 
     g_BootContext.SystemReady = TRUE;
     g_BootContext.SystemBooting = TRUE;
@@ -1427,39 +1462,67 @@ PpcRunBootSelfTest (
         PpcReadGuestByte(PPC_LOW_MEM_GUEST_BASE + 0x08) == 0xAA,
         L"low-memory globals read/write (guest 0x00000000)");
 
-    // ROM: magic word readable through the interpreter's memory path.
-    BootSelfTestCheck(
-        PpcReadGuestByte(PPC_ROM_GUEST_BASE + 0) == 'R' &&
-        PpcReadGuestByte(PPC_ROM_GUEST_BASE + 1) == 'O' &&
-        PpcReadGuestByte(PPC_ROM_GUEST_BASE + 2) == 'M' &&
-        PpcReadGuestByte(PPC_ROM_GUEST_BASE + 3) == '1',
-        L"ROM magic word 'ROM1' readable at guest 0xFFF00000");
+    // ROM mapping: readable through the interpreter's memory path, and
+    // read-only to guest stores. A real firmware dump must not be executed,
+    // so the reset-vector execution checks only run against the demo ROM.
+    if (g_BootContext.RomType == PPC_ROM_TYPE_DEMO) {
+        // Demo ROM: magic word readable at the ROM base.
+        BootSelfTestCheck(
+            PpcReadGuestByte(PPC_ROM_GUEST_BASE + 0) == 'R' &&
+            PpcReadGuestByte(PPC_ROM_GUEST_BASE + 1) == 'O' &&
+            PpcReadGuestByte(PPC_ROM_GUEST_BASE + 2) == 'M' &&
+            PpcReadGuestByte(PPC_ROM_GUEST_BASE + 3) == '1',
+            L"ROM magic word 'ROM1' readable at guest 0xFFF00000");
+    } else {
+        // Real ROM: region present and its base is readable (no fixed magic).
+        BootSelfTestCheck(
+            g_BootContext.RomLoaded && g_BootContext.RomSize > 0,
+            L"system ROM region present at guest 0xFFF00000");
+        if (g_BootContext.RomType == PPC_ROM_TYPE_NEW_WORLD) {
+            static const UINT8 ChrpSig[12] = { '<', 'C', 'H', 'R', 'P', '-',
+                                               'B', 'O', 'O', 'T', '>', '\r' };
+            BOOLEAN Chrp = TRUE;
+            for (UINTN I = 0; I < 12; I++) {
+                if (PpcReadGuestByte(PPC_ROM_GUEST_BASE + (UINT32)I) != ChrpSig[I]) {
+                    Chrp = FALSE;
+                    break;
+                }
+            }
+            BootSelfTestCheck(Chrp, L"New World ROM '<CHRP-BOOT>' signature present");
+        }
+    }
 
-    // ROM is read-only to guest stores.
-    PpcWriteGuestByte(PPC_ROM_GUEST_BASE + 0, 0xEE);
-    BootSelfTestCheck(
-        PpcReadGuestByte(PPC_ROM_GUEST_BASE + 0) == 'R',
-        L"ROM rejects guest writes (read-only)");
+    // ROM is read-only to guest stores (applies to demo and real ROMs).
+    {
+        UINT8 B0 = PpcReadGuestByte(PPC_ROM_GUEST_BASE + 0);
+        PpcWriteGuestByte(PPC_ROM_GUEST_BASE + 0, (UINT8)(B0 ^ 0xFF));
+        BootSelfTestCheck(
+            PpcReadGuestByte(PPC_ROM_GUEST_BASE + 0) == B0,
+            L"ROM rejects guest writes (read-only)");
+    }
 
-    // Cross-region execution: run the reset-vector program in the ROM; it
-    // loads the ROM magic word and stores its successor into guest RAM.
-    PpcSetGprValue(1, (UINT32)RamBase);
-    PpcSetGprValue(3, 0);
-    PpcSetGprValue(4, 0);
-    PpcSetGprValue(5, 0);
-    Status = PpcExecuteBlock((UINT32*)(UINTN)PPC_RESET_VECTOR, 4, &Executed);
+    // Cross-region execution (demo ROM only): run the reset-vector program in
+    // the ROM; it loads the ROM magic word and stores its successor into
+    // guest RAM.
+    if (g_BootContext.RomType == PPC_ROM_TYPE_DEMO) {
+        PpcSetGprValue(1, (UINT32)RamBase);
+        PpcSetGprValue(3, 0);
+        PpcSetGprValue(4, 0);
+        PpcSetGprValue(5, 0);
+        Status = PpcExecuteBlock((UINT32*)(UINTN)PPC_RESET_VECTOR, 4, &Executed);
 
-    MagicPlusOne = 0x524F4D31 + 1;
-    BootSelfTestCheck(Status == EFI_SUCCESS && Executed == 4,
-                      L"reset-vector program ran cleanly");
-    BootSelfTestCheck(PpcGetGprValue(4) == 0x524F4D31,
-                      L"program read ROM word (r4 = 'ROM1')");
-    BootSelfTestCheck(
-        PpcReadGuestByte((UINT32)RamBase + 0) == (UINT8)(MagicPlusOne >> 24) &&
-        PpcReadGuestByte((UINT32)RamBase + 1) == (UINT8)(MagicPlusOne >> 16) &&
-        PpcReadGuestByte((UINT32)RamBase + 2) == (UINT8)(MagicPlusOne >> 8) &&
-        PpcReadGuestByte((UINT32)RamBase + 3) == (UINT8)MagicPlusOne,
-        L"program stored result to guest RAM");
+        MagicPlusOne = 0x524F4D31 + 1;
+        BootSelfTestCheck(Status == EFI_SUCCESS && Executed == 4,
+                          L"reset-vector program ran cleanly");
+        BootSelfTestCheck(PpcGetGprValue(4) == 0x524F4D31,
+                          L"program read ROM word (r4 = 'ROM1')");
+        BootSelfTestCheck(
+            PpcReadGuestByte((UINT32)RamBase + 0) == (UINT8)(MagicPlusOne >> 24) &&
+            PpcReadGuestByte((UINT32)RamBase + 1) == (UINT8)(MagicPlusOne >> 16) &&
+            PpcReadGuestByte((UINT32)RamBase + 2) == (UINT8)(MagicPlusOne >> 8) &&
+            PpcReadGuestByte((UINT32)RamBase + 3) == (UINT8)MagicPlusOne,
+            L"program stored result to guest RAM");
+    }
 
     Print(L"--- Boot self-test complete: %d passed, %d failed ---\n",
           g_BootTestPasses, g_BootTestFailures);
@@ -1603,24 +1666,23 @@ PpcLoadSystemFiles (
         return Status;
     }
 
-    // System Folder on the attached Mac OS disc: stage System / Finder /
-    // Mac OS ROM through the in-emulator HFS reader.
+    // System Folder on the attached Mac OS disc: stage System and Finder
+    // through the in-emulator HFS reader. The system ROM is installed
+    // separately by PpcInstallSystemRom (ESP -> HFS "Mac OS ROM" -> demo).
     if (g_BootContext.SystemFolderFromHfs) {
         struct {
             CHAR16*         Path;
             CHAR16*         Report;
             PPC_SYSTEM_FILE_TYPE Type;
-        } BootFiles[3] = {
+        } BootFiles[2] = {
             { PPC_HFS_SYSTEM_FILE_PATH, L":System Folder:System", PPC_SYSTEM_FILE_TYPE_SYSTEM },
             { PPC_HFS_FINDER_FILE_PATH, L":System Folder:Finder", PPC_SYSTEM_FILE_TYPE_FINDER },
-            { PPC_HFS_ROM_FILE_PATH,    L":System Folder:Extensions:Mac OS ROM", PPC_SYSTEM_FILE_TYPE_ROM },
         };
-        for (UINTN I = 0; I < 3; I++) {
+        for (UINTN I = 0; I < 2; I++) {
             BOOLEAN Present;
             switch (BootFiles[I].Type) {
             case PPC_SYSTEM_FILE_TYPE_SYSTEM: Present = g_BootContext.SystemPresent; break;
-            case PPC_SYSTEM_FILE_TYPE_FINDER: Present = g_BootContext.FinderPresent; break;
-            default:                          Present = g_BootContext.MacOsRomPresent; break;
+            default:                          Present = g_BootContext.FinderPresent; break;
             }
             if (!Present) {
                 continue;
@@ -1629,6 +1691,10 @@ PpcLoadSystemFiles (
             Status = PpcHfsOpenPath(BootFiles[I].Path, &E);
             if (EFI_ERROR(Status) || E.IsDirectory) {
                 Print(L"Failed to resolve HFS '%s': %r\n", BootFiles[I].Path, Status);
+                continue;
+            }
+            if (E.Size == 0) {
+                Print(L"  Skipped %s (empty data fork)\n", BootFiles[I].Report);
                 continue;
             }
             F = &g_BootContext.SystemFiles[g_BootContext.SystemFileCount];
@@ -1685,22 +1751,8 @@ PpcLoadSystemFiles (
         }
     }
 
-    if (g_BootContext.MacOsRomPresent) {
-        F = &g_BootContext.SystemFiles[g_BootContext.SystemFileCount];
-        Status = BootStageFile(PPC_SYSTEM_FOLDER_ROM_PATH, PPC_SYSTEM_FILE_TYPE_ROM,
-                               PPC_SYSTEM_AREA_GUEST_BASE, PPC_SYSTEM_AREA_SIZE,
-                               g_BootContext.SystemAreaHost, &g_BootContext.SystemAreaCursor,
-                               F, &Host);
-        if (!EFI_ERROR(Status)) {
-            g_BootContext.SystemFileHosts[g_BootContext.SystemFileCount] = Host;
-            g_BootContext.SystemFileCount++;
-            g_BootContext.LoadedSystemFileCount++;
-            Print(L"Staged Mac OS ROM file: %s -> guest 0x%x (%d bytes)\n",
-                  F->Name, (UINT64)F->GuestAddress, (UINT64)F->FileSize);
-        } else {
-            Print(L"Failed to stage Mac OS ROM file: %r\n", Status);
-        }
-    }
+    // The system ROM (Old World dump or New World "Mac OS ROM") is installed
+    // separately by PpcInstallSystemRom, not staged into the system area.
 
     return (g_BootContext.LoadedSystemFileCount > 0) ? EFI_SUCCESS : EFI_NOT_FOUND;
 }
@@ -1743,9 +1795,16 @@ PpcLoadDrivers (
     for (I = 0; I < g_BootContext.DriverCount; I++) {
         PPC_SYSTEM_FILE* D = &g_BootContext.Drivers[I];
         VOID* Host = NULL;
+        if (D->FileSize == 0) {
+            Print(L"  Skipped driver '%s' (empty data fork)\n", D->Name);
+            continue;
+        }
         if (g_BootContext.SystemFolderFromHfs) {
             PPC_HFS_ENTRY E;
-            Status = PpcHfsOpenPath(D->Path, &E);
+            // Resolve by catalog ID: the entry came from PpcHfsListChildren, and
+            // re-opening the path would mis-split names containing '/' or ':'.
+            Status = (D->HfsId != 0) ? PpcHfsGetEntryById(D->HfsId, &E)
+                                     : PpcHfsOpenPath(D->Path, &E);
             if (EFI_ERROR(Status) || E.IsDirectory) {
                 Print(L"  Failed to resolve driver '%s': %r\n", D->Name, Status);
                 continue;

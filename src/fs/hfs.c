@@ -981,10 +981,13 @@ PpcHfsProbeBootFiles (
         if (!EFI_ERROR(PpcHfsOpenPath(L"System Folder:Finder", &E)) && !E.IsDirectory) {
             Finder = TRUE;
         }
-        if (!EFI_ERROR(PpcHfsOpenPath(L"System Folder:Extensions:Mac OS ROM", &E)) &&
-            !E.IsDirectory) {
-            Rom = TRUE;
-        }
+    }
+
+    // The New World "Mac OS ROM" file may live inside an install-image System
+    // Folder (e.g. "Power Mac G4 Install:System Folder:Mac OS ROM"), so probe
+    // the whole catalog rather than a single fixed path.
+    if (!EFI_ERROR(PpcHfsFindMacOsRom(&E)) && !E.IsDirectory) {
+        Rom = TRUE;
     }
 
     if (SystemFolderPresent) { *SystemFolderPresent = Folder; }
@@ -1037,6 +1040,76 @@ PpcHfsListChildren (
 
     *Count = Written;
     return (Written < Total) ? EFI_BUFFER_TOO_SMALL : EFI_SUCCESS;
+}
+
+EFI_STATUS
+PpcHfsGetEntryById (
+    IN  UINT32         Id,
+    OUT PPC_HFS_ENTRY* Entry
+    )
+{
+    if (Entry == NULL) {
+        return EFI_INVALID_PARAMETER;
+    }
+    if (!g_HfsMounted) {
+        return EFI_NOT_READY;
+    }
+
+    for (UINTN I = 0; I < g_HfsDirCount; I++) {
+        if (g_HfsDirs[I].Id == Id) {
+            CopyMem(Entry, &g_HfsDirs[I], sizeof(PPC_HFS_ENTRY));
+            return EFI_SUCCESS;
+        }
+    }
+    for (UINTN I = 0; I < g_HfsFileCount; I++) {
+        if (g_HfsFiles[I].Id == Id) {
+            CopyMem(Entry, &g_HfsFiles[I], sizeof(PPC_HFS_ENTRY));
+            return EFI_SUCCESS;
+        }
+    }
+
+    return EFI_NOT_FOUND;
+}
+
+// The New World "Mac OS ROM" file name. It ships inside System Folders, and
+// on install discs it lives inside the disc's install-image System Folder
+// (e.g. "Power Mac G4 Install:System Folder:Mac OS ROM"), so a path-based
+// lookup is not enough: search the whole catalog.
+STATIC const CHAR16 PPC_HFS_MAC_OS_ROM_NAME[] = L"Mac OS ROM";
+
+EFI_STATUS
+PpcHfsFindMacOsRom (
+    OUT PPC_HFS_ENTRY* Entry
+    )
+{
+    if (Entry == NULL) {
+        return EFI_INVALID_PARAMETER;
+    }
+    if (!g_HfsMounted) {
+        return EFI_NOT_READY;
+    }
+
+    BOOLEAN Found = FALSE;
+    PPC_HFS_ENTRY Best;
+    ZeroMem(&Best, sizeof(Best));
+    for (UINTN I = 0; I < g_HfsFileCount; I++) {
+        if (g_HfsFiles[I].Size == 0) {
+            continue;
+        }
+        if (HfsStriCmp(g_HfsFiles[I].Name, PPC_HFS_MAC_OS_ROM_NAME) != 0) {
+            continue;
+        }
+        if (!Found || g_HfsFiles[I].Size > Best.Size) {
+            Best = g_HfsFiles[I];
+            Found = TRUE;
+        }
+    }
+
+    if (!Found) {
+        return EFI_NOT_FOUND;
+    }
+    CopyMem(Entry, &Best, sizeof(PPC_HFS_ENTRY));
+    return EFI_SUCCESS;
 }
 
 EFI_STATUS
