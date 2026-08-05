@@ -64,6 +64,7 @@ APP_SRCS := \
 	src/memory/manager_impl.c \
 	src/hardware/abstraction_impl.c \
 	src/boot/bootloader_impl.c \
+	src/fs/hfs.c \
 	src/utils/debug_impl.c \
 	src/platform/uefi_interface_impl.c
 

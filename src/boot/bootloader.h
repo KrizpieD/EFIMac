@@ -36,6 +36,14 @@ typedef struct {
 #define PPC_EXTENSIONS_DIR_PATH     L"\\System Folder\\Extensions"
 #define PPC_SYSTEM_FOLDER_ROM_PATH  L"\\System Folder\\Extensions\\Mac OS ROM"
 
+// HFS volume paths (Mac-style ':' separators) used when the System Folder is
+// read from an attached Mac OS disc through the in-emulator HFS reader instead
+// of the FAT boot volume.
+#define PPC_HFS_SYSTEM_FOLDER_PATH  L"System Folder"
+#define PPC_HFS_SYSTEM_FILE_PATH    L"System Folder:System"
+#define PPC_HFS_FINDER_FILE_PATH    L"System Folder:Finder"
+#define PPC_HFS_ROM_FILE_PATH       L"System Folder:Extensions:Mac OS ROM"
+
 // Guest staging areas for system files and drivers
 #define PPC_SYSTEM_AREA_GUEST_BASE  0x20000000  // System + Finder + Mac OS ROM
 #define PPC_SYSTEM_AREA_SIZE        0x01000000  // 16 MB

@@ -774,6 +774,32 @@ PpcGetBlockIoInfo (
 }
 
 EFI_STATUS
+PpcGetBlockDeviceInfo (
+    IN  UINTN                 Index,
+    OUT PPC_BLOCK_DEVICE_INFO* Info
+    )
+{
+    if (Info == NULL) {
+        return EFI_INVALID_PARAMETER;
+    }
+    if (g_BlockDevices == NULL || g_BlockDeviceCount == 0) {
+        return EFI_NOT_READY;
+    }
+    if (Index >= g_BlockDeviceCount) {
+        return EFI_NOT_FOUND;
+    }
+
+    EFI_BLOCK_IO_MEDIA* M = g_BlockDevices[Index]->Media;
+    ZeroMem(Info, sizeof(PPC_BLOCK_DEVICE_INFO));
+    Info->BlockSize  = M->BlockSize;
+    Info->BlockCount = (UINT64)M->LastBlock + 1;
+    Info->MediaId    = M->MediaId;
+    Info->ReadOnly   = M->ReadOnly;
+    Info->Removable  = M->RemovableMedia;
+    return EFI_SUCCESS;
+}
+
+EFI_STATUS
 PpcReadDiskBlock (
     IN  UINTN   Index,
     IN  EFI_LBA Lba,

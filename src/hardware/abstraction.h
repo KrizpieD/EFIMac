@@ -320,6 +320,16 @@ typedef struct {
     UINT32   FirstSector0;     // First word (big-endian) of the test sector
 } PPC_BLOCK_IO_INFO;
 
+// Per-device media geometry (for filesystem drivers that need to read raw
+// sectors from a specific enumerated block device).
+typedef struct {
+    UINTN    BlockSize;        // Bytes per block
+    UINT64   BlockCount;       // Total number of blocks
+    UINT32   MediaId;          // Media ID
+    BOOLEAN  ReadOnly;         // Media is read-only
+    BOOLEAN  Removable;        // Media is removable
+} PPC_BLOCK_DEVICE_INFO;
+
 /**
   Enumerate every UEFI Block I/O protocol instance (whole disks and
   partitions) and report real media geometry.
@@ -341,6 +351,21 @@ EFI_STATUS
 EFIAPI
 PpcGetBlockIoInfo (
     OUT PPC_BLOCK_IO_INFO* Info
+    );
+
+/**
+  Get the media geometry of a single enumerated block device.
+  @param[in]  Index  Device index (0-based)
+  @param[out] Info   Per-device geometry structure to fill
+  @retval EFI_SUCCESS       Device geometry returned
+  @retval EFI_NOT_FOUND     Index out of range
+  @retval EFI_NOT_READY     Block I/O not initialized
+**/
+EFI_STATUS
+EFIAPI
+PpcGetBlockDeviceInfo (
+    IN  UINTN                Index,
+    OUT PPC_BLOCK_DEVICE_INFO* Info
     );
 
 /**

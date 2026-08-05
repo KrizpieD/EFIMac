@@ -5,6 +5,7 @@
 #include "cpu/translation.h"
 #include "memory/manager.h"
 #include "hardware/abstraction.h"
+#include "fs/hfs.h"
 #include "platform/uefi_interface.h"
 
 // Bootloader context structure with more complete implementation
@@ -29,6 +30,7 @@ typedef struct {
     // Phase 5: system files and drivers (classic Mac OS System Folder)
     BOOLEAN SystemFolderScanned;
     BOOLEAN SystemFolderFound;
+    BOOLEAN SystemFolderFromHfs;
     CHAR16  SystemFolderPath[PPC_SYSTEM_FOLDER_PATH_MAX];
     BOOLEAN SystemPresent;
     BOOLEAN FinderPresent;
@@ -499,6 +501,58 @@ BootStageFile (
     return EFI_SUCCESS;
 }
 
+// Stage a single file from the mounted HFS volume into a guest staging area.
+// Mirrors BootStageFile but reads the data fork through the in-emulator HFS
+// reader (PpcHfsReadFile) instead of the FAT boot volume.
+STATIC EFI_STATUS
+BootStageHfsFile (
+    IN  PPC_HFS_ENTRY*     Entry,
+    IN  CHAR16*            ReportPath,
+    IN  PPC_SYSTEM_FILE_TYPE Type,
+    IN  UINT64             AreaGuestBase,
+    IN  UINTN              AreaSize,
+    IN  VOID*              AreaHost,
+    IN  UINT64*            Cursor,
+    OUT PPC_SYSTEM_FILE*   OutFile,
+    OUT VOID**             OutHost
+    )
+{
+    if (Entry == NULL || Entry->IsDirectory || Entry->Size == 0) {
+        return EFI_NOT_FOUND;
+    }
+
+    UINTN FileSize = (UINTN)Entry->Size;
+    UINTN Aligned = (FileSize + 0xF) & ~0xF;
+    if ((UINT64)(*Cursor - AreaGuestBase) + Aligned > AreaSize) {
+        Print(L"Staging area full for '%s'\n", ReportPath);
+        return EFI_OUT_OF_RESOURCES;
+    }
+
+    UINTN Offset = (UINTN)(*Cursor - AreaGuestBase);
+    UINTN Got = FileSize;
+    EFI_STATUS Status = PpcHfsReadFile(Entry, (UINT8*)AreaHost + Offset, &Got);
+    if (EFI_ERROR(Status) || Got != FileSize) {
+        return EFI_ERROR(Status) ? Status : EFI_LOAD_ERROR;
+    }
+    ZeroMem((UINT8*)AreaHost + Offset + FileSize, Aligned - FileSize);
+
+    OutFile->Type = Type;
+    OutFile->Loaded = TRUE;
+    OutFile->FileSize = FileSize;
+    OutFile->GuestAddress = *Cursor;
+    OutFile->StagedSize = Aligned;
+    BootCopyString(OutFile->Path, ReportPath, PPC_SYSTEM_FILE_PATH_MAX);
+    BootCopyString(OutFile->Name, Entry->Name, PPC_SYSTEM_FILE_NAME_MAX);
+
+    if (OutHost != NULL) {
+        *OutHost = (UINT8*)AreaHost + Offset;
+    }
+    *Cursor += Aligned;
+    g_BootContext.TotalStagedBytes += FileSize;
+
+    return EFI_SUCCESS;
+}
+
 // Enumerate the Extensions folder and register every file as a driver.
 STATIC EFI_STATUS
 BootEnumerateExtensions (
@@ -587,6 +641,68 @@ BootEnumerateExtensions (
 
     g_BootContext.DriverCount = Count;
     Print(L"Extensions scanned: %d driver(s) found\n", Count);
+    return EFI_SUCCESS;
+}
+
+// Enumerate the Extensions folder on the attached Mac OS disc (in-emulator
+// HFS/HFS+ reader) and register every file as a driver. Mirrors
+// BootEnumerateExtensions, which reads the FAT boot volume instead.
+STATIC EFI_STATUS
+BootEnumerateExtensionsHfs (
+    VOID
+    )
+{
+    PPC_HFS_ENTRY ExtDir;
+    EFI_STATUS Status = PpcHfsOpenPath(PPC_HFS_SYSTEM_FOLDER_PATH L":Extensions", &ExtDir);
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+    if (!ExtDir.IsDirectory) {
+        return EFI_NOT_FOUND;
+    }
+
+    PPC_HFS_ENTRY* Children = AllocatePool(PPC_MAX_DRIVERS * sizeof(PPC_HFS_ENTRY));
+    if (Children == NULL) {
+        return EFI_OUT_OF_RESOURCES;
+    }
+    UINTN Count = PPC_MAX_DRIVERS;
+    Status = PpcHfsListChildren(ExtDir.Id, Children, &Count);
+    if (EFI_ERROR(Status) && Status != EFI_BUFFER_TOO_SMALL) {
+        FreePool(Children);
+        return Status;
+    }
+
+    UINTN Registered = 0;
+    for (UINTN I = 0; I < Count; I++) {
+        if (Children[I].IsDirectory) {
+            continue;
+        }
+        if (BootStriCmp(Children[I].Name, L"Mac OS ROM") == 0) {
+            continue;   // handled by the ROM loader
+        }
+        if (Registered >= PPC_MAX_DRIVERS) {
+            break;
+        }
+        PPC_SYSTEM_FILE* D = &g_BootContext.Drivers[Registered];
+        ZeroMem(D, sizeof(PPC_SYSTEM_FILE));
+        D->Type = PPC_SYSTEM_FILE_TYPE_DRIVER;
+        D->Loaded = FALSE;
+        D->FileSize = Children[I].Size;
+        BootCopyString(D->Name, Children[I].Name, PPC_SYSTEM_FILE_NAME_MAX);
+        BootCopyString(D->Path, PPC_HFS_SYSTEM_FOLDER_PATH L":Extensions:",
+                       PPC_SYSTEM_FILE_PATH_MAX);
+        UINTN Off = 0;
+        while (Off + 1 < PPC_SYSTEM_FILE_PATH_MAX && D->Path[Off] != 0) { Off++; }
+        for (UINTN K = 0; Off + 1 < PPC_SYSTEM_FILE_PATH_MAX && Children[I].Name[K] != 0; K++) {
+            D->Path[Off++] = Children[I].Name[K];
+        }
+        D->Path[Off] = 0;
+        Registered++;
+    }
+
+    FreePool(Children);
+    g_BootContext.DriverCount = Registered;
+    Print(L"Extensions scanned (HFS): %d driver(s) found\n", Registered);
     return EFI_SUCCESS;
 }
 
@@ -906,6 +1022,62 @@ PpcLoadSystemRom (
     return EFI_SUCCESS;
 }
 
+// Load the "Mac OS ROM" file from the System Folder of the attached Mac OS
+// disc (in-emulator HFS/HFS+ reader) into a page-aligned buffer. Used as a
+// fallback when the boot volume has no ROM file.
+STATIC EFI_STATUS
+BootLoadHfsRomToPages (
+    OUT VOID**  Buffer,
+    OUT UINTN*  Size
+    )
+{
+    PPC_HFS_VOLUME_INFO HfsInfo;
+    EFI_STATUS Status = PpcHfsGetVolumeInfo(&HfsInfo);
+    if (EFI_ERROR(Status)) {
+        Status = PpcHfsMount(NULL);
+        if (EFI_ERROR(Status)) {
+            return Status;
+        }
+        Status = PpcHfsGetVolumeInfo(&HfsInfo);
+        if (EFI_ERROR(Status)) {
+            return Status;
+        }
+    }
+
+    PPC_HFS_ENTRY RomEntry;
+    Status = PpcHfsOpenPath(PPC_HFS_ROM_FILE_PATH, &RomEntry);
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+    if (RomEntry.IsDirectory || RomEntry.Size == 0) {
+        return EFI_NOT_FOUND;
+    }
+    if (RomEntry.Size > PPC_ROM_MAX_SIZE) {
+        Print(L"HFS Mac OS ROM too large: %d bytes\n", (UINT64)RomEntry.Size);
+        return EFI_LOAD_ERROR;
+    }
+
+    UINTN FileSize = (UINTN)RomEntry.Size;
+    UINTN Pages = (FileSize + EFI_PAGE_SIZE - 1) / EFI_PAGE_SIZE;
+    EFI_PHYSICAL_ADDRESS Base = 0;
+    Status = BS->AllocatePages(AllocateAnyPages, EfiBootServicesData, Pages, &Base);
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+    UINTN Got = FileSize;
+    Status = PpcHfsReadFile(&RomEntry, (VOID*)(UINTN)Base, &Got);
+    if (EFI_ERROR(Status) || Got != FileSize) {
+        BS->FreePages(Base, Pages);
+        return EFI_ERROR(Status) ? Status : EFI_LOAD_ERROR;
+    }
+
+    *Buffer = (VOID*)(UINTN)Base;
+    *Size = FileSize;
+    Print(L"System ROM loaded from HFS volume '%s': %d bytes\n",
+          HfsInfo.VolumeName, (UINT64)FileSize);
+    return EFI_SUCCESS;
+}
+
 EFI_STATUS
 PpcInstallSystemRom (
     IN  CHAR16* RomPath,
@@ -925,7 +1097,20 @@ PpcInstallSystemRom (
 
     Status = PpcLoadSystemRom(RomPath, &Buffer, &Size);
     if (EFI_ERROR(Status)) {
-        return Status;
+        // No ROM file on the boot volume: try the "Mac OS ROM" file on the
+        // attached Mac OS disc through the in-emulator HFS reader.
+        if (Status == EFI_NOT_FOUND) {
+            VOID*  HfsRom = NULL;
+            UINTN  HfsRomSize = 0;
+            Status = BootLoadHfsRomToPages(&HfsRom, &HfsRomSize);
+            if (!EFI_ERROR(Status)) {
+                Buffer = HfsRom;
+                Size = HfsRomSize;
+            }
+        }
+        if (EFI_ERROR(Status)) {
+            return Status;
+        }
     }
 
     // Map the ROM into the guest memory map as a read-only region.
@@ -1307,6 +1492,53 @@ BootFillSystemFolderInfo (
     Info->DriverAreaBase = g_BootContext.DriverAreaInstalled ? PPC_DRIVER_AREA_GUEST_BASE : 0;
 }
 
+// Fall back to the attached Mac OS disc when the boot volume has no System
+// Folder: mount the disc's HFS/HFS+ volume (via the in-emulator reader) and
+// record the presence of System / Finder / Extensions / Mac OS ROM.
+STATIC VOID
+BootLocateSystemFolderHfs (
+    VOID
+    )
+{
+    PPC_HFS_VOLUME_INFO HfsInfo;
+    EFI_STATUS Status = PpcHfsGetVolumeInfo(&HfsInfo);
+    if (EFI_ERROR(Status)) {
+        Status = PpcHfsMount(NULL);
+        if (EFI_ERROR(Status)) {
+            return;
+        }
+    }
+
+    BOOLEAN Folder = FALSE;
+    BOOLEAN Sys = FALSE;
+    BOOLEAN Finder = FALSE;
+    BOOLEAN Rom = FALSE;
+    UINT32  FolderId = 0;
+    Status = PpcHfsProbeBootFiles(&Folder, &Sys, &Finder, &Rom, &FolderId);
+    if (EFI_ERROR(Status) || !Folder || !Sys) {
+        return;
+    }
+
+    BOOLEAN Extensions = FALSE;
+    PPC_HFS_ENTRY Ext;
+    if (!EFI_ERROR(PpcHfsOpenPath(PPC_HFS_SYSTEM_FOLDER_PATH L":Extensions", &Ext)) &&
+        Ext.IsDirectory) {
+        Extensions = TRUE;
+    }
+
+    g_BootContext.SystemFolderFound = TRUE;
+    g_BootContext.SystemFolderFromHfs = TRUE;
+    g_BootContext.SystemPresent = Sys;
+    g_BootContext.FinderPresent = Finder;
+    g_BootContext.ExtensionsPresent = Extensions;
+    g_BootContext.MacOsRomPresent = Rom;
+    BootCopyString(g_BootContext.SystemFolderPath, L":System Folder",
+                   PPC_SYSTEM_FOLDER_PATH_MAX);
+    Print(L"System Folder found on HFS volume '%s': System=%d Finder=%d "
+          L"Extensions=%d MacOSROM=%d (DirID %d)\n",
+          HfsInfo.VolumeName, Sys, Finder, Extensions, Rom, FolderId);
+}
+
 EFI_STATUS
 PpcLocateSystemFolder (
     OUT PPC_SYSTEM_FOLDER_INFO* Info
@@ -1336,6 +1568,12 @@ PpcLocateSystemFolder (
               g_BootContext.FinderPresent,
               g_BootContext.ExtensionsPresent,
               g_BootContext.MacOsRomPresent);
+
+        // The boot volume (FAT ESP) has no System Folder: try the attached Mac
+        // OS disc through the in-emulator HFS/HFS+ reader.
+        if (!g_BootContext.SystemFolderFound) {
+            BootLocateSystemFolderHfs();
+        }
     }
 
     if (Info != NULL) {
@@ -1363,6 +1601,54 @@ PpcLoadSystemFiles (
     Status = BootEnsureSystemArea();
     if (EFI_ERROR(Status)) {
         return Status;
+    }
+
+    // System Folder on the attached Mac OS disc: stage System / Finder /
+    // Mac OS ROM through the in-emulator HFS reader.
+    if (g_BootContext.SystemFolderFromHfs) {
+        struct {
+            CHAR16*         Path;
+            CHAR16*         Report;
+            PPC_SYSTEM_FILE_TYPE Type;
+        } BootFiles[3] = {
+            { PPC_HFS_SYSTEM_FILE_PATH, L":System Folder:System", PPC_SYSTEM_FILE_TYPE_SYSTEM },
+            { PPC_HFS_FINDER_FILE_PATH, L":System Folder:Finder", PPC_SYSTEM_FILE_TYPE_FINDER },
+            { PPC_HFS_ROM_FILE_PATH,    L":System Folder:Extensions:Mac OS ROM", PPC_SYSTEM_FILE_TYPE_ROM },
+        };
+        for (UINTN I = 0; I < 3; I++) {
+            BOOLEAN Present;
+            switch (BootFiles[I].Type) {
+            case PPC_SYSTEM_FILE_TYPE_SYSTEM: Present = g_BootContext.SystemPresent; break;
+            case PPC_SYSTEM_FILE_TYPE_FINDER: Present = g_BootContext.FinderPresent; break;
+            default:                          Present = g_BootContext.MacOsRomPresent; break;
+            }
+            if (!Present) {
+                continue;
+            }
+            PPC_HFS_ENTRY E;
+            Status = PpcHfsOpenPath(BootFiles[I].Path, &E);
+            if (EFI_ERROR(Status) || E.IsDirectory) {
+                Print(L"Failed to resolve HFS '%s': %r\n", BootFiles[I].Path, Status);
+                continue;
+            }
+            F = &g_BootContext.SystemFiles[g_BootContext.SystemFileCount];
+            Status = BootStageHfsFile(&E, BootFiles[I].Report, BootFiles[I].Type,
+                                      PPC_SYSTEM_AREA_GUEST_BASE, PPC_SYSTEM_AREA_SIZE,
+                                      g_BootContext.SystemAreaHost,
+                                      &g_BootContext.SystemAreaCursor, F, &Host);
+            if (!EFI_ERROR(Status)) {
+                g_BootContext.SystemFileHosts[g_BootContext.SystemFileCount] = Host;
+                g_BootContext.SystemFileCount++;
+                g_BootContext.LoadedSystemFileCount++;
+                Print(L"Staged %s: '%s' -> guest 0x%x (%d bytes)\n",
+                      F->Type == PPC_SYSTEM_FILE_TYPE_SYSTEM ? L"System file" :
+                      F->Type == PPC_SYSTEM_FILE_TYPE_FINDER ? L"Finder" : L"Mac OS ROM file",
+                      F->Name, (UINT64)F->GuestAddress, (UINT64)F->FileSize);
+            } else {
+                Print(L"Failed to stage %s: %r\n", BootFiles[I].Report, Status);
+            }
+        }
+        return (g_BootContext.LoadedSystemFileCount > 0) ? EFI_SUCCESS : EFI_NOT_FOUND;
     }
 
     if (g_BootContext.SystemPresent) {
@@ -1427,6 +1713,9 @@ PpcScanExtensionsDirectory (
     if (!g_BootContext.SystemFolderFound) {
         return EFI_NOT_FOUND;
     }
+    if (g_BootContext.SystemFolderFromHfs) {
+        return BootEnumerateExtensionsHfs();
+    }
     return BootEnumerateExtensions();
 }
 
@@ -1454,10 +1743,23 @@ PpcLoadDrivers (
     for (I = 0; I < g_BootContext.DriverCount; I++) {
         PPC_SYSTEM_FILE* D = &g_BootContext.Drivers[I];
         VOID* Host = NULL;
-        Status = BootStageFile(D->Path, PPC_SYSTEM_FILE_TYPE_DRIVER,
-                               PPC_DRIVER_AREA_GUEST_BASE, PPC_DRIVER_AREA_SIZE,
-                               g_BootContext.DriverAreaHost, &g_BootContext.DriverAreaCursor,
-                               D, &Host);
+        if (g_BootContext.SystemFolderFromHfs) {
+            PPC_HFS_ENTRY E;
+            Status = PpcHfsOpenPath(D->Path, &E);
+            if (EFI_ERROR(Status) || E.IsDirectory) {
+                Print(L"  Failed to resolve driver '%s': %r\n", D->Name, Status);
+                continue;
+            }
+            Status = BootStageHfsFile(&E, D->Path, PPC_SYSTEM_FILE_TYPE_DRIVER,
+                                      PPC_DRIVER_AREA_GUEST_BASE, PPC_DRIVER_AREA_SIZE,
+                                      g_BootContext.DriverAreaHost,
+                                      &g_BootContext.DriverAreaCursor, D, &Host);
+        } else {
+            Status = BootStageFile(D->Path, PPC_SYSTEM_FILE_TYPE_DRIVER,
+                                   PPC_DRIVER_AREA_GUEST_BASE, PPC_DRIVER_AREA_SIZE,
+                                   g_BootContext.DriverAreaHost, &g_BootContext.DriverAreaCursor,
+                                   D, &Host);
+        }
         if (!EFI_ERROR(Status)) {
             g_BootContext.DriverHosts[I] = Host;
             Loaded++;

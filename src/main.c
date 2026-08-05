@@ -9,6 +9,7 @@ UINT32 _fltused = 0;
 #include "memory/manager.h"
 #include "hardware/abstraction.h"
 #include "boot/bootloader.h"
+#include "fs/hfs.h"
 #include "utils/debug.h"
 #include "platform/uefi_interface.h"
 
@@ -395,6 +396,10 @@ efi_main (
   } else {
     Print(L"Block I/O self-check: SKIP (%r)\n", Status);
   }
+
+  // HFS self-test: mount the attached Mac OS disc (raw HFS/HFS+ block device)
+  // and verify catalog parsing + System file readback through Block I/O.
+  PpcHfsRunSelfTest();
   
   // Initialize network subsystem
   Status = PpcInitializeNetwork(1);
