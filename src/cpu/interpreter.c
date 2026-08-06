@@ -2240,6 +2240,9 @@ PpcRunGuest (
     static UINT32 TraceDumped = 0;
     static UINT32 StoreProbed = 0;
     static UINT32 AllocTraced = 0;
+    static UINT32 FlushProbed = 0;
+    static UINT32 HelperDumped = 0;
+    static UINT32 SccPollTraced = 0;
 
     if (ExecutedCount == NULL) {
         return EFI_INVALID_PARAMETER;
@@ -2315,6 +2318,45 @@ PpcRunGuest (
                   AllocTraced, R, g_PpcContext.Lr, CpuRead32(R1 - 0xAB0 + 8),
                   CpuRead32(R - 4), CpuRead32(R - 8));
             AllocTraced++;
+        }
+        // Banner CR/LF flush-tail diagnostics. The guest spins at the SCC
+        // Tx-empty poll (PC=0x40B26500, LBZ 2(r28) / ANDI. bit 2) because the
+        // SCC base register r28 is 0, so the poll reads guest 0x2 instead of
+        // the SCC at 0x20002. Log r28 around the flush helper call (bl at
+        // 0x40B264D8 to 0x40B28A98) to see whether the helper zeroes r28 or
+        // whether the SCC base was never loaded (candidate: PSA NoIdeaR23 at
+        // [KDP-0x900], the SCC base `prints` reads via `lwz r28,-0x900(r1)`).
+        if (FlushProbed < 4 && (Current == 0x40B264D8 || Current == 0x40B264DC)) {
+            UINT32 Ewa = g_PpcContext.Spr[272];
+            UINT32 Kdp = CpuRead32(Ewa - 4);
+            Print(L"  FLUSHPROBE[%d] @0x%08x r28=0x%08x CR=0x%08x CTR=0x%08x LR=0x%08x\n",
+                  FlushProbed, Current, g_PpcContext.Gpr[28], g_PpcContext.Cr,
+                  g_PpcContext.Ctr, g_PpcContext.Lr);
+            if (Current == 0x40B264D8) {
+                Print(L"  FLUSHPROBE KDP=0x%08x NoIdeaR23[KDP-0x900]=0x%08x [KDP+0xedc]=0x%08x [KDP+0x648]=0x%08x [KDP+0x64c]=0x%08x\n",
+                      Kdp, CpuRead32(Kdp - 0x900), CpuRead32(Kdp + 0xedc),
+                      CpuRead32(Kdp + 0x648), CpuRead32(Kdp + 0x64c));
+            }
+            FlushProbed++;
+        }
+        // Dump the flush helper body once so we can see how it sets r28/CR.
+        if (HelperDumped == 0 && Current == 0x40B28A98) {
+            UINT32 A;
+            HelperDumped = 1;
+            Print(L"  FLUSHHELPER dump 0x40B28A74..0x40B28C00:\n");
+            for (A = 0x40B28A74; A < 0x40B28C00; A += 16) {
+                Print(L"    0x%08x: %08x %08x %08x %08x\n",
+                      A, CpuRead32(A), CpuRead32(A + 4), CpuRead32(A + 8), CpuRead32(A + 0xC));
+            }
+        }
+        // Log the SCC Tx-empty poll iterations: r29 is the value the LBZ at
+        // 0x40B264F8 just read from [r28+2], which must be the SCC status reg
+        // (0x20002). If addr != 0x20002 the poll will spin forever.
+        if (SccPollTraced < 30 && Current == 0x40B264FC) {
+            Print(L"  SCCPOLL[%d] after lbz r29,2(r28): r28=0x%08x addr=0x%08x value=0x%02x\n",
+                  SccPollTraced, g_PpcContext.Gpr[28], g_PpcContext.Gpr[28] + 2,
+                  g_PpcContext.Gpr[29]);
+            SccPollTraced++;
         }
         TailInst[TailStart] = Instr;
         TailPc[TailStart] = Current;
