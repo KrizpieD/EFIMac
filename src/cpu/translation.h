@@ -232,6 +232,24 @@ PpcExecuteBlock (
     );
 
 /**
+  Continuously execute guest code from the current PC, delivering pending
+  exceptions through the vector mechanism. Stops on the first unimplemented
+  opcode or execution error.
+  @param[in]  MaxInstructions  Maximum number of instructions to execute
+  @param[in]  LogUnsupported   Print the stopping instruction to the console
+  @param[out] ExecutedCount    Number of instructions actually executed
+  @retval EFI_SUCCESS          Budget exhausted (no error)
+  @retval EFI_UNSUPPORTED      An opcode the interpreter does not implement
+**/
+EFI_STATUS
+EFIAPI
+PpcRunGuest (
+    IN  UINT32  MaxInstructions,
+    IN  BOOLEAN LogUnsupported,
+    OUT UINTN*  ExecutedCount
+    );
+
+/**
   Run the CPU self-test suite
   @retval EFI_SUCCESS       All tests passed
   @retval EFI_LOAD_ERROR    One or more tests failed

@@ -21,7 +21,7 @@ PPC_CPU_CONTEXT g_PpcContext = {0};
 #define BF(w)      (((w) >> 23) & 0x7)
 #define SH(w)      (((w) >> 11) & 0x1F)
 #define MB(w)      (((w) >> 6) & 0x1F)
-#define ME(w)      ((w) & 0x1F)
+#define ME(w)      (((w) >> 1) & 0x1F)
 #define SIMM(w)    ((UINT32)(INT32)(INT16)((w) & 0xFFFF))
 #define UIMM(w)    ((w) & 0xFFFF)
 #define XO(w)      (((w) >> 1) & 0x3FE)      // 10-bit XO with OE bit masked out
@@ -30,11 +30,13 @@ PPC_CPU_CONTEXT g_PpcContext = {0};
 #define LK(w)      ((w) & 1)
 #define AA(w)      (((w) >> 1) & 1)
 #define SPR(w)     ((((w) >> 16) & 0x1F) | ((((w) >> 11) & 0x1F) << 5))
+// BD is a 14-bit signed field at word bits 16-29; the byte displacement is
+// sign_extend(BD) << 2.
 #define BD(w)      ((UINT32)(INT32)(INT16)((((w) >> 2) & 0x3FFF) << 2))
-// LI is a 24-bit signed field at word bits 2-25 (sign-extended)
-#define LI(w)      ((UINT32)((((w) >> 2) & 0x800000) ? \
-                             (((w) >> 2) | 0xFF000000) : \
-                             (((w) >> 2) & 0xFFFFFF)))
+// LI is a 24-bit signed field at word bits 6-29; the byte displacement is
+// sign_extend(LI) << 2.
+#define LI(w)      ((UINT32)(INT32)(((((w) >> 2) & 0x800000) ? \
+                     (((w) >> 2) | 0xFF000000) : (((w) >> 2) & 0xFFFFFF)) << 2))
 
 // Floating-point fields (opcodes 48-63). FRT/FRA/FRB occupy the same word
 // positions as their fixed-point counterparts; FRC is the third source of the
@@ -54,6 +56,7 @@ PPC_CPU_CONTEXT g_PpcContext = {0};
 #define XO_SUBFC       8
 #define XO_ADDC       10
 #define XO_MULHWU     11
+#define XO_MFCR       19
 #define XO_LWARX      20
 #define XO_LWZX       23
 #define XO_SLW        24
@@ -115,7 +118,8 @@ PPC_CPU_CONTEXT g_PpcContext = {0};
 #define XO_MFSR      595
 #define XO_LSWI      597
 #define XO_SYNC      598
-#define XO_MTSR      625
+#define XO_TLBSYNC   566
+#define XO_MTSR      210
 #define XO_MFSRIN    659
 #define XO_STSWX     661
 #define XO_STWBRX    662
@@ -134,6 +138,14 @@ PPC_CPU_CONTEXT g_PpcContext = {0};
 #define XO19_RFI      50
 #define XO19_ISYNC   150
 #define XO19_BCCTR   528
+#define XO19_CRNOR    33
+#define XO19_CRANDC  129
+#define XO19_CRXOR   193
+#define XO19_CRNAND  225
+#define XO19_CRAND   257
+#define XO19_CREQV   289
+#define XO19_CRORC   417
+#define XO19_CROR    449
 
 // X-form XO values for floating-point opcodes 59 (single) and 63 (double)
 #define XOFP_FCMPU      0
@@ -170,6 +182,8 @@ PPC_CPU_CONTEXT g_PpcContext = {0};
 #define SPR_XER    1
 #define SPR_LR     8
 #define SPR_CTR    9
+#define SPR_SRR0  26
+#define SPR_SRR1  27
 #define SPR_PVR  287
 
 // ---------------------------------------------------------------------------
@@ -197,6 +211,28 @@ typedef struct {
 // Guest memory map. Lookup is in insertion order; the first region that
 // contains an address wins.
 static PPC_GUEST_REGION g_GuestRegions[PPC_MAX_GUEST_REGIONS];
+static UINTN g_OutDevChars = 0;
+static BOOLEAN g_SccRxPending = FALSE;
+static UINT8 g_SccRxFifo[64];
+static UINTN g_SccRxFifoHead = 0;
+static UINTN g_SccRxFifoTail = 0;
+
+// Queue a byte on the NK's SCC receive side so a polled read eventually
+// returns it (bit 0 of the [0x20002] status read reports Rx data ready).
+VOID
+PpcSccPutChar (
+    IN UINT8 Char
+    )
+{
+    UINTN Next = (g_SccRxFifoHead + 1) % sizeof(g_SccRxFifo);
+    if (Next != g_SccRxFifoTail) {
+        g_SccRxFifo[g_SccRxFifoHead] = Char;
+        g_SccRxFifoHead = Next;
+    }
+    g_SccRxPending = TRUE;
+    Print(L"  [SCC] putchar 0x%02x (head=%d tail=%d pending=%d)\n",
+          Char, g_SccRxFifoHead, g_SccRxFifoTail, g_SccRxPending);
+}
 
 static UINT8
 PpcDefaultReadByte (
@@ -205,12 +241,44 @@ PpcDefaultReadByte (
 {
     UINTN I;
 
+    // NK output/input device = Zilog 8530 SCC at 0x20000. [base+2] is the
+    // control/status register (WR0 on read). Report Tx-buffer-empty (bit 2)
+    // so the boot printer's poll completes, and Rx-data-ready (bit 0) only
+    // when a byte has actually been queued on the input side. Never echo
+    // previously-written control bytes back here (they are not status).
+    if (Address == 0x00020002) {
+        static UINTN SccStatusReads = 0;
+        UINT8 R = 0x04 | (g_SccRxPending ? 0x01 : 0x00);
+        if ((SccStatusReads % 500000) == 0 || SccStatusReads < 10) {
+            Print(L"  [SCC] status@0x20002 -> 0x%02x (pending=%d head=%d tail=%d)\n",
+                  R, g_SccRxPending, g_SccRxFifoHead, g_SccRxFifoTail);
+        }
+        SccStatusReads++;
+        return R;
+    }
+    // [base+6] is the SCC data register (channel control lives at [base+2]).
+    // A read returns the queued Rx byte.
+    if (Address == 0x00020006) {
+        if (g_SccRxFifoHead != g_SccRxFifoTail) {
+            UINT8 C = g_SccRxFifo[g_SccRxFifoTail];
+            g_SccRxFifoTail = (g_SccRxFifoTail + 1) % sizeof(g_SccRxFifo);
+            g_SccRxPending = (g_SccRxFifoHead != g_SccRxFifoTail);
+            Print(L"  [SCC] data@0x20006 -> 0x%02x (head=%d tail=%d LR=0x%08x PC=0x%08x)\n",
+                  C, g_SccRxFifoHead, g_SccRxFifoTail, g_PpcContext.Lr, g_PpcContext.Pc);
+            return C;
+        }
+        g_SccRxPending = FALSE;
+        Print(L"  [SCC] data@0x20006 -> EMPTY\n");
+        return 0;
+    }
+
     for (I = 0; I < PPC_MAX_GUEST_REGIONS; I++) {
         if (g_GuestRegions[I].Active &&
             Address >= g_GuestRegions[I].GuestBase &&
             (UINT64)(Address - g_GuestRegions[I].GuestBase) < g_GuestRegions[I].Size) {
-            return *(volatile UINT8*)((UINTN)g_GuestRegions[I].HostBase +
-                                      (Address - g_GuestRegions[I].GuestBase));
+            UINT8 V = *(volatile UINT8*)((UINTN)g_GuestRegions[I].HostBase +
+                                         (Address - g_GuestRegions[I].GuestBase));
+            return V;
         }
     }
     return 0;  // Unmapped guest address reads as zero
@@ -228,6 +296,22 @@ PpcDefaultWriteByte (
         if (g_GuestRegions[I].Active &&
             Address >= g_GuestRegions[I].GuestBase &&
             (UINT64)(Address - g_GuestRegions[I].GuestBase) < g_GuestRegions[I].Size) {
+            if (Address == 0x00020006 && g_OutDevChars < 4096) {
+                g_OutDevChars++;
+                if (Value == 0x0D) {
+                    Print(L"\r\n");
+                } else if (Value == 0x0A) {
+                    // swallow (already translated \r\n)
+                } else if (Value >= 0x20 && Value <= 0x7E) {
+                    Print(L"%c", (UINTN)Value);
+                }
+            }
+            // SCC data register [base+6] and control register [base+2]:
+            // writes must not land in guest RAM (the 8530 never reads them
+            // back as status/data).
+            if (Address == 0x00020006 || Address == 0x00020002) {
+                return;
+            }
             if (!g_GuestRegions[I].ReadOnly) {
                 *(volatile UINT8*)((UINTN)g_GuestRegions[I].HostBase +
                                    (Address - g_GuestRegions[I].GuestBase)) = Value;
@@ -1204,7 +1288,7 @@ PpcExecuteInstruction (
             g_PpcContext.Lr = CurrentAddress + 4;
         }
         if (PpcBranchTaken(BO(w), BI(w))) {
-            Next = AA(w) ? (UINT32)(INT32)(INT16)((w >> 2) & 0xFFFF) : CurrentAddress + BD(w);
+            Next = AA(w) ? BD(w) : CurrentAddress + BD(w);
         }
         break;
 
@@ -1240,6 +1324,11 @@ PpcExecuteInstruction (
             break;
 
         case XO19_RFI:  // rfi
+            if (CurrentAddress >= 0x40B10000 && CurrentAddress < 0x40B30000) {
+                Print(L"  DBG rfi @0x%08x: SRR0=0x%08x SRR1=0x%08x MSR=0x%08x -> PC=0x%08x\n",
+                      CurrentAddress, g_PpcContext.Srr0, g_PpcContext.Srr1,
+                      g_PpcContext.Msr, g_PpcContext.Srr0);
+            }
             g_PpcContext.Msr = g_PpcContext.Srr1;
             Next = g_PpcContext.Srr0;
             break;
@@ -1255,6 +1344,40 @@ PpcExecuteInstruction (
                 }
                 if (PpcBranchTaken(BO(w), BI(w))) {
                     Next = Target;
+                }
+            }
+            break;
+
+        case XO19_CRNOR:   // crnor
+        case XO19_CRANDC:  // crandc
+        case XO19_CRXOR:   // crxor
+        case XO19_CRNAND:  // crnand
+        case XO19_CRAND:   // crand
+        case XO19_CREQV:   // creqv
+        case XO19_CRORC:   // crorc
+        case XO19_CROR:    // cror / crmove / crclr
+            {
+                UINT32 BitT = (w >> 21) & 0x1F;  // BT
+                UINT32 BitA = (w >> 16) & 0x1F;  // BA
+                UINT32 BitB = (w >> 11) & 0x1F;  // BB
+                UINT32 A = (g_PpcContext.Cr >> (31 - BitA)) & 1;
+                UINT32 B = (g_PpcContext.Cr >> (31 - BitB)) & 1;
+                UINT32 R = 0;
+
+                switch (XO10(w)) {
+                case XO19_CRNOR:  R = !(A | B); break;
+                case XO19_CRANDC: R = A & !B;   break;
+                case XO19_CRXOR:  R = A ^ B;    break;
+                case XO19_CRNAND: R = !(A & B); break;
+                case XO19_CRAND:  R = A & B;    break;
+                case XO19_CREQV:  R = !(A ^ B); break;
+                case XO19_CRORC:  R = A | !B;   break;
+                default:          R = A | B;    break;  // XO19_CROR
+                }
+                if (R) {
+                    g_PpcContext.Cr |= (1U << (31 - BitT));
+                } else {
+                    g_PpcContext.Cr &= ~(1U << (31 - BitT));
                 }
             }
             break;
@@ -1532,6 +1655,24 @@ PpcExecuteInstruction (
             case XO_MULHWU:  // mulhwu / mulhwu.
                 g_PpcContext.Gpr[RT(w)] = (UINT32)(((UINT64)g_PpcContext.Gpr[RA(w)] * g_PpcContext.Gpr[RB(w)]) >> 32);
                 if (Rc(w)) PpcSetCr0FromResult(g_PpcContext.Gpr[RT(w)]);
+                break;
+
+            case XO_MFCR:  // mfcr / mfocrf
+                {
+                    UINT32 Fxm = (w >> 12) & 0xFF;
+                    UINT32 Value = g_PpcContext.Cr;
+                    if (Fxm != 0xFF) {
+                        UINT32 I, Field = 0;
+                        for (I = 0; I < 8; I++) {
+                            if (Fxm & (0x80 >> I)) {
+                                Field = (g_PpcContext.Cr >> (28 - I * 4)) & 0xF;
+                                break;
+                            }
+                        }
+                        Value = Field * 0x11111111;
+                    }
+                    g_PpcContext.Gpr[RT(w)] = Value;
+                }
                 break;
 
             case XO_LWARX:  // lwarx (no reservation tracking)
@@ -1824,6 +1965,8 @@ PpcExecuteInstruction (
                     case SPR_XER:  Value = g_PpcContext.Xer; break;
                     case SPR_LR:   Value = g_PpcContext.Lr; break;
                     case SPR_CTR:  Value = g_PpcContext.Ctr; break;
+                    case SPR_SRR0: Value = g_PpcContext.Srr0; break;
+                    case SPR_SRR1: Value = g_PpcContext.Srr1; break;
                     case SPR_PVR:  Value = 0x00010000; break;   // fabricated PVR
                     default:       Value = g_PpcContext.Spr[SprNum]; break;
                     }
@@ -1892,6 +2035,8 @@ PpcExecuteInstruction (
                     case SPR_XER:  g_PpcContext.Xer = Value; break;
                     case SPR_LR:   g_PpcContext.Lr = Value; break;
                     case SPR_CTR:  g_PpcContext.Ctr = Value; break;
+                    case SPR_SRR0: g_PpcContext.Srr0 = Value; break;
+                    case SPR_SRR1: g_PpcContext.Srr1 = Value; break;
                     default:       g_PpcContext.Spr[SprNum] = Value; break;
                     }
                 }
@@ -1943,7 +2088,7 @@ PpcExecuteInstruction (
                 break;
 
             case XO_MFSR:  // mfsr
-                g_PpcContext.Gpr[RT(w)] = g_PpcContext.Spr[(w >> 16) & 0xF];
+                g_PpcContext.Gpr[RT(w)] = g_PpcContext.Spr[(w >> 11) & 0xF];
                 break;
 
             case XO_LSWI:  // lswi
@@ -1953,8 +2098,11 @@ PpcExecuteInstruction (
             case XO_SYNC:  // sync (no-op)
                 break;
 
+            case XO_TLBSYNC:  // tlbsync (no-op; no TLB modelled)
+                break;
+
             case XO_MTSR:  // mtsr
-                g_PpcContext.Spr[(w >> 16) & 0xF] = g_PpcContext.Gpr[RS(w)];
+                g_PpcContext.Spr[(w >> 11) & 0xF] = g_PpcContext.Gpr[RS(w)];
                 break;
 
             case XO_MFSRIN:  // mfsrin
@@ -2066,6 +2214,405 @@ PpcExecuteBlock (
     return EFI_SUCCESS;
 }
 
+// Continuous guest execution harness. Runs up to MaxInstructions of real
+// guest code from the current PC, delivering pending exceptions through the
+// CPU vector mechanism so interrupt/syscall handlers run like on hardware.
+// Stops with the reported status on an unimplemented opcode (EFI_UNSUPPORTED)
+// or a memory/execution error; the guest PC is left at the stopping point.
+EFI_STATUS
+EFIAPI
+PpcRunGuest (
+    IN  UINT32  MaxInstructions,
+    IN  BOOLEAN LogUnsupported,
+    OUT UINTN*  ExecutedCount
+    )
+{
+    UINTN Executed = 0;
+    UINTN TailStart = 0;
+    UINTN TailCount = 0;
+    static UINT32 TailPc[4096];
+    static UINT32 TailInst[4096];
+    static UINT32 TailNext[4096];
+    static UINT32 TailR28[4096];
+    static UINT32 TailR8[4096];
+    static UINT32 TailR17[4096];
+    static UINT32 PcsDumped = 0;
+    static UINT32 TraceDumped = 0;
+    static UINT32 StoreProbed = 0;
+    static UINT32 AllocTraced = 0;
+
+    if (ExecutedCount == NULL) {
+        return EFI_INVALID_PARAMETER;
+    }
+
+    g_PpcContext.ExceptionPending = 0;
+
+    while (Executed < MaxInstructions) {
+        UINT32 Instr;
+        UINT32 Current;
+        UINT32 Next;
+        EFI_STATUS Status;
+
+        Instr = CpuRead32(g_PpcContext.Pc);
+        Current = g_PpcContext.Pc;
+        Status = PpcExecuteInstruction(Instr, Current, &Next);
+        Executed++;
+        if (Current == 0x40B126CC || Current == 0x40B107FC || Current == 0x40B10098) {
+            Print(L"  PROBE@0x%08x r1=0x%08x r3=0x%08x [r1+648]=0x%08x [0x648]=0x%08x [0xA648]=0x%08x [0xAFE4]=0x%04x [r1+5A0]=0x%08x [r1+5A4]=0x%08x [r1-964]=0x%08x [r1-20]=0x%08x\n",
+                  Current, g_PpcContext.Gpr[1], g_PpcContext.Gpr[3],
+                  CpuRead32(g_PpcContext.Gpr[1] + 0x648),
+                  CpuRead32(0x00000648), CpuRead32(0x0000A648),
+                  CpuRead16(0x0000AFE4),
+                  CpuRead32(g_PpcContext.Gpr[1] + 0x5A0),
+                  CpuRead32(g_PpcContext.Gpr[1] + 0x5A4),
+                  CpuRead32(g_PpcContext.Gpr[1] - 0x964),
+                  CpuRead32(g_PpcContext.Gpr[1] - 0x20));
+        }
+        if (StoreProbed == 0 && (Current == 0x40B11B64 || Current == 0x40B11B48)) {
+            UINT32 P = g_PpcContext.Gpr[1];
+            UINT32 T;
+            StoreProbed = 1;
+            Print(L"  STOREPROBE@0x%08x (before) r1=0x%08x r8=0x%08x r9=0x%08x r16=0x%08x r28=0x%08x r29=0x%08x r30=0x%08x r31=0x%08x\n",
+                  Current, P, g_PpcContext.Gpr[8], g_PpcContext.Gpr[9],
+                  g_PpcContext.Gpr[16], g_PpcContext.Gpr[28], g_PpcContext.Gpr[29],
+                  g_PpcContext.Gpr[30], g_PpcContext.Gpr[31]);
+            Print(L"  STOREPROBE PA_CurAS[r1-1C]=0x%08x PA_PSA[r1-18]=0x%08x PA_KDP[r1-4]=0x%08x\n",
+                  CpuRead32(P - 0x1C), CpuRead32(P - 0x18), CpuRead32(P - 0x04));
+            Print(L"  STOREPROBE PA_ConfigInfo[r1+648]=0x%08x [r1+64C]=0x%08x\n",
+                  CpuRead32(P + 0x648), CpuRead32(P + 0x64C));
+            Print(L"  STOREPROBE FreePool[r1-AB0]=0x%08x FirstSeg[r1-AA0]=0x%08x FirstSegLogi[r1-A9C]=0x%08x\n",
+                  CpuRead32(P - 0xAB0), CpuRead32(P - 0xAA0), CpuRead32(P - 0xA9C));
+            Print(L"  STOREPROBE mem@0x8C40:\n");
+            for (T = 0x8C40; T < 0x8D40; T += 16) {
+                Print(L"    0x%08x: %08x %08x %08x %08x\n",
+                      T, CpuRead32(T), CpuRead32(T + 4), CpuRead32(T + 8), CpuRead32(T + 0xC));
+            }
+        }
+        if (AllocTraced < 60 && Current == 0x40B22828) {
+            UINT32 R1 = g_PpcContext.Gpr[1];
+            Print(L"  ALLOCENTRY[%d] size=0x%08x r9=0x%08x LR=0x%08x FreeNext=0x%08x FreePageCnt=0x%08x FreeList=0x%08x\n",
+                  AllocTraced, g_PpcContext.Gpr[8], g_PpcContext.Gpr[9],
+                  g_PpcContext.Lr, CpuRead32(R1 - 0xAB0 + 8),
+                  CpuRead32(R1 - 0x430), CpuRead32(R1 - 0x448));
+        }
+        if (AllocTraced < 200 && Current == 0x40B228D8) {
+            UINT32 R1 = g_PpcContext.Gpr[1];
+            Print(L"  ALLOCWALK[%d] block=0x%08x blocksize=0x%08x req=0x%08x sig=0x%08x FreeNext=0x%08x\n",
+                  AllocTraced, g_PpcContext.Gpr[15], CpuRead32(g_PpcContext.Gpr[15]),
+                  g_PpcContext.Gpr[8], CpuRead32(g_PpcContext.Gpr[15] + 4),
+                  CpuRead32(R1 - 0xAB0 + 8));
+        }
+        if (AllocTraced < 1 && Current >= 0x40B22820 && Current <= 0x40B228E4) {
+            Print(L"  ALLOCSTEP[%d] PC=0x%08x next=0x%08x r8=0x%08x r15=0x%08x r16=0x%08x r17=0x%08x r18=0x%08x CR=0x%08x\n",
+                  AllocTraced, Current, Next, g_PpcContext.Gpr[8], g_PpcContext.Gpr[15],
+                  g_PpcContext.Gpr[16], g_PpcContext.Gpr[17], g_PpcContext.Gpr[18],
+                  g_PpcContext.Cr);
+        }
+        if (AllocTraced < 120 && Current == 0x40B229D4) {
+            UINT32 R1 = g_PpcContext.Gpr[1];
+            UINT32 R = g_PpcContext.Gpr[8];
+            Print(L"  ALLOCRET[%d] ret=0x%08x LR=0x%08x FreeHead=0x%08x sig=0x%08x offnext=0x%08x\n",
+                  AllocTraced, R, g_PpcContext.Lr, CpuRead32(R1 - 0xAB0 + 8),
+                  CpuRead32(R - 4), CpuRead32(R - 8));
+            AllocTraced++;
+        }
+        TailInst[TailStart] = Instr;
+        TailPc[TailStart] = Current;
+        TailNext[TailStart] = Next;
+        TailR28[TailStart] = g_PpcContext.Gpr[28];
+        TailR8[TailStart] = g_PpcContext.Gpr[8];
+        TailR17[TailStart] = g_PpcContext.Gpr[17];
+        TailStart = (TailStart + 1) % 4096;
+        if (TailCount < 4096) TailCount++;
+        if ((Executed % 250000) == 0) {
+            Print(L"  PROGRESS[%d] PC=0x%08x LR=0x%08x r1=0x%08x r8=0x%08x r28=0x%08x SPRG4=0x%08x\n",
+                  Executed, Current, g_PpcContext.Lr, g_PpcContext.Gpr[1],
+                  g_PpcContext.Gpr[8], g_PpcContext.Gpr[28], g_PpcContext.Spr[272]);
+        }
+        if (PcsDumped == 0 && (Current == 0x40B2751C || Current == 0x40B27530 || Current == 0x40B27540)) {
+            UINT32 Ewa = g_PpcContext.Spr[272];
+            UINT32 Kdp = CpuRead32(Ewa - 4);
+            PcsDumped = 1;
+            Print(L"  PANICDUMP EWA=0x%08x KDP=0x%08x [EWA-4]=0x%08x\n", Ewa, Kdp, CpuRead32(Ewa - 4));
+            Print(L"  PANICDUMP saved r0-r11: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                  CpuRead32(Kdp+0x700), CpuRead32(Kdp+0x704), CpuRead32(Kdp+0x708),
+                  CpuRead32(Kdp+0x70c), CpuRead32(Kdp+0x710), CpuRead32(Kdp+0x714),
+                  CpuRead32(Kdp+0x718), CpuRead32(Kdp+0x71c), CpuRead32(Kdp+0x720),
+                  CpuRead32(Kdp+0x724), CpuRead32(Kdp+0x728), CpuRead32(Kdp+0x72c));
+            Print(L"  PANICDUMP saved r12-r23: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                  CpuRead32(Kdp+0x730), CpuRead32(Kdp+0x734), CpuRead32(Kdp+0x738),
+                  CpuRead32(Kdp+0x73c), CpuRead32(Kdp+0x740), CpuRead32(Kdp+0x744),
+                  CpuRead32(Kdp+0x748), CpuRead32(Kdp+0x74c), CpuRead32(Kdp+0x750),
+                  CpuRead32(Kdp+0x754), CpuRead32(Kdp+0x758), CpuRead32(Kdp+0x75c));
+            Print(L"  PANICDUMP saved r24-r31: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                  CpuRead32(Kdp+0x760), CpuRead32(Kdp+0x764), CpuRead32(Kdp+0x768),
+                  CpuRead32(Kdp+0x76c), CpuRead32(Kdp+0x770), CpuRead32(Kdp+0x774),
+                  CpuRead32(Kdp+0x778), CpuRead32(Kdp+0x77c));
+            Print(L"  PANICDUMP CR=0x%08x XER=0x%08x CTR=0x%08x LR=0x%08x PVR=0x%08x DSISR=0x%08x DAR=0x%08x\n",
+                  CpuRead32(Kdp+0x780), CpuRead32(Kdp+0x788), CpuRead32(Kdp+0x790),
+                  CpuRead32(Kdp+0x78c), CpuRead32(Kdp+0x794), CpuRead32(Kdp+0x798),
+                  CpuRead32(Kdp+0x79c));
+            Print(L"  PANICDUMP TBU=0x%08x TBL=0x%08x DEC=0x%08x SDR1=0x%08x SRR0=0x%08x SRR1=0x%08x MSR=0x%08x\n",
+                  CpuRead32(Kdp+0x7a0), CpuRead32(Kdp+0x7a4), CpuRead32(Kdp+0x7a8),
+                  CpuRead32(Kdp+0x7b0), CpuRead32(Kdp+0x7b4), CpuRead32(Kdp+0x7b8),
+                  CpuRead32(Kdp+0x7bc));
+            Print(L"  PANICDUMP TerminationCaller[KDP+0x904]=0x%08x [KDP+0x900]=0x%08x [KDP+0x908]=0x%08x\n",
+                  CpuRead32(Kdp+0x904), CpuRead32(Kdp+0x900), CpuRead32(Kdp+0x908));
+            Print(L"  PANICDUMP NoIdeaR23[KDP-0x900]=0x%08x OldKDP[KDP+0x5a0]=0x%08x [KDP+0x5a4]=0x%08x [KDP+0x648]=0x%08x [KDP+0x64c]=0x%08x\n",
+                  CpuRead32(Kdp-0x900), CpuRead32(Kdp+0x5a0), CpuRead32(Kdp+0x5a4),
+                  CpuRead32(Kdp+0x648), CpuRead32(Kdp+0x64c));
+            Print(L"  PANICDUMP pool FreePool[KDP-0xAB0]=0x%08x FirstSeg[KDP-0xAA0]=0x%08x FirstSegLogi[KDP-0xA9C]=0x%08x\n",
+                  CpuRead32(Kdp-0xAB0), CpuRead32(Kdp-0xAA0), CpuRead32(Kdp-0xA9C));
+            Print(L"  PANICPOOL FreePool LLL @0x9548:\n");
+            {
+                UINT32 A;
+                for (A = 0x9548; A < 0x9568; A += 16) {
+                    Print(L"    0x%08x: %08x %08x %08x %08x\n",
+                          A, CpuRead32(A), CpuRead32(A + 4), CpuRead32(A + 8), CpuRead32(A + 0xC));
+                }
+            }
+            Print(L"  PANICPOOL first segment begin @0x2FE0:\n");
+            {
+                UINT32 A;
+                for (A = 0x2FE0; A < 0x3050; A += 16) {
+                    Print(L"    0x%08x: %08x %08x %08x %08x\n",
+                          A, CpuRead32(A), CpuRead32(A + 4), CpuRead32(A + 8), CpuRead32(A + 0xC));
+                }
+            }
+            Print(L"  PANICPOOL first segment end @0x9FC0..0xA010:\n");
+            {
+                UINT32 A;
+                for (A = 0x9FC0; A < 0xA010; A += 16) {
+                    Print(L"    0x%08x: %08x %08x %08x %08x\n",
+                          A, CpuRead32(A), CpuRead32(A + 4), CpuRead32(A + 8), CpuRead32(A + 0xC));
+                }
+            }
+            Print(L"  PANICPOOL cgrp block @0x8C40..0x8CB8:\n");
+            {
+                UINT32 A;
+                for (A = 0x8C40; A < 0x8CB8; A += 16) {
+                    Print(L"    0x%08x: %08x %08x %08x %08x\n",
+                          A, CpuRead32(A), CpuRead32(A + 4), CpuRead32(A + 8), CpuRead32(A + 0xC));
+                }
+            }
+            Print(L"  PANICDUMP mem@0x8C00..0x8D00:\n");
+            {
+                UINT32 T;
+                for (T = 0x8C00; T < 0x8D00; T += 16) {
+                    Print(L"    0x%08x: %08x %08x %08x %08x\n",
+                          T, CpuRead32(T), CpuRead32(T + 4), CpuRead32(T + 8), CpuRead32(T + 0xC));
+                }
+            }
+            Print(L"  PANICROM (NKCreateAddressSpaceSub region):\n");
+            {
+                UINT32 A;
+                for (A = 0x40B1F000; A < 0x40B1FC00; A += 16) {
+                    Print(L"  ROM[0x%08x] %08x %08x %08x %08x\n",
+                          A, CpuRead32(A), CpuRead32(A + 4),
+                          CpuRead32(A + 8), CpuRead32(A + 12));
+                }
+            }
+            Print(L"  PANICROM (InitPool region 0x40B10F00):\n");
+            {
+                UINT32 A;
+                for (A = 0x40B10F00; A < 0x40B11200; A += 16) {
+                    Print(L"  ROM[0x%08x] %08x %08x %08x %08x\n",
+                          A, CpuRead32(A), CpuRead32(A + 4),
+                          CpuRead32(A + 8), CpuRead32(A + 12));
+                }
+            }
+            Print(L"  PANICROM (PoolAllocClear/InitPool region 0x40B22600):\n");
+            {
+                UINT32 A;
+                for (A = 0x40B22600; A < 0x40B22A00; A += 16) {
+                    Print(L"  ROM[0x%08x] %08x %08x %08x %08x\n",
+                          A, CpuRead32(A), CpuRead32(A + 4),
+                          CpuRead32(A + 8), CpuRead32(A + 12));
+                }
+            }
+            Print(L"  PANICROM (system-AS creation 0x40B11B00):\n");
+            {
+                UINT32 A;
+                for (A = 0x40B11B00; A < 0x40B11E60; A += 16) {
+                    Print(L"  ROM[0x%08x] %08x %08x %08x %08x\n",
+                          A, CpuRead32(A), CpuRead32(A + 4),
+                          CpuRead32(A + 8), CpuRead32(A + 12));
+                }
+            }
+            Print(L"  PANICDUMP live r1=0x%08x r8=0x%08x r28=0x%08x r29=0x%08x r30=0x%08x r31=0x%08x LR=0x%08x\n",
+                  g_PpcContext.Gpr[1], g_PpcContext.Gpr[8], g_PpcContext.Gpr[28],
+                  g_PpcContext.Gpr[29], g_PpcContext.Gpr[30], g_PpcContext.Gpr[31],
+                  g_PpcContext.Lr);
+            Print(L"  PANICROM (message + dead-loop region 0x40B10600):\n");
+            {
+                UINT32 A;
+                for (A = 0x40B10600; A < 0x40B10900; A += 16) {
+                    Print(L"  ROM[0x%08x] %08x %08x %08x %08x\n",
+                          A, CpuRead32(A), CpuRead32(A + 4),
+                          CpuRead32(A + 8), CpuRead32(A + 12));
+                }
+            }
+            Print(L"  PANICROM (panic handler region 0x40B26300):\n");
+            {
+                UINT32 A;
+                for (A = 0x40B26300; A < 0x40B27600; A += 16) {
+                    Print(L"  ROM[0x%08x] %08x %08x %08x %08x\n",
+                          A, CpuRead32(A), CpuRead32(A + 4),
+                          CpuRead32(A + 8), CpuRead32(A + 12));
+                }
+            }
+        }
+        if (TraceDumped == 0 && (Current == 0x40B272E0 || Current == 0x40B272E8 || Current == 0x40B272EC)) {
+            UINTN I;
+            UINTN N = (TailCount < 1500) ? TailCount : 1500;
+            CHAR16 Mn[16];
+            TraceDumped = 1;
+            Print(L"--- last %d instructions before panic entry ---\n", N);
+            for (I = 0; I < N; I++) {
+                UINTN Idx = (TailStart + TailCount - 1 - I) % 4096;
+                PpcDecodeInstruction(TailInst[Idx], Mn, sizeof(Mn));
+                Print(L"  PRE[-%d] PC=0x%08x 0x%08x %s -> 0x%08x r28=0x%08x r8=0x%08x r17=0x%08x\n",
+                      (UINTN)I + 1, TailPc[Idx], TailInst[Idx], Mn, TailNext[Idx],
+                      TailR28[Idx], TailR8[Idx], TailR17[Idx]);
+            }
+            Print(L"  PRE[0] PC=0x%08x LR=0x%08x r1=0x%08x r8=0x%08x r9=0x%08x r17=0x%08x r28=0x%08x\n",
+                  Current, g_PpcContext.Lr, g_PpcContext.Gpr[1], g_PpcContext.Gpr[8],
+                  g_PpcContext.Gpr[9], g_PpcContext.Gpr[17], g_PpcContext.Gpr[28]);
+        }
+        if (Executed <= 200) {
+            CHAR16 Mn[16];
+            PpcDecodeInstruction(Instr, Mn, sizeof(Mn));
+            Print(L"  TRACE[%d] PC=0x%08x 0x%08x %s -> next 0x%08x\n",
+                  Executed, Current, Instr, Mn, Next);
+        }
+
+        if (EFI_ERROR(Status)) {
+            if (LogUnsupported) {
+                UINTN I;
+                CHAR16 Mn[16];
+                Print(L"--- last %d instructions before stop ---\n", TailCount);
+                for (I = 0; I < TailCount; I++) {
+                    UINTN Idx = (TailStart + TailCount - 1 - I) % 4096;
+                    PpcDecodeInstruction(TailInst[Idx], Mn, sizeof(Mn));
+                    Print(L"  TRACE[-%d] PC=0x%08x 0x%08x %s -> 0x%08x r28=0x%08x r8=0x%08x\n",
+                          (UINTN)I + 1, TailPc[Idx], TailInst[Idx], Mn, TailNext[Idx],
+                          TailR28[Idx], TailR8[Idx]);
+                }
+                {
+                    CHAR16 StopMn[16];
+                    PpcDecodeInstruction(Instr, StopMn, sizeof(StopMn));
+                    Print(L"GUEST STOP at PC=0x%08x inst=0x%08x (%s): %r\n",
+                          g_PpcContext.Pc, Instr, StopMn, Status);
+                }
+                Print(L"  MSR=0x%08x CR=0x%08x LR=0x%08x CTR=0x%08x SRR0=0x%08x SRR1=0x%08x\n",
+                      g_PpcContext.Msr, g_PpcContext.Cr, g_PpcContext.Lr,
+                      g_PpcContext.Ctr, g_PpcContext.Srr0, g_PpcContext.Srr1);
+                Print(L"  GPR: r0=0x%08x r1=0x%08x r2=0x%08x r3=0x%08x r4=0x%08x r5=0x%08x r6=0x%08x r7=0x%08x\n",
+                      g_PpcContext.Gpr[0], g_PpcContext.Gpr[1], g_PpcContext.Gpr[2],
+                      g_PpcContext.Gpr[3], g_PpcContext.Gpr[4], g_PpcContext.Gpr[5],
+                      g_PpcContext.Gpr[6], g_PpcContext.Gpr[7]);
+                Print(L"  GPR: r8=0x%08x r9=0x%08x r10=0x%08x r11=0x%08x r12=0x%08x r13=0x%08x r14=0x%08x r15=0x%08x\n",
+                      g_PpcContext.Gpr[8], g_PpcContext.Gpr[9], g_PpcContext.Gpr[10],
+                      g_PpcContext.Gpr[11], g_PpcContext.Gpr[12], g_PpcContext.Gpr[13],
+                      g_PpcContext.Gpr[14], g_PpcContext.Gpr[15]);
+                Print(L"  GPR: r16=0x%08x r17=0x%08x r18=0x%08x r19=0x%08x r20=0x%08x r21=0x%08x r22=0x%08x r23=0x%08x\n",
+                      g_PpcContext.Gpr[16], g_PpcContext.Gpr[17], g_PpcContext.Gpr[18],
+                      g_PpcContext.Gpr[19], g_PpcContext.Gpr[20], g_PpcContext.Gpr[21],
+                      g_PpcContext.Gpr[22], g_PpcContext.Gpr[23]);
+                Print(L"  GPR: r24=0x%08x r25=0x%08x r26=0x%08x r27=0x%08x r28=0x%08x r29=0x%08x r30=0x%08x r31=0x%08x\n",
+                      g_PpcContext.Gpr[24], g_PpcContext.Gpr[25], g_PpcContext.Gpr[26],
+                      g_PpcContext.Gpr[27], g_PpcContext.Gpr[28], g_PpcContext.Gpr[29],
+                      g_PpcContext.Gpr[30], g_PpcContext.Gpr[31]);
+                Print(L"  SPR: XER=0x%08x SPRG4=0x%08x SPRG5=0x%08x SPRG6=0x%08x SPRG7=0x%08x\n",
+                      g_PpcContext.Xer, g_PpcContext.Spr[272], g_PpcContext.Spr[273],
+                      g_PpcContext.Spr[274], g_PpcContext.Spr[275]);
+                Print(L"  MEM[r8]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                      CpuRead32(g_PpcContext.Gpr[8] + 0x00),
+                      CpuRead32(g_PpcContext.Gpr[8] + 0x04),
+                      CpuRead32(g_PpcContext.Gpr[8] + 0x08),
+                      CpuRead32(g_PpcContext.Gpr[8] + 0x0C),
+                      CpuRead32(g_PpcContext.Gpr[8] + 0x10),
+                      CpuRead32(g_PpcContext.Gpr[8] + 0x14),
+                      CpuRead32(g_PpcContext.Gpr[8] + 0x18),
+                      CpuRead32(g_PpcContext.Gpr[8] + 0x1C));
+                Print(L"  MEM[r11]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                      CpuRead32(g_PpcContext.Gpr[11] + 0x00),
+                      CpuRead32(g_PpcContext.Gpr[11] + 0x04),
+                      CpuRead32(g_PpcContext.Gpr[11] + 0x08),
+                      CpuRead32(g_PpcContext.Gpr[11] + 0x0C),
+                      CpuRead32(g_PpcContext.Gpr[11] + 0x10),
+                      CpuRead32(g_PpcContext.Gpr[11] + 0x14),
+                      CpuRead32(g_PpcContext.Gpr[11] + 0x18),
+                      CpuRead32(g_PpcContext.Gpr[11] + 0x1C));
+                Print(L"  OUTBUF[r1-0x404]: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                      CpuRead32(g_PpcContext.Gpr[1] - 0x404 + 0x00),
+                      CpuRead32(g_PpcContext.Gpr[1] - 0x404 + 0x04),
+                      CpuRead32(g_PpcContext.Gpr[1] - 0x404 + 0x08),
+                      CpuRead32(g_PpcContext.Gpr[1] - 0x404 + 0x0C),
+                      CpuRead32(g_PpcContext.Gpr[1] - 0x404 + 0x10),
+                      CpuRead32(g_PpcContext.Gpr[1] - 0x404 + 0x14),
+                      CpuRead32(g_PpcContext.Gpr[1] - 0x404 + 0x18),
+                      CpuRead32(g_PpcContext.Gpr[1] - 0x404 + 0x1C));
+            }
+            *ExecutedCount = Executed;
+            return Status;
+        }
+
+        if (g_PpcContext.ExceptionPending != 0) {
+            UINT32 Pending = g_PpcContext.ExceptionPending;
+            g_PpcContext.ExceptionPending = 0;
+            Status = PpcHandleException(Pending, Current);
+            if (EFI_ERROR(Status)) {
+                *ExecutedCount = Executed;
+                return Status;
+            }
+            continue;
+        }
+
+        g_PpcContext.Pc = Next;
+    }
+
+    Print(L"  PROGRESS[END] PC=0x%08x LR=0x%08x r1=0x%08x r3=0x%08x r8=0x%08x r28=0x%08x SPRG4=0x%08x\n",
+          g_PpcContext.Pc, g_PpcContext.Lr, g_PpcContext.Gpr[1], g_PpcContext.Gpr[3],
+          g_PpcContext.Gpr[8], g_PpcContext.Gpr[28], g_PpcContext.Spr[272]);
+    Print(L"  MSR=0x%08x CR=0x%08x SRR0=0x%08x SRR1=0x%08x CTR=0x%08x XER=0x%08x\n",
+          g_PpcContext.Msr, g_PpcContext.Cr, g_PpcContext.Srr0, g_PpcContext.Srr1,
+          g_PpcContext.Ctr, g_PpcContext.Xer);
+    Print(L"  GPR: r8=0x%08x r9=0x%08x r16=0x%08x r17=0x%08x r18=0x%08x r26=0x%08x r27=0x%08x r28=0x%08x r29=0x%08x r30=0x%08x r31=0x%08x\n",
+          g_PpcContext.Gpr[8], g_PpcContext.Gpr[9], g_PpcContext.Gpr[16],
+          g_PpcContext.Gpr[17], g_PpcContext.Gpr[18], g_PpcContext.Gpr[26],
+          g_PpcContext.Gpr[27], g_PpcContext.Gpr[28], g_PpcContext.Gpr[29],
+          g_PpcContext.Gpr[30], g_PpcContext.Gpr[31]);
+    {
+        UINTN A, W;
+        UINT32 Loops[][2] = { { 0x40A00000u, 0x40A01000u }, { 0x40B10000u, 0x40B16000u },
+                              { 0x40B11B00u, 0x40B11E60u }, { 0x40B1F800u, 0x40B1FC00u },
+                              { 0x40B23F00u, 0x40B24400u }, { 0x40B26000u, 0x40B28000u },
+                              { 0x40B28700u, 0x40B28B00u } };
+        for (W = 0; W < 7; W++) {
+            for (A = Loops[W][0]; A < Loops[W][1]; A += 16) {
+                Print(L"  ROM[0x%08x] %08x %08x %08x %08x\n",
+                      A, CpuRead32(A), CpuRead32(A + 4),
+                      CpuRead32(A + 8), CpuRead32(A + 12));
+            }
+        }
+    }
+    if (LogUnsupported) {
+        UINTN I;
+        CHAR16 Mn[16];
+        Print(L"--- last %d instructions (budget stop) ---\n", TailCount);
+        for (I = 0; I < TailCount && I < 300; I++) {
+            UINTN Idx = (TailStart + TailCount - 1 - I) % 4096;
+            PpcDecodeInstruction(TailInst[Idx], Mn, sizeof(Mn));
+            Print(L"  TRACE[-%d] PC=0x%08x 0x%08x %s -> 0x%08x r28=0x%08x r8=0x%08x r17=0x%08x\n",
+                  (UINTN)I + 1, TailPc[Idx], TailInst[Idx], Mn, TailNext[Idx],
+                  TailR28[Idx], TailR8[Idx], TailR17[Idx]);
+        }
+    }
+    *ExecutedCount = Executed;
+    return EFI_SUCCESS;
+}
+
 // ---------------------------------------------------------------------------
 // Instruction decode to a short mnemonic
 // ---------------------------------------------------------------------------
@@ -2168,9 +2715,14 @@ PpcDecodeInstruction (
         case XO_XOR:       Name = L"xor";   break;
         case XO_NOR:       Name = L"nor";   break;
         case XO_CMP:       Name = L"cmp";   break;
-        case XO_CMPL:      Name = L"cmpl";  break;
+        case XO_MFCR:       Name = L"mfcr";  break;
+        case XO_CMPL:       Name = L"cmpl";  break;
         case XO_MFSPR:     Name = L"mfspr"; break;
         case XO_MTSPR:     Name = L"mtspr"; break;
+        case XO_MFSR:      Name = L"mfsr";  break;
+        case XO_MTSR:      Name = L"mtsr";  break;
+        case XO_MFSRIN:    Name = L"mfsrin";break;
+        case XO_MTSRIN:    Name = L"mtsrin";break;
         case XO_SLW:       Name = L"slw";   break;
         case XO_SRW:       Name = L"srw";   break;
         case XO_SRAW:      Name = L"sraw";  break;
@@ -2192,6 +2744,7 @@ PpcDecodeInstruction (
         case XO_STBX:      Name = L"stbx";  break;
         case XO_STHX:      Name = L"sthx";  break;
         case XO_SYNC:      Name = L"sync";  break;
+        case XO_TLBSYNC:   Name = L"tlbsync"; break;
         case XO_EIEIO:     Name = L"eieio"; break;
         default:           Name = L"X-op";  break;
         }
@@ -2202,6 +2755,14 @@ PpcDecodeInstruction (
         case XO19_RFI:     Name = L"rfi";   break;
         case XO19_ISYNC:   Name = L"isync"; break;
         case XO19_MCRF:    Name = L"mcrf";  break;
+        case XO19_CRNOR:   Name = L"crnor"; break;
+        case XO19_CRANDC:  Name = L"crandc";break;
+        case XO19_CRXOR:   Name = L"crxor"; break;
+        case XO19_CRNAND:  Name = L"crnand";break;
+        case XO19_CRAND:   Name = L"crand"; break;
+        case XO19_CREQV:   Name = L"creqv"; break;
+        case XO19_CRORC:   Name = L"crorc"; break;
+        case XO19_CROR:    Name = L"cror";  break;
         default:           Name = L"XL-op"; break;
         }
     }

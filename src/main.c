@@ -5,6 +5,7 @@
 UINT32 _fltused = 0;
 
 // Include all our module headers
+#include "cpu/interpreter.h"
 #include "cpu/translation.h"
 #include "memory/manager.h"
 #include "hardware/abstraction.h"
@@ -586,6 +587,109 @@ efi_main (
     BootStatus = PpcPrepareSystemForBoot();
     Print(L"System initialization: %s\n",
           EFI_ERROR(BootStatus) ? L"FAIL" : L"PASS");
+
+    // 4b. Continuous execution of a real installed ROM. New World Macs skip
+    //     Open Firmware and enter the nanokernel boot routine directly
+    //     (ROM base + 0x310000, the SheepShaver entry); Old World ROMs and the
+    //     demo start at the CPU reset vector. Runs real firmware code through
+    //     the interpreter until the first unimplemented opcode stops the guest
+    //     (the current milestone).
+    {
+      PPC_BOOT_INFO RunInfo;
+      if (!EFI_ERROR(PpcGetBootInfo(&RunInfo)) &&
+          RunInfo.MemoryMap.RomInstalled &&
+          RunInfo.MemoryMap.RomType != PPC_ROM_TYPE_DEMO &&
+          RunInfo.MemoryMap.RomType != PPC_ROM_TYPE_UNKNOWN) {
+        UINTN Executed = 0;
+        EFI_STATUS RunStatus;
+
+        if (RunInfo.MemoryMap.RomType == PPC_ROM_TYPE_NEW_WORLD) {
+          g_PpcContext.Pc = (UINT32)RunInfo.MemoryMap.RomBase + PPC_NANOKERNEL_BOOT_OFFSET;
+          // r3 = nanokernel code base: the NK entry's old-world replacement
+          // path rfis to r3 + 0x40 (InitReplacement), so r3 must point at the
+          // nanokernel image itself (ROM base + 0x310000).
+          g_PpcContext.Gpr[3] = (UINT32)RunInfo.MemoryMap.RomBase + PPC_NANOKERNEL_BOOT_OFFSET;
+          // r5 = nanokernel output-device base. The NK boot printer polls
+          // [base+2] bit 2 until set and writes output characters to [base+6].
+          // Point it at a spare region of low memory pre-marked "ready" so the
+          // poll completes; characters land harmlessly in RAM (no display yet).
+          g_PpcContext.Gpr[5] = 0x00020000;
+          PpcWriteGuestByte(0x00020000 + 2, 0x04);
+          Print(L"  Outdev seed: [0x20002]=0x%02x (read-back)\n",
+                PpcReadGuestByte(0x00020000 + 2));
+          // The NK InitReplacement reads a caller structure through SPRG4
+          // (mfspr r11,sprg4) and copies [r11+4 .. r11+0x1000] onto its own
+          // stack at [r1+4 .. r1+0x1000]. Version magic at [r11+0xFE4]:
+          // 0x101 -> replaced (classic protocol), >= 0x200 -> NOT replaced.
+          // Provide a structure in low RAM (0x30000, outside the NK's
+          // guard-fill ranges) so the NK takes the replaced path.
+          g_PpcContext.Spr[272] = 0x00030000;
+          {
+            UINT32 B = 0x00030000;
+            PpcWriteGuestByte(B + 0xFE4, 0x01);
+            PpcWriteGuestByte(B + 0xFE5, 0x01);
+            PpcWriteGuestByte(B + 0x340, 0x00);
+            PpcWriteGuestByte(B + 0x5B4, 0x00);
+            PpcWriteGuestByte(B + 0x684 + 0, (UINT8)(B >> 24));
+            PpcWriteGuestByte(B + 0x684 + 1, (UINT8)(B >> 16));
+            PpcWriteGuestByte(B + 0x684 + 2, (UINT8)(B >> 8));
+            PpcWriteGuestByte(B + 0x684 + 3, (UINT8)(B));
+            PpcWriteGuestByte(B + 0x66C + 0, (UINT8)(B >> 24));
+            PpcWriteGuestByte(B + 0x66C + 1, (UINT8)(B >> 16));
+            PpcWriteGuestByte(B + 0x66C + 2, (UINT8)(B >> 8));
+            PpcWriteGuestByte(B + 0x66C + 3, (UINT8)(B));
+            PpcWriteGuestByte(B + 0x5E8 + 0, (UINT8)(B >> 24));
+            PpcWriteGuestByte(B + 0x5E8 + 1, (UINT8)(B >> 16));
+            PpcWriteGuestByte(B + 0x5E8 + 2, (UINT8)(B >> 8));
+            PpcWriteGuestByte(B + 0x5E8 + 3, (UINT8)(B));
+          }
+          Print(L"  Seeded SPRG4 caller structure at 0x30000: version [0x30FE4]=0x0101\n");
+          Print(L"\n--- Executing system ROM from nanokernel boot entry (0x%08x) ---\n",
+                g_PpcContext.Pc);
+          {
+            UINTN D;
+            UINT32 DAddr[14] = {
+              0x40B10000, 0x40B1000C, 0x40B10040, 0x40B10190,
+              0x40B26440, 0x40B26B44, 0x40B28A74, 0x40B28A88,
+              0x40B28BF0, 0x40B28C04, 0x40B32640, 0x40B32874,
+              0x40B32888, 0x40B328F0
+            };
+            for (D = 0; D < 14; D++) {
+              UINT32 W = ((UINT32)PpcReadGuestByte(DAddr[D]) << 24) |
+                         ((UINT32)PpcReadGuestByte(DAddr[D] + 1) << 16) |
+                         ((UINT32)PpcReadGuestByte(DAddr[D] + 2) << 8) |
+                         ((UINT32)PpcReadGuestByte(DAddr[D] + 3));
+              Print(L"  ROMDUMP[0x%08x] = 0x%08x\n", DAddr[D], W);
+            }
+          }
+          {
+            UINT32 ReturnTarget =
+              (UINT32)RunInfo.MemoryMap.RomBase + PPC_NANOKERNEL_BOOT_OFFSET;
+            PpcWriteGuestByte(0x648 + 0, (UINT8)(ReturnTarget >> 24));
+            PpcWriteGuestByte(0x648 + 1, (UINT8)(ReturnTarget >> 16));
+            PpcWriteGuestByte(0x648 + 2, (UINT8)(ReturnTarget >> 8));
+            PpcWriteGuestByte(0x648 + 3, (UINT8)(ReturnTarget));
+            Print(L"  Seeded NK return-address slot [0x648] = 0x%08x\n", ReturnTarget);
+            // The NK prints "Nanodebugger activated." and then idles at the
+            // nanokernel debugger prompt, polling the SCC for a command. The
+            // first byte queued is consumed by the "Old KDP" break-in check
+            // during debugger setup; feed the nanodebugger's command line its
+            // own "go" ('g') + CR so it resumes the boot sequence.
+            PpcSccPutChar('g');
+            PpcSccPutChar(0x0D);
+            PpcSccPutChar('g');
+            PpcSccPutChar(0x0D);
+            Print(L"  Queued SCC input: 'g' CR 'g' CR (nanodebugger go)\n");
+          }
+        } else {
+          g_PpcContext.Pc = PPC_RESET_VECTOR;
+          Print(L"\n--- Executing system ROM from reset vector ---\n");
+        }
+        RunStatus = PpcRunGuest(PPC_GUEST_STEP_BUDGET, TRUE, &Executed);
+        Print(L"Guest execution stopped after %d instructions at PC=0x%08x: %r\n",
+              Executed, g_PpcContext.Pc, RunStatus);
+      }
+    }
 
     // 5. Report the final boot state.
     PPC_BOOT_INFO BootInfo;

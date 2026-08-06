@@ -54,4 +54,10 @@ PpcSetXerOverflow (
     IN UINT32 Overflow
     );
 
+// Queue a byte on the NK's emulated SCC receive side
+VOID
+PpcSccPutChar (
+    IN UINT8 Char
+    );
+
 #endif // __PPC_INTERPRETER_H__

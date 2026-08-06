@@ -275,7 +275,7 @@ PpcRunSelfTest (
 
     // 12. rlwinm r8, r3, 1, 0, 31 (r3=1) -> r8=2
     PpcSetGprValue(3, 1);
-    Status = PpcExecuteInstruction(0x5468081F, 0x3004, &Next);
+    Status = PpcExecuteInstruction(0x5468083E, 0x3004, &Next);
     SelfTestCheck(Status == EFI_SUCCESS && PpcGetGprValue(8) == 2,
                   L"rlwinm r8,r3,1,0,31 -> r8=2");
 

@@ -22,8 +22,16 @@ typedef struct {
 #define PPC_ROM_MAX_SIZE        0x00400000  // 4 MB ROM window
 #define PPC_ROM_DEFAULT_PATH    L"\\System\\MacOS\\ROM"
 #define PPC_RESET_VECTOR        (PPC_ROM_GUEST_BASE + 0x100)
+#define PPC_NANOKERNEL_BOOT_OFFSET 0x310000  // New World nanokernel boot entry (SheepShaver)
+#define PPC_GUEST_STEP_BUDGET   10000000    // Continuous-run instruction budget
 #define PPC_LOW_MEM_GUEST_BASE  0x00000000  // Low-memory globals
-#define PPC_LOW_MEM_SIZE        0x4000      // 16 KB
+#define PPC_LOW_MEM_SIZE        0x00040000  // 256 KB (covers the nanokernel's fixed stack/context at 0xA000-0x1A000)
+
+// New World "Mac OS ROM" images are 4 MB but boot from offset 0x310000. A 4 MB
+// window at PPC_ROM_GUEST_BASE (the top of the 32-bit space) can only address
+// offsets < 1 MB, so New World ROMs are mapped lower, at SheepShaver's
+// ROM_BASE (0x40800000); ROM base + 0x310000 = 0x40B10000 is the boot entry.
+#define PPC_NEW_WORLD_ROM_GUEST_BASE 0x40800000
 
 // Which kind of system ROM is installed. Old World is a classic PowerPC
 // firmware dump (System 7 through early Mac OS 8); New World is the

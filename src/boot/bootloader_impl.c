@@ -28,6 +28,7 @@ typedef struct {
     UINT64  RomSize;
     VOID*   RomHostBuffer;
     UINT32  RomType;
+    BOOLEAN RomDecoded;     // TRUE when a CHRP file was expanded to the flat image
     // Phase 5: system files and drivers (classic Mac OS System Folder)
     BOOLEAN SystemFolderScanned;
     BOOLEAN SystemFolderFound;
@@ -1016,6 +1017,282 @@ BootIdentifyRomType (
     return PPC_ROM_TYPE_OLD_WORLD;
 }
 
+// ---------------------------------------------------------------------------
+// New World "Mac OS ROM" image decode
+// ---------------------------------------------------------------------------
+// The New World "Mac OS ROM" file (Mac OS 8.5+) is a CHRP boot image. Its
+// Forth text descriptor declares where the compressed payload lives:
+//
+//     h# 01BFC0 constant parcels-offset
+//     h# 259C8C constant parcels-size
+//
+// The payload starts with the fourcc 'prcl' followed by a chain of parcels.
+// Each parcel header is big-endian 32-bit words: next-offset, type, then
+// type-specific data. The chain is walked starting at parcel offset 0x14. The
+// parcel of type 'rom ' holds the actual firmware image as LZSS data, which
+// expands to the flat 4 MB ROM window the CPU boots from. (Same layout as
+// SheepShaver rom_patches.cpp DecodeROM/decode_parcels/decode_lzss.)
+
+STATIC UINT32
+BootReadBe32 (
+    IN const UINT8* P
+    )
+{
+    return ((UINT32)P[0] << 24) | ((UINT32)P[1] << 16) |
+           ((UINT32)P[2] << 8)  | ((UINT32)P[3]);
+}
+
+// Read the hexadecimal constant that immediately precedes the token
+// "constant <Name>" inside the CHRP descriptor text, e.g. the "01BFC0" in
+// "h# 01BFC0 constant parcels-offset". Returns TRUE and sets *Value on match.
+STATIC BOOLEAN
+BootFindChrpHexConstant (
+    IN const UINT8* Data,
+    IN UINTN        Size,
+    IN const CHAR8* Name,
+    OUT UINT32*     Value
+    )
+{
+    STATIC const CHAR8 Token[] = "constant ";
+    UINTN NameLen = 0;
+    UINTN I;
+
+    if (Value == NULL) {
+        return FALSE;
+    }
+    while (Name[NameLen] != 0) {
+        NameLen++;
+    }
+
+    for (I = 0; I < Size; I++) {
+        UINT8 Nibbles[16];
+        UINTN Count = 0;
+        UINTN J = I;
+        UINT32 V = 0;
+
+        if (Data[I] != Token[0]) {
+            continue;
+        }
+        if (I + sizeof(Token) - 1 + NameLen > Size) {
+            break;
+        }
+        if (CompareMem(Data + I, Token, sizeof(Token) - 1) != 0) {
+            continue;
+        }
+        if (CompareMem(Data + I + sizeof(Token) - 1, Name, NameLen) != 0) {
+            continue;
+        }
+
+        // Walk backwards from the 'c' of "constant": first over any
+        // whitespace, then over the hex digits of the declared value
+        // (e.g. the "01BFC0" in "h# 01BFC0 constant parcels-offset").
+        while (J > 0) {
+            UINT8 Sep = Data[J - 1];
+            if (Sep == ' ' || Sep == '\t' || Sep == '\r' || Sep == '\n') {
+                J--;
+            } else {
+                break;
+            }
+        }
+        while (J > 0 && Count < 16) {
+            UINT8 C = Data[J - 1];
+            UINT8 D;
+            if (C >= '0' && C <= '9')        { D = (UINT8)(C - '0'); }
+            else if (C >= 'a' && C <= 'f')   { D = (UINT8)(C - 'a' + 10); }
+            else if (C >= 'A' && C <= 'F')   { D = (UINT8)(C - 'A' + 10); }
+            else                             { break; }
+            Nibbles[Count++] = D;
+            J--;
+        }
+        if (Count == 0) {
+            continue;
+        }
+        // Nibbles were collected right-to-left; assemble forward.
+        while (Count > 0) {
+            V = (V << 4) | Nibbles[--Count];
+        }
+        *Value = V;
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+// LZSS decompression (the algorithm used by Apple's compressed ROM parcels).
+// The 4 KB dictionary is held at file scope: on the stack it would trigger an
+// x86_64 __chkstk stack probe, which the freestanding image does not provide.
+// The decoder is not reentrant in this single-threaded boot path.
+static UINT8 g_LzssDict[0x1000];
+
+STATIC VOID
+BootLzssDecode (
+    IN const UINT8* Src,
+    IN UINTN        Size,
+    OUT UINT8*      Dest
+    )
+{
+    UINT8* Dict = g_LzssDict;
+    INTN  RunMask = 0;
+    INTN  Remaining = (INTN)Size;
+    UINTN DictIdx = 0xFEE;
+
+    SetMem(Dict, sizeof(g_LzssDict), 0);
+    while (Remaining >= 0) {
+        if (RunMask < 0x100) {
+            if (--Remaining < 0) break;
+            RunMask = *Src++ | 0xFF00;
+        }
+        if (RunMask & 1) {
+            // Verbatim byte
+            if (--Remaining < 0) break;
+            UINT8 C = *Src++;
+            Dict[DictIdx & 0xFFF] = C;
+            *Dest++ = C;
+            DictIdx = (DictIdx + 1) & 0xFFF;
+        } else {
+            // Copy run from the 4 KB dictionary
+            if (--Remaining < 0) break;
+            UINT8 Idx = *Src++;
+            if (--Remaining < 0) break;
+            UINT8 Cnt = *Src++;
+            UINTN Start = (UINTN)(Idx | ((UINTN)(Cnt << 4) & 0xF00));
+            UINTN N = (UINTN)(Cnt & 0x0F) + 3;
+            while (N--) {
+                UINT8 C = Dict[Start & 0xFFF];
+                Dict[DictIdx & 0xFFF] = C;
+                *Dest++ = C;
+                Start = (Start + 1) & 0xFFF;
+                DictIdx = (DictIdx + 1) & 0xFFF;
+            }
+        }
+        RunMask >>= 1;
+    }
+}
+
+// Walk the 'prcl' parcel chain and expand the 'rom ' parcel (LZSS) into the
+// flat ROM image buffer Dest.
+STATIC EFI_STATUS
+BootDecodeParcels (
+    IN const UINT8* Parcels,
+    IN UINTN        ParcelsSize,
+    OUT UINT8*      Dest
+    )
+{
+    UINT32 Offset = 0x14;
+
+    if (ParcelsSize < 0x14 + 16) {
+        return EFI_LOAD_ERROR;
+    }
+    if (BootReadBe32(Parcels) != 0x7072636CU /* 'prcl' */) {
+        return EFI_LOAD_ERROR;
+    }
+
+    while (Offset != 0) {
+        UINT32 Next = 0;
+        UINT32 Type = 0;
+        UINT32 LzssOffset = 0;
+        UINTN  ParcelBase = (UINTN)Offset;
+
+        if (ParcelBase + 12 > ParcelsSize) {
+            return EFI_LOAD_ERROR;
+        }
+        Next = BootReadBe32(Parcels + ParcelBase + 0);
+        Type = BootReadBe32(Parcels + ParcelBase + 4);
+        LzssOffset = BootReadBe32(Parcels + ParcelBase + 8);
+
+        if (Type == 0x726F6D20U /* 'rom ' */) {
+            UINT32 LzssSize;
+            if (ParcelBase + LzssOffset > ParcelsSize || Next > ParcelsSize) {
+                return EFI_LOAD_ERROR;
+            }
+            if (Next < ParcelBase + LzssOffset) {
+                return EFI_LOAD_ERROR;
+            }
+            LzssSize = Next - (UINT32)(ParcelBase + LzssOffset);
+            BootLzssDecode(Parcels + ParcelBase + LzssOffset, LzssSize, Dest);
+            return EFI_SUCCESS;
+        }
+
+        if (Next == 0 || Next <= ParcelBase || Next > ParcelsSize) {
+            return EFI_LOAD_ERROR;
+        }
+        Offset = Next;
+    }
+
+    return EFI_LOAD_ERROR;
+}
+
+// Try to expand a New World <CHRP-BOOT> ROM file into the flat 4 MB ROM
+// window image. On success *Out holds a freshly allocated page-aligned buffer
+// and *OutSize is the mapped size; the caller owns it and should free the
+// original compressed file buffer. Returns FALSE if the image is not a CHRP
+// file or cannot be decoded.
+STATIC BOOLEAN
+BootDecodeChrpRom (
+    IN  const UINT8* Buffer,
+    IN  UINTN        Size,
+    OUT VOID**       Out,
+    OUT UINTN*       OutSize
+    )
+{
+    STATIC const UINT8 ChrpBoot[11] = { '<', 'C', 'H', 'R', 'P', '-',
+                                        'B', 'O', 'O', 'T', '>' };
+    UINT32 ParcelsOffset = 0;
+    UINT32 ParcelsSize = 0;
+    UINTN  Pages;
+    UINT8* Rom;
+    EFI_PHYSICAL_ADDRESS Base = 0;
+    EFI_STATUS Status;
+
+    if (Out == NULL || OutSize == NULL) {
+        return FALSE;
+    }
+    if (Buffer == NULL || Size < sizeof(ChrpBoot)) {
+        return FALSE;
+    }
+    if (CompareMem(Buffer, ChrpBoot, sizeof(ChrpBoot)) != 0) {
+        return FALSE;
+    }
+
+    if (!BootFindChrpHexConstant(Buffer, Size, "parcels-offset", &ParcelsOffset)) {
+        return FALSE;
+    }
+    if (!BootFindChrpHexConstant(Buffer, Size, "parcels-size", &ParcelsSize)) {
+        return FALSE;
+    }
+    if (ParcelsOffset == 0 || (UINTN)ParcelsOffset + ParcelsSize > Size) {
+        return FALSE;
+    }
+    if (BootReadBe32(Buffer + ParcelsOffset) != 0x7072636CU /* 'prcl' */) {
+        return FALSE;
+    }
+
+    // The flat image is 4 MB; the compressor may emit a few bytes past the
+    // window, so hold a small slack beyond the mapped size.
+    Pages = (PPC_ROM_MAX_SIZE + 0x10000) / EFI_PAGE_SIZE;
+    Status = BS->AllocatePages(AllocateAnyPages, EfiBootServicesData, Pages, &Base);
+    if (EFI_ERROR(Status)) {
+        Print(L"Failed to allocate decoded ROM pages: %r\n", Status);
+        return FALSE;
+    }
+    Rom = (UINT8*)(UINTN)Base;
+    ZeroMem(Rom, (PPC_ROM_MAX_SIZE + 0x10000));
+
+    Status = BootDecodeParcels(Buffer + ParcelsOffset, ParcelsSize, Rom);
+    if (EFI_ERROR(Status)) {
+        BS->FreePages(Base, Pages);
+        Print(L"Failed to decode New World ROM parcels: %r\n", Status);
+        return FALSE;
+    }
+
+    Print(L"New World ROM decompressed: %d bytes of parcels to flat image\n",
+          (UINT64)ParcelsSize);
+
+    *Out = Rom;
+    *OutSize = PPC_ROM_MAX_SIZE;
+    return TRUE;
+}
+
 EFI_STATUS
 PpcLoadSystemRom (
     IN  CHAR16* RomPath,
@@ -1140,8 +1417,38 @@ PpcInstallSystemRom (
         }
     }
 
-    // Map the ROM into the guest memory map as a read-only region.
-    Status = PpcAddGuestMemoryRegion(Buffer, PPC_ROM_GUEST_BASE, (UINT32)Size, TRUE);
+    // Identify the ROM type from the file as loaded: a New World "Mac OS ROM"
+    // file is a compressed CHRP image, so its type must be captured before the
+    // parcels are expanded (the flat image no longer starts with <CHRP-BOOT>).
+    g_BootContext.RomType = BootIdentifyRomType((const UINT8*)Buffer, (UINTN)Size);
+    g_BootContext.RomDecoded = FALSE;
+
+    // New World "Mac OS ROM" files are compressed CHRP images (LZSS parcels).
+    // Expand them into the flat 4 MB ROM window so the reset/boot region
+    // contains real firmware code instead of descriptor text.
+    {
+        VOID*  Decoded = NULL;
+        UINTN  DecodedSize = 0;
+        if (BootDecodeChrpRom((const UINT8*)Buffer, (UINTN)Size, &Decoded, &DecodedSize)) {
+            PpcFreeMemory(Buffer, Size);
+            Buffer = Decoded;
+            Size = DecodedSize;
+            g_BootContext.RomDecoded = TRUE;
+        }
+    }
+
+    // Map the ROM into the guest memory map. New World images boot from ROM
+    // base + 0x310000, which overflows the 32-bit space at PPC_ROM_GUEST_BASE,
+    // so they are mapped at the lower SheepShaver base. The region must be
+    // writable: the nanokernel is told this 4 MB window is a RAM bank (the
+    // SheepShaver memory model), and builds its HTAB, kernel data page (KDP),
+    // EWA, stack and IRP in the top of it (HTABORG 0x40BF0000, KDP 0x40BEE000).
+    // A read-only mapping silently drops those stores and the NK panics.
+    UINT32 GuestBase = (g_BootContext.RomType == PPC_ROM_TYPE_NEW_WORLD)
+                           ? PPC_NEW_WORLD_ROM_GUEST_BASE
+                           : PPC_ROM_GUEST_BASE;
+    Status = PpcAddGuestMemoryRegion(Buffer, GuestBase, (UINT32)Size,
+                                     g_BootContext.RomType != PPC_ROM_TYPE_NEW_WORLD);
     if (EFI_ERROR(Status)) {
         PpcFreeMemory(Buffer, Size);
         Print(L"Failed to map ROM into guest memory: %r\n", Status);
@@ -1149,16 +1456,15 @@ PpcInstallSystemRom (
     }
 
     g_BootContext.RomLoaded = TRUE;
-    g_BootContext.RomAddress = PPC_ROM_GUEST_BASE;
+    g_BootContext.RomAddress = GuestBase;
     g_BootContext.RomSize = Size;
     g_BootContext.RomHostBuffer = Buffer;
-    g_BootContext.RomType = BootIdentifyRomType((const UINT8*)Buffer, (UINTN)Size);
 
-    if (RomAddress != NULL) { *RomAddress = PPC_ROM_GUEST_BASE; }
+    if (RomAddress != NULL) { *RomAddress = GuestBase; }
     if (RomSize != NULL) { *RomSize = Size; }
 
     Print(L"System ROM installed: %d bytes at guest 0x%x (%s)\n",
-          (UINT64)Size, PPC_ROM_GUEST_BASE,
+          (UINT64)Size, GuestBase,
           g_BootContext.RomType == PPC_ROM_TYPE_NEW_WORLD ? L"New World" :
           g_BootContext.RomType == PPC_ROM_TYPE_OLD_WORLD ? L"Old World" :
           L"unknown type");
@@ -1419,7 +1725,8 @@ PpcPrepareSystemForBoot (
     BootWriteWord32(PPC_LOW_MEM_GUEST_BASE + PPC_LOW_MEM_MAGIC_OFFSET, 0x45464921);
     BootWriteWord32(PPC_LOW_MEM_GUEST_BASE + PPC_LOW_MEM_BOOTINFO_OFFSET + 0, (UINT32)RamBase);
     BootWriteWord32(PPC_LOW_MEM_GUEST_BASE + PPC_LOW_MEM_BOOTINFO_OFFSET + 4, (UINT32)RamSize);
-    BootWriteWord32(PPC_LOW_MEM_GUEST_BASE + PPC_LOW_MEM_BOOTINFO_OFFSET + 8, PPC_ROM_GUEST_BASE);
+    BootWriteWord32(PPC_LOW_MEM_GUEST_BASE + PPC_LOW_MEM_BOOTINFO_OFFSET + 8,
+                    (UINT32)g_BootContext.RomAddress);
     BootWriteWord32(PPC_LOW_MEM_GUEST_BASE + PPC_LOW_MEM_BOOTINFO_OFFSET + 12,
                     (UINT32)(g_BootContext.RomLoaded ? g_BootContext.RomSize : 0));
     BootWriteWord32(PPC_LOW_MEM_GUEST_BASE + PPC_LOW_MEM_BOOTINFO_OFFSET + 16,
@@ -1465,39 +1772,53 @@ PpcRunBootSelfTest (
     // ROM mapping: readable through the interpreter's memory path, and
     // read-only to guest stores. A real firmware dump must not be executed,
     // so the reset-vector execution checks only run against the demo ROM.
+    UINT32 RomBase = (UINT32)g_BootContext.RomAddress;
     if (g_BootContext.RomType == PPC_ROM_TYPE_DEMO) {
         // Demo ROM: magic word readable at the ROM base.
         BootSelfTestCheck(
-            PpcReadGuestByte(PPC_ROM_GUEST_BASE + 0) == 'R' &&
-            PpcReadGuestByte(PPC_ROM_GUEST_BASE + 1) == 'O' &&
-            PpcReadGuestByte(PPC_ROM_GUEST_BASE + 2) == 'M' &&
-            PpcReadGuestByte(PPC_ROM_GUEST_BASE + 3) == '1',
-            L"ROM magic word 'ROM1' readable at guest 0xFFF00000");
+            PpcReadGuestByte(RomBase + 0) == 'R' &&
+            PpcReadGuestByte(RomBase + 1) == 'O' &&
+            PpcReadGuestByte(RomBase + 2) == 'M' &&
+            PpcReadGuestByte(RomBase + 3) == '1',
+            L"ROM magic word 'ROM1' readable at the ROM base");
     } else {
         // Real ROM: region present and its base is readable (no fixed magic).
         BootSelfTestCheck(
             g_BootContext.RomLoaded && g_BootContext.RomSize > 0,
-            L"system ROM region present at guest 0xFFF00000");
+            L"system ROM region present in guest memory");
         if (g_BootContext.RomType == PPC_ROM_TYPE_NEW_WORLD) {
-            static const UINT8 ChrpSig[12] = { '<', 'C', 'H', 'R', 'P', '-',
-                                               'B', 'O', 'O', 'T', '>', '\r' };
-            BOOLEAN Chrp = TRUE;
-            for (UINTN I = 0; I < 12; I++) {
-                if (PpcReadGuestByte(PPC_ROM_GUEST_BASE + (UINT32)I) != ChrpSig[I]) {
-                    Chrp = FALSE;
-                    break;
+            if (g_BootContext.RomDecoded) {
+                // The flat image no longer carries the <CHRP-BOOT> text header;
+                // verify the nanokernel boot entry (ROM base + 0x310000, the
+                // SheepShaver entry point) contains executable code instead.
+                UINT32 EntryWord = 0;
+                for (UINTN I = 0; I < 4; I++) {
+                    EntryWord = (EntryWord << 8) |
+                                PpcReadGuestByte(RomBase +
+                                                 PPC_NANOKERNEL_BOOT_OFFSET + (UINT32)I);
                 }
+                BootSelfTestCheck(EntryWord != 0, L"New World ROM nanokernel boot entry present");
+            } else {
+                static const UINT8 ChrpSig[12] = { '<', 'C', 'H', 'R', 'P', '-',
+                                                   'B', 'O', 'O', 'T', '>', '\r' };
+                BOOLEAN Chrp = TRUE;
+                for (UINTN I = 0; I < 12; I++) {
+                    if (PpcReadGuestByte(RomBase + (UINT32)I) != ChrpSig[I]) {
+                        Chrp = FALSE;
+                        break;
+                    }
+                }
+                BootSelfTestCheck(Chrp, L"New World ROM '<CHRP-BOOT>' signature present");
             }
-            BootSelfTestCheck(Chrp, L"New World ROM '<CHRP-BOOT>' signature present");
         }
     }
 
     // ROM is read-only to guest stores (applies to demo and real ROMs).
     {
-        UINT8 B0 = PpcReadGuestByte(PPC_ROM_GUEST_BASE + 0);
-        PpcWriteGuestByte(PPC_ROM_GUEST_BASE + 0, (UINT8)(B0 ^ 0xFF));
+        UINT8 B0 = PpcReadGuestByte(RomBase + 0);
+        PpcWriteGuestByte(RomBase + 0, (UINT8)(B0 ^ 0xFF));
         BootSelfTestCheck(
-            PpcReadGuestByte(PPC_ROM_GUEST_BASE + 0) == B0,
+            PpcReadGuestByte(RomBase + 0) == B0,
             L"ROM rejects guest writes (read-only)");
     }
 
