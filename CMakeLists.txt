@@ -18,12 +18,16 @@ include_directories(
     src/boot
     src/utils
     src/platform
+    src/ui
     ${EFI_INCLUDE_DIRS}
 )
 
 # Source files
 set(SOURCES
     src/main.c
+    
+    # Setup / configuration front-end
+    src/ui/ui_impl.c
     
     # CPU Translation Layer
     src/cpu/translation_impl.c

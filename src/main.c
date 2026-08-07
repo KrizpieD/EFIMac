@@ -13,6 +13,7 @@ UINT32 _fltused = 0;
 #include "fs/hfs.h"
 #include "utils/debug.h"
 #include "platform/uefi_interface.h"
+#include "ui/ui.h"
 
 // True if the GOP pixel at (X,Y) holds exactly the R/G/B channels of the
 // given guest color (big-endian 0xRRGGBB00), placed according to the GOP
@@ -97,9 +98,26 @@ efi_main (
     Print(L"Failed to initialize UEFI interface: %r\n", Status);
     return Status;
   }
+
+  // Load the saved configuration, run the boot gate (ASCII Macintosh splash
+  // with a 5-second countdown) and, when F8 is pressed, the setup menu. The
+  // resulting configuration drives the boot below.
+  PPC_CONFIG BootConfig;
+  PpcConfigLoad(&BootConfig);
+  if (PpcBootGateWait(&BootConfig)) {
+    Status = PpcShowConfigMenu(&BootConfig);
+    if (EFI_ERROR(Status)) {
+      Print(L"Configuration menu failed: %r\n", Status);
+    }
+  }
+
+  // Honor the configured boot volume (auto-detection when not pinned).
+  PpcHfsSetDeviceIndex(BootConfig.BootDeviceIndex);
   
-  // Initialize debug system
-  Status = PpcInitializeDebug(PPC_DEBUG_LEVEL_DEBUG, FALSE, NULL);
+  // Initialize debug system (level follows the setup configuration)
+  Status = PpcInitializeDebug(BootConfig.DebugEnabled ? PPC_DEBUG_LEVEL_DEBUG
+                                                      : PPC_DEBUG_LEVEL_ERROR,
+                              FALSE, NULL);
   if (EFI_ERROR(Status)) {
     Print(L"Failed to initialize debug system: %r\n", Status);
     return Status;
@@ -119,8 +137,15 @@ efi_main (
     return Status;
   }
   
-  // Initialize memory manager (guest RAM at the classic Mac OS kernel base)
-  Status = PpcInitializeMemoryManager(0x10000000, 0x10000000);  // 256MB
+  // Initialize memory manager (guest RAM at the classic Mac OS kernel base,
+  // sized from the setup configuration; 256 MB default).
+  {
+    UINTN GuestRamMB = (UINTN)BootConfig.MemorySizeMB;
+    if (GuestRamMB < 128 || GuestRamMB > 2048) {
+      GuestRamMB = 256;
+    }
+    Status = PpcInitializeMemoryManager(0x10000000, GuestRamMB * 0x100000);
+  }
   if (EFI_ERROR(Status)) {
     Print(L"Failed to initialize memory manager: %r\n", Status);
     return Status;
@@ -233,8 +258,13 @@ efi_main (
     return Status;
   }
   
-  // Initialize graphics for the emulator
-  Status = PpcInitializeGraphics(640, 480, 32);
+  // Initialize graphics for the emulator at the configured resolution.
+  {
+    UINT32 VideoWidth  = 640;
+    UINT32 VideoHeight = 480;
+    PpcVideoModeResolution(BootConfig.VideoMode, &VideoWidth, &VideoHeight);
+    Status = PpcInitializeGraphics(VideoWidth, VideoHeight, 32);
+  }
   if (EFI_ERROR(Status)) {
     Print(L"Failed to initialize graphics: %r\n", Status);
     return Status;
@@ -342,43 +372,49 @@ efi_main (
     }
   }
   
-  // Initialize audio subsystem
-  Status = PpcInitializeAudio();
-  if (EFI_ERROR(Status)) {
-    Print(L"Failed to initialize audio: %r\n", Status);
-    return Status;
+  // Initialize audio subsystem (disabled in the setup menu when off)
+  if (BootConfig.AudioEnabled) {
+    Status = PpcInitializeAudio();
+    if (EFI_ERROR(Status)) {
+      Print(L"Failed to initialize audio: %r\n", Status);
+      return Status;
+    }
+  } else {
+    Print(L"Audio device: DISABLED (setup)\n");
   }
 
   // Audio self-check: the guest writes big-endian PCM samples into the
   // ring buffer, the host reads them back, then advances playback.
-  {
-    PPC_AUDIO_INFO AudioInfo;
-    Status = PpcAudioGetBufferInfo(&AudioInfo);
-    if (!EFI_ERROR(Status) && AudioInfo.HostBuffer != NULL) {
-      // Guest-side write path: 16-bit big-endian 0x1000 = 4096 sample.
-      UINT32 GuestAddr = AudioInfo.GuestBase;
-      PpcWriteGuestByte(GuestAddr + 0, 0x10);
-      PpcWriteGuestByte(GuestAddr + 1, 0x00);
-      PpcWriteGuestByte(GuestAddr + 2, 0x20);
-      PpcWriteGuestByte(GuestAddr + 3, 0x00);
+  if (BootConfig.AudioEnabled) {
+    {
+      PPC_AUDIO_INFO AudioInfo;
+      Status = PpcAudioGetBufferInfo(&AudioInfo);
+      if (!EFI_ERROR(Status) && AudioInfo.HostBuffer != NULL) {
+        // Guest-side write path: 16-bit big-endian 0x1000 = 4096 sample.
+        UINT32 GuestAddr = AudioInfo.GuestBase;
+        PpcWriteGuestByte(GuestAddr + 0, 0x10);
+        PpcWriteGuestByte(GuestAddr + 1, 0x00);
+        PpcWriteGuestByte(GuestAddr + 2, 0x20);
+        PpcWriteGuestByte(GuestAddr + 3, 0x00);
 
-      UINT16 S0 = 0, S1 = 0;
-      BOOLEAN ReadOk = (PpcAudioReadSample(0, &S0) == EFI_SUCCESS) &&
-                       (PpcAudioReadSample(1, &S1) == EFI_SUCCESS);
-      Status = PpcAudioAdvancePlayback(2);
-      PPC_AUDIO_INFO After;
-      PpcAudioGetBufferInfo(&After);
+        UINT16 S0 = 0, S1 = 0;
+        BOOLEAN ReadOk = (PpcAudioReadSample(0, &S0) == EFI_SUCCESS) &&
+                         (PpcAudioReadSample(1, &S1) == EFI_SUCCESS);
+        Status = PpcAudioAdvancePlayback(2);
+        PPC_AUDIO_INFO After;
+        PpcAudioGetBufferInfo(&After);
 
-      if (ReadOk && S0 == 0x1000 && S1 == 0x2000 && !EFI_ERROR(Status) &&
-          After.PlayCursor == 2) {
-        Print(L"Audio self-check: PASS (samples 0x%04x/0x%04x, played %d)\n",
-              S0, S1, (UINT32)After.PlayCursor);
+        if (ReadOk && S0 == 0x1000 && S1 == 0x2000 && !EFI_ERROR(Status) &&
+            After.PlayCursor == 2) {
+          Print(L"Audio self-check: PASS (samples 0x%04x/0x%04x, played %d)\n",
+                S0, S1, (UINT32)After.PlayCursor);
+        } else {
+          Print(L"Audio self-check: FAIL (samples 0x%04x/0x%04x, played %d)\n",
+                S0, S1, (UINT32)(After.PlayCursor));
+        }
       } else {
-        Print(L"Audio self-check: FAIL (samples 0x%04x/0x%04x, played %d)\n",
-              S0, S1, (UINT32)(After.PlayCursor));
+        Print(L"Audio self-check: SKIP (no buffer)\n");
       }
-    } else {
-      Print(L"Audio self-check: SKIP (no buffer)\n");
     }
   }
   
@@ -418,40 +454,46 @@ efi_main (
   // and verify catalog parsing + System file readback through Block I/O.
   PpcHfsRunSelfTest();
   
-  // Initialize network subsystem
-  Status = PpcInitializeNetwork(1);
-  if (EFI_ERROR(Status) && Status != EFI_NOT_FOUND) {
-    Print(L"Failed to initialize network: %r\n", Status);
-    return Status;
+  // Initialize network subsystem (disabled in the setup menu when off)
+  if (BootConfig.NetworkEnabled) {
+    Status = PpcInitializeNetwork(1);
+    if (EFI_ERROR(Status) && Status != EFI_NOT_FOUND) {
+      Print(L"Failed to initialize network: %r\n", Status);
+      return Status;
+    }
+  } else {
+    Print(L"Network: DISABLED (setup)\n");
   }
 
   // Network self-check: report every real SNP interface and its transmit test.
-  {
-    PPC_NETWORK_INFO NetInfo;
-    Status = PpcGetNetworkInfo(&NetInfo);
-    if (!EFI_ERROR(Status)) {
-      BOOLEAN AllPassed = NetInfo.InterfaceCount > 0;
-      for (UINTN i = 0; i < NetInfo.InterfaceCount; i++) {
-        Print(L"Network self-check: interface %d MAC %02x:%02x:%02x:%02x:%02x:%02x, "
-              L"media %s, transmit %s\n",
-              i,
-              NetInfo.Interfaces[i].MacAddress[0],
-              NetInfo.Interfaces[i].MacAddress[1],
-              NetInfo.Interfaces[i].MacAddress[2],
-              NetInfo.Interfaces[i].MacAddress[3],
-              NetInfo.Interfaces[i].MacAddress[4],
-              NetInfo.Interfaces[i].MacAddress[5],
-              NetInfo.Interfaces[i].MediaPresent ? L"present" : L"absent",
-              NetInfo.Interfaces[i].TransmitTestPassed ? L"PASS" : L"FAIL");
-        if (!NetInfo.Interfaces[i].MediaPresent ||
-            !NetInfo.Interfaces[i].TransmitTestPassed) {
-          AllPassed = FALSE;
+  if (BootConfig.NetworkEnabled) {
+    {
+      PPC_NETWORK_INFO NetInfo;
+      Status = PpcGetNetworkInfo(&NetInfo);
+      if (!EFI_ERROR(Status)) {
+        BOOLEAN AllPassed = NetInfo.InterfaceCount > 0;
+        for (UINTN i = 0; i < NetInfo.InterfaceCount; i++) {
+          Print(L"Network self-check: interface %d MAC %02x:%02x:%02x:%02x:%02x:%02x, "
+                L"media %s, transmit %s\n",
+                i,
+                NetInfo.Interfaces[i].MacAddress[0],
+                NetInfo.Interfaces[i].MacAddress[1],
+                NetInfo.Interfaces[i].MacAddress[2],
+                NetInfo.Interfaces[i].MacAddress[3],
+                NetInfo.Interfaces[i].MacAddress[4],
+                NetInfo.Interfaces[i].MacAddress[5],
+                NetInfo.Interfaces[i].MediaPresent ? L"present" : L"absent",
+                NetInfo.Interfaces[i].TransmitTestPassed ? L"PASS" : L"FAIL");
+          if (!NetInfo.Interfaces[i].MediaPresent ||
+              !NetInfo.Interfaces[i].TransmitTestPassed) {
+            AllPassed = FALSE;
+          }
         }
+        Print(L"Network self-check: %s (%d interface(s))\n",
+              AllPassed ? L"PASS" : L"FAIL", NetInfo.InterfaceCount);
+      } else {
+        Print(L"Network self-check: SKIP (no SNP interface)\n");
       }
-      Print(L"Network self-check: %s (%d interface(s))\n",
-            AllPassed ? L"PASS" : L"FAIL", NetInfo.InterfaceCount);
-    } else {
-      Print(L"Network self-check: SKIP (no SNP interface)\n");
     }
   }
   
@@ -499,12 +541,12 @@ efi_main (
     // Verify kernel integrity (bounds check + first word read).
     PpcVerifyKernel(KernelAddress, KernelSize);
 
-    // Set boot parameters (real storage into the bootloader context).
+    // Set boot parameters (from the saved/edited configuration).
     PPC_BOOT_PARAMETERS Params;
-    Params.BootMode = PPC_BOOT_MODE_NORMAL;
-    Params.MemorySizeMB = 256;
-    Params.VideoMode = PPC_GRAPHICS_MODE_1024x768;
-    Params.EnableDebug = TRUE;
+    Params.BootMode = BootConfig.BootMode;
+    Params.MemorySizeMB = BootConfig.MemorySizeMB;
+    Params.VideoMode = BootConfig.VideoMode;
+    Params.EnableDebug = BootConfig.DebugEnabled;
     Params.CommandLine = L"console=serial";
     PpcSetBootParameters(&Params);
     Print(L"Boot parameters set successfully\n");

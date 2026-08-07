@@ -39,6 +39,9 @@ STATIC UINTN  g_HfsDeviceIndex    = 0;
 STATIC UINTN  g_HfsMediaBlockSize = 512;
 STATIC UINT64 g_HfsDeviceBytes    = 0;
 
+// Boot device pinned by the setup menu (PPC_HFS_AUTO_DEVICE = auto-detect).
+STATIC UINT32 g_HfsPreferredDevice = PPC_HFS_AUTO_DEVICE;
+
 // Classic HFS: byte offset of the first allocation block (drAlBlSt * 512).
 STATIC UINTN  g_HfsAllocBlockStart = 0;
 
@@ -719,6 +722,69 @@ HfsLoadBTreeFile (
 }
 
 EFI_STATUS
+EFIAPI
+PpcHfsSetDeviceIndex (
+    IN UINT32 DeviceIndex
+    )
+{
+    g_HfsPreferredDevice = DeviceIndex;
+    return EFI_SUCCESS;
+}
+
+// Try to find an HFS/HFS+ volume on one enumerated block device. When found,
+// g_HfsDeviceIndex / g_HfsMediaBlockSize / g_HfsDeviceBytes are set and the
+// volume byte offset is returned.
+STATIC
+BOOLEAN
+HfsDetectDevice (
+    IN  UINTN  Index,
+    OUT UINTN* OutKind,
+    OUT UINTN* OutBase
+    )
+{
+    PPC_BLOCK_DEVICE_INFO Dev;
+    if (EFI_ERROR(PpcGetBlockDeviceInfo(Index, &Dev))) {
+        return FALSE;
+    }
+    if (Dev.BlockSize == 0 || Dev.BlockCount == 0) {
+        return FALSE;
+    }
+
+    g_HfsDeviceIndex    = Index;
+    g_HfsMediaBlockSize = Dev.BlockSize;
+    g_HfsDeviceBytes    = Dev.BlockCount * Dev.BlockSize;
+
+    // 1. Raw volume at offset 0.
+    UINTN Sz = 0;
+    CHAR16 Name[PPC_HFS_NAME_MAX + 1];
+    if (HfsMdbFieldsClassic(0, &Sz, Name)) {
+        *OutKind = PPC_HFS_KIND_CLASSIC;
+        *OutBase = 0;
+        return TRUE;
+    }
+    if (HfsMdbFieldsPlus(0, &Sz)) {
+        *OutKind = PPC_HFS_KIND_PLUS;
+        *OutBase = 0;
+        return TRUE;
+    }
+
+    // 2. Apple Partition Map Apple_HFS partition.
+    if (HfsDetectApm(OutBase, &Sz)) {
+        *OutKind = PPC_HFS_KIND_CLASSIC;
+        return TRUE;
+    }
+
+    // 3. Full 2048-byte boundary scan, largest volume wins.
+    BOOLEAN IsPlus = FALSE;
+    if (HfsDetectScan(OutBase, &Sz, &IsPlus)) {
+        *OutKind = IsPlus ? PPC_HFS_KIND_PLUS : PPC_HFS_KIND_CLASSIC;
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+EFI_STATUS
 PpcHfsMount (
     OUT PPC_HFS_VOLUME_INFO* Info
     )
@@ -741,49 +807,28 @@ PpcHfsMount (
     UINTN   FoundKind = PPC_HFS_KIND_NONE;
     UINTN   FoundBase = 0;
 
+    // The setup menu may have pinned a boot device; try it first and fall
+    // back to scanning every device when it holds no HFS volume.
+    BOOLEAN PinnedTried = FALSE;
+    if (g_HfsPreferredDevice != PPC_HFS_AUTO_DEVICE &&
+        g_HfsPreferredDevice < Bio.DeviceCount) {
+        PinnedTried = TRUE;
+        Found = HfsDetectDevice((UINTN)g_HfsPreferredDevice,
+                                &FoundKind, &FoundBase);
+        if (Found) {
+            Print(L"HFS: using configured boot device %d\n",
+                  (UINTN)g_HfsPreferredDevice);
+        } else {
+            Print(L"HFS: configured boot device %d holds no HFS volume; scanning all\n",
+                  (UINTN)g_HfsPreferredDevice);
+        }
+    }
+
     for (UINTN I = 0; I < Bio.DeviceCount && !Found; I++) {
-        PPC_BLOCK_DEVICE_INFO Dev;
-        if (EFI_ERROR(PpcGetBlockDeviceInfo(I, &Dev))) {
+        if (PinnedTried && I == (UINTN)g_HfsPreferredDevice) {
             continue;
         }
-        if (Dev.BlockSize == 0 || Dev.BlockCount == 0) {
-            continue;
-        }
-
-        g_HfsDeviceIndex    = I;
-        g_HfsMediaBlockSize = Dev.BlockSize;
-        g_HfsDeviceBytes    = Dev.BlockCount * Dev.BlockSize;
-
-        // 1. Raw volume at offset 0.
-        UINTN Sz = 0;
-        CHAR16 Name[PPC_HFS_NAME_MAX + 1];
-        if (HfsMdbFieldsClassic(0, &Sz, Name)) {
-            Found = TRUE;
-            FoundKind = PPC_HFS_KIND_CLASSIC;
-            FoundBase = 0;
-            break;
-        }
-        if (HfsMdbFieldsPlus(0, &Sz)) {
-            Found = TRUE;
-            FoundKind = PPC_HFS_KIND_PLUS;
-            FoundBase = 0;
-            break;
-        }
-
-        // 2. Apple Partition Map Apple_HFS partition.
-        if (HfsDetectApm(&FoundBase, &Sz)) {
-            Found = TRUE;
-            FoundKind = PPC_HFS_KIND_CLASSIC;
-            break;
-        }
-
-        // 3. Full 2048-byte boundary scan, largest volume wins.
-        BOOLEAN IsPlus = FALSE;
-        if (HfsDetectScan(&FoundBase, &Sz, &IsPlus)) {
-            Found = TRUE;
-            FoundKind = IsPlus ? PPC_HFS_KIND_PLUS : PPC_HFS_KIND_CLASSIC;
-            break;
-        }
+        Found = HfsDetectDevice(I, &FoundKind, &FoundBase);
     }
 
     if (!Found) {

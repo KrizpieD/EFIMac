@@ -59,6 +59,7 @@ GNUEFI_SRCS := \
 # Application sources
 APP_SRCS := \
 	src/main.c \
+	src/ui/ui_impl.c \
 	src/cpu/interpreter.c \
 	src/cpu/translation_impl.c \
 	src/memory/manager_impl.c \

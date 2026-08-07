@@ -11,6 +11,9 @@
 // partitions of type Apple_HFS are tried, otherwise the largest plausible MDB
 // found on a 2048-byte boundary is chosen.
 
+// PpcHfsSetDeviceIndex value meaning "auto-detect the first HFS volume".
+#define PPC_HFS_AUTO_DEVICE     0xFFFFFFFFu
+
 #define PPC_HFS_NAME_MAX        31      // HFS_NAMELEN
 #define PPC_HFS_MAX_FILES       8192    // catalog file entries
 #define PPC_HFS_MAX_DIRS        4096    // catalog folder entries
@@ -55,6 +58,18 @@ typedef struct {
     UINTN        FileCount;             // catalog file entries
     UINTN        DirCount;              // catalog folder entries
 } PPC_HFS_VOLUME_INFO;
+
+/**
+  Pin the block device the volume is read from. PpcHfsMount tries the pinned
+  device first and falls back to auto-detection when it holds no HFS volume.
+  @param[in] DeviceIndex  Block device index, or PPC_HFS_AUTO_DEVICE
+  @retval EFI_SUCCESS
+**/
+EFI_STATUS
+EFIAPI
+PpcHfsSetDeviceIndex (
+    IN UINT32 DeviceIndex
+    );
 
 /**
   Scan the enumerated block devices for an HFS or HFS+ volume and build its
