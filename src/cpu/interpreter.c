@@ -46,6 +46,40 @@ PPC_CPU_CONTEXT g_PpcContext = {0};
 #define FRB(w)     (((w) >> 11) & 0x1F)
 #define FRC(w)     (((w) >> 6) & 0x1F)
 
+// AltiVec vector fields (opcode 4). VD/VA/VB occupy the same positions as
+// RT/RA/RB. The 11-bit vector sub-opcode spans bits 0-10: a 5-bit XO in the
+// FRC position (bits 6-10), the V bit at 5, and a 5-bit extension in bits 0-4.
+// For the VA-form ops (vperm/vsel/vmaddfp/vsldoi/...) the FRC field holds the
+// third source register or shift instead of part of the opcode.
+#define VD(w)      RT(w)
+#define VA(w)      RA(w)
+#define VB(w)      RB(w)
+#define VC(w)      FRC(w)
+#define VX5(w)     FRC(w)      // 5-bit vector sub-opcode (bits 6-10)
+#define VV(w)      ((w >> 5) & 1)
+#define VTAIL(w)   (w & 0x1F)
+#define VS(w)      RT(w)       // vector target/source (mfvscr/mtvscr)
+#define UIM(w)     VA(w)       // unsigned immediate (convert / splat ops)
+
+// Vector register byte access (guest big-endian). Index 0 is the most
+// significant byte of the 16-byte vector.
+#define VBYTE(r, i)      (g_PpcContext.Vr[r][i])
+#define VWD(r, i)        (((UINT32)VBYTE(r, (i) * 4) << 24) | \
+                          ((UINT32)VBYTE(r, (i) * 4 + 1) << 16) | \
+                          ((UINT32)VBYTE(r, (i) * 4 + 2) << 8) | \
+                          (UINT32)VBYTE(r, (i) * 4 + 3))
+#define VWD_SET(r, i, v) do { \
+    VBYTE(r, (i) * 4)     = (UINT8)((v) >> 24); \
+    VBYTE(r, (i) * 4 + 1) = (UINT8)((v) >> 16); \
+    VBYTE(r, (i) * 4 + 2) = (UINT8)((v) >> 8);  \
+    VBYTE(r, (i) * 4 + 3) = (UINT8)(v);         \
+} while (0)
+#define VHW(r, i)        (((UINT32)VBYTE(r, (i) * 2) << 8) | VBYTE(r, (i) * 2 + 1))
+#define VHW_SET(r, i, v) do { \
+    VBYTE(r, (i) * 2) = (UINT8)((v) >> 8); \
+    VBYTE(r, (i) * 2 + 1) = (UINT8)(v);    \
+} while (0)
+
 // Effective address helpers (RA==0 means GPR(0) is NOT used)
 #define EaD(w, ra) (((ra) == 0) ? SIMM(w) : (g_PpcContext.Gpr[ra] + SIMM(w)))
 #define EaX(w, ra, rb) ((((ra) == 0) ? 0U : g_PpcContext.Gpr[ra]) + g_PpcContext.Gpr[rb])
@@ -59,6 +93,7 @@ PPC_CPU_CONTEXT g_PpcContext = {0};
 #define XO_MFCR       19
 #define XO_LWARX      20
 #define XO_LWZX       23
+#define XO_LWZUX      55
 #define XO_SLW        24
 #define XO_CNTLZW     26
 #define XO_AND        28
@@ -131,6 +166,35 @@ PPC_CPU_CONTEXT g_PpcContext = {0};
 #define XO_STHBRX    918
 #define XO_ICBI      982
 #define XO_DCBZ     1014
+
+// PowerPC 601 / POWER integer XO values for opcode 31. These share the
+// X-form encoding (RT/RA/RB fields, OE bit at word bit 21, Rc at bit 31) and
+// are matched via XO10() which folds OE into bit 9 (0x200).
+#define XO_MASKG      29
+#define XO_MUL       107
+#define XO_DOZ       264
+#define XO_DIV       331
+#define XO_ABS       360
+#define XO_DIVS      363
+#define XO_NABS      488
+#define XO_RRIB      537
+#define XO_MASKIR    541
+#define XO_ECIWX     310
+#define XO_ECOWX     438
+
+// AltiVec vector load/store XO values for opcode 31 (X-form, EA = RA+RB)
+#define XO_LVSL        6
+#define XO_LVEBX       7
+#define XO_LVSR       38
+#define XO_LVEHX      39
+#define XO_LVEWX      71
+#define XO_LVX       103
+#define XO_STVEBX    135
+#define XO_STVEHX    167
+#define XO_LVXL      359
+#define XO_STVEWX    199
+#define XO_STVX      231
+#define XO_STVXL     487
 
 // XL-form XO values for opcode 19
 #define XO19_MCRF      0
@@ -829,6 +893,1330 @@ PpcStoreSingle (
     g_WriteByte(Ea + 3, (UINT8)V.U);
 }
 
+// ---------------------------------------------------------------------------
+// AltiVec helpers
+// ---------------------------------------------------------------------------
+// 64-bit halves of a vector register (V64H = bytes 0-7, V64L = bytes 8-15)
+#define V64H(r)  (((UINT64)VBYTE(r, 0) << 56) | ((UINT64)VBYTE(r, 1) << 48) | \
+                  ((UINT64)VBYTE(r, 2) << 40) | ((UINT64)VBYTE(r, 3) << 32) | \
+                  ((UINT64)VBYTE(r, 4) << 24) | ((UINT64)VBYTE(r, 5) << 16) | \
+                  ((UINT64)VBYTE(r, 6) << 8)  | (UINT64)VBYTE(r, 7))
+#define V64L(r)  (((UINT64)VBYTE(r, 8) << 56) | ((UINT64)VBYTE(r, 9) << 48) | \
+                  ((UINT64)VBYTE(r, 10) << 40) | ((UINT64)VBYTE(r, 11) << 32) | \
+                  ((UINT64)VBYTE(r, 12) << 24) | ((UINT64)VBYTE(r, 13) << 16) | \
+                  ((UINT64)VBYTE(r, 14) << 8)  | (UINT64)VBYTE(r, 15))
+#define V64_SET_H(r, v) do { \
+    VBYTE(r, 0) = (UINT8)((UINT64)(v) >> 56); VBYTE(r, 1) = (UINT8)((UINT64)(v) >> 48); \
+    VBYTE(r, 2) = (UINT8)((UINT64)(v) >> 40); VBYTE(r, 3) = (UINT8)((UINT64)(v) >> 32); \
+    VBYTE(r, 4) = (UINT8)((UINT64)(v) >> 24); VBYTE(r, 5) = (UINT8)((UINT64)(v) >> 16); \
+    VBYTE(r, 6) = (UINT8)((UINT64)(v) >> 8);  VBYTE(r, 7) = (UINT8)(UINT64)(v); \
+} while (0)
+#define V64_SET_L(r, v) do { \
+    VBYTE(r, 8) = (UINT8)((UINT64)(v) >> 56); VBYTE(r, 9) = (UINT8)((UINT64)(v) >> 48); \
+    VBYTE(r, 10) = (UINT8)((UINT64)(v) >> 40); VBYTE(r, 11) = (UINT8)((UINT64)(v) >> 32); \
+    VBYTE(r, 12) = (UINT8)((UINT64)(v) >> 24); VBYTE(r, 13) = (UINT8)((UINT64)(v) >> 16); \
+    VBYTE(r, 14) = (UINT8)((UINT64)(v) >> 8);  VBYTE(r, 15) = (UINT8)(UINT64)(v); \
+} while (0)
+
+static UINT8 PpcSatS8 (INT32 V) { if (V > 127) return 0x7F; if (V < -128) return 0x80; return (UINT8)V; }
+static UINT8 PpcSatU8 (INT32 V) { if (V > 0xFF) return 0xFF; if (V < 0) return 0; return (UINT8)V; }
+static UINT16 PpcSatS16 (INT32 V) { if (V > 0x7FFF) return 0x7FFF; if (V < -0x8000) return 0x8000; return (UINT16)V; }
+static UINT16 PpcSatU16 (INT32 V) { if (V > 0xFFFF) return 0xFFFF; if (V < 0) return 0; return (UINT16)V; }
+static UINT32 PpcSatS32 (INT64 V) { if (V > 0x7FFFFFFFLL) return 0x7FFFFFFF; if (V < -0x80000000LL) return 0x80000000; return (UINT32)V; }
+static UINT32 PpcSatU32 (INT64 V) { if (V > 0xFFFFFFFFLL) return 0xFFFFFFFF; if (V < 0) return 0; return (UINT32)V; }
+
+// Minimal freestanding libm shim. clang lowers __builtin_truncf/floorf/ceilf/
+// rintf/expf/logf to these libcall symbols, and no CRT math library is linked
+// into the UEFI image.
+float truncf (float X)
+{
+    PPC_FP32 U;
+    U.F = X;
+    UINT32 E = (U.U >> 23) & 0xFF;
+    if (E < 150) {
+        UINT32 Drop = 150 - E;
+        if (Drop >= 24) {
+            U.U &= 0x80000000;                  // |X| < 1 -> signed zero
+        } else {
+            U.U &= ~((1U << Drop) - 1);
+        }
+    }
+    return U.F;
+}
+
+float floorf (float X)
+{
+    float T = truncf (X);
+    if (X < T) T -= 1.0f;
+    return T;
+}
+
+float ceilf (float X)
+{
+    float T = truncf (X);
+    if (X > T) T += 1.0f;
+    return T;
+}
+
+float rintf (float X)
+{
+    if (X >= 0x1.0p23f || X <= -0x1.0p23f) {
+        return X;                               // already integral
+    }
+    float T = X + 0x1.8p23f;                    // 1.5 * 2^23
+    return T - 0x1.8p23f;
+}
+
+float expf (float X)
+{
+    // exp(X) = 2^(X * log2(e)). Range-reduce into integer part plus a
+    // fraction in [-0.5, 0.5] and evaluate 2^f with a Taylor series.
+    float Y = X * 1.4426950408889634f;          // X * log2(e)
+    float N = rintf (Y);
+    float F = Y - N;
+    float T = F * 0.6931471805599453f;          // F * ln2
+    float R = 1.0f + T * (1.0f + T * (0.5f + T * (0.1666666667f + T * (0.0416666667f + T * 0.0083333333f))));
+    PPC_FP32 U;
+    U.F = R;
+    INT32 Exp = (INT32)N + (INT32)((U.U >> 23) & 0xFF);
+    if (Exp > 254) {
+        U.U = 0x7F800000;                       // overflow -> +inf
+    } else if (Exp < 1) {
+        U.U = 0;                                // underflow -> 0
+    } else {
+        U.U = (U.U & 0x807FFFFF) | ((UINT32)Exp << 23);
+    }
+    return U.F;
+}
+
+float logf (float X)
+{
+    if (X <= 0.0f) {
+        return -3.402823466e38f;                // not meaningful; keep finite
+    }
+    PPC_FP32 U;
+    U.F = X;
+    INT32 E = (INT32)((U.U >> 23) & 0xFF) - 127;
+    U.U = (U.U & 0x807FFFFF) | 0x3F800000;      // mantissa in [1, 2)
+    float M = U.F;
+    float Z = (M - 1.0f) / (M + 1.0f);
+    float Z2 = Z * Z;
+    // log(M) = 2*Z*(1 + Z2/3 + Z2^2/5 + Z2^3/7)
+    float L = 2.0f * Z * (1.0f + Z2 * (0.3333333333f + Z2 * (0.2f + Z2 * 0.1428571429f)));
+    // log2(X) = E + log2(M); log2(M) = L * log2(e)
+    float L2 = (float)E + L * 1.4426950408889634f;
+    return L2 * 0.6931471805599453f;
+}
+
+// Single-precision lane access for the vector float ops
+static float PpcVecF (UINT8 R, UINT8 I) { PPC_FP32 V; V.U = VWD(R, I); return V.F; }
+static VOID  PpcVecFS (UINT8 R, UINT8 I, float F) { PPC_FP32 V; V.F = F; VWD_SET(R, I, V.U); }
+
+static UINT32
+PpcVecCvtToS32 (
+    IN float F
+    )
+{
+    if (F != F) {
+        return 0;
+    }
+    if (F >= 2147483648.0f) {
+        return 0x7FFFFFFF;
+    }
+    if (F < -2147483648.0f) {
+        return 0x80000000;
+    }
+    return (UINT32)(INT32)__builtin_truncf(F);
+}
+
+static UINT32
+PpcVecCvtToU32 (
+    IN float F
+    )
+{
+    if (F != F) {
+        return 0;
+    }
+    if (F >= 4294967296.0f) {
+        return 0xFFFFFFFF;
+    }
+    if (F <= -1.0f) {
+        return 0;
+    }
+    return (UINT32)__builtin_truncf(F);
+}
+
+// Update CR6 from a vector compare: EQ when all lanes matched, GT when some
+// but not all matched, LT when any lane was unordered (FP compares only).
+static VOID
+PpcVecSetCr6 (
+    IN BOOLEAN AllTrue,
+    IN BOOLEAN AnyTrue,
+    IN BOOLEAN AnyNaN
+    )
+{
+    UINT32 Value = 0;
+    if (AnyNaN) {
+        Value |= PPC_CR_LT;
+    } else if (AllTrue) {
+        Value |= PPC_CR_EQ;
+    } else if (AnyTrue) {
+        Value |= PPC_CR_GT;
+    }
+    PpcSetCrField(6, Value);
+}
+
+// Execute an AltiVec opcode-4 (VX/VA-form) instruction.
+static EFI_STATUS
+PpcExecuteVectorOp (
+    IN UINT32 w
+    )
+{
+    UINT32 Vbit = VV(w);
+    UINT32 Tail = VTAIL(w);
+    UINT32 X5   = VX5(w);
+    UINT32 Vd   = VD(w);
+    UINT32 Va   = VA(w);
+    UINT32 Vb   = VB(w);
+    UINT32 Vc   = VC(w);
+    UINT32 I;
+
+    // VA-form ops: the FRC field carries the third source register or a shift.
+    // All are distinguished by the V bit plus the 5-bit tail alone.
+    if (Vbit) {
+        switch (Tail) {
+        case 0x00:  // vmhaddshs vD, vA, vB, vC: sat((vA*vB + vC) >> 1)
+            for (I = 0; I < 8; I++) {
+                INT32 T = (INT32)(INT16)VHW(Va, I) * (INT32)(INT16)VHW(Vb, I) +
+                          (INT32)(INT16)VHW(Vc, I);
+                VHW_SET(Vd, I, PpcSatS16(T >> 1));
+            }
+            return EFI_SUCCESS;
+
+        case 0x01:  // vmhraddshs: sat((vA*vB + vC + 0x4000) >> 15)
+            for (I = 0; I < 8; I++) {
+                INT32 T = (INT32)(INT16)VHW(Va, I) * (INT32)(INT16)VHW(Vb, I) +
+                          (INT32)(INT16)VHW(Vc, I) + 0x4000;
+                VHW_SET(Vd, I, PpcSatS16(T >> 15));
+            }
+            return EFI_SUCCESS;
+
+        case 0x02:  // vmladduhm: sat16(vA*vB + vC), unsigned halfwords
+            for (I = 0; I < 8; I++) {
+                UINT32 T = (UINT32)VHW(Va, I) * VHW(Vb, I) + VHW(Vc, I);
+                VHW_SET(Vd, I, PpcSatU16((INT32)T));
+            }
+            return EFI_SUCCESS;
+
+        case 0x04:  // vmsumubm
+            for (I = 0; I < 4; I++) {
+                INT64 T = (UINT32)VWD(Vc, I);
+                UINTN J;
+                for (J = 0; J < 4; J++) {
+                    T += (UINT32)VBYTE(Va, I * 4 + J) * VBYTE(Vb, I * 4 + J);
+                }
+                VWD_SET(Vd, I, PpcSatU32(T));
+            }
+            return EFI_SUCCESS;
+
+        case 0x05:  // vmsummbm
+            for (I = 0; I < 4; I++) {
+                INT64 T = (INT32)(UINT32)VWD(Vc, I);
+                UINTN J;
+                for (J = 0; J < 4; J++) {
+                    T += (INT32)(INT8)VBYTE(Va, I * 4 + J) * (INT32)(INT8)VBYTE(Vb, I * 4 + J);
+                }
+                VWD_SET(Vd, I, PpcSatS32(T));
+            }
+            return EFI_SUCCESS;
+
+        case 0x06:  // vmsumuhm
+            for (I = 0; I < 4; I++) {
+                INT64 T = (UINT32)VWD(Vc, I);
+                UINTN J;
+                for (J = 0; J < 4; J++) {
+                    T += (UINT32)VHW(Va, I * 2 + J) * VHW(Vb, I * 2 + J);
+                }
+                VWD_SET(Vd, I, PpcSatU32(T));
+            }
+            return EFI_SUCCESS;
+
+        case 0x07:  // vmsumuhs
+            {
+                INT64 T = 0;
+                for (I = 0; I < 4; I++) {
+                    T += (UINT32)VHW(Va, I) * VHW(Vb, I);
+                }
+                VWD_SET(Vd, 0, PpcSatU32(T));
+                VWD_SET(Vd, 1, VWD(Vc, 0));
+                VWD_SET(Vd, 2, VWD(Vc, 1));
+                VWD_SET(Vd, 3, VWD(Vc, 2));
+            }
+            return EFI_SUCCESS;
+
+        case 0x08:  // vmsumshm
+            for (I = 0; I < 4; I++) {
+                INT64 T = (INT32)(UINT32)VWD(Vc, I);
+                UINTN J;
+                for (J = 0; J < 4; J++) {
+                    T += (INT32)(INT16)VHW(Va, I * 2 + J) * (INT32)(INT16)VHW(Vb, I * 2 + J);
+                }
+                VWD_SET(Vd, I, PpcSatS32(T));
+            }
+            return EFI_SUCCESS;
+
+        case 0x09:  // vmsumshs
+            {
+                INT64 T = 0;
+                for (I = 0; I < 4; I++) {
+                    T += (INT32)(INT16)VHW(Va, I) * (INT32)(INT16)VHW(Vb, I);
+                }
+                VWD_SET(Vd, 0, PpcSatS32(T));
+                VWD_SET(Vd, 1, VWD(Vc, 0));
+                VWD_SET(Vd, 2, VWD(Vc, 1));
+                VWD_SET(Vd, 3, VWD(Vc, 2));
+            }
+            return EFI_SUCCESS;
+
+        case 0x0A:  // vsel vD, vA, vB, vC: (vC & vA) | (~vC & vB)
+            for (I = 0; I < 16; I++) {
+                VBYTE(Vd, I) = (VBYTE(Vc, I) & VBYTE(Va, I)) |
+                               (~VBYTE(Vc, I) & VBYTE(Vb, I));
+            }
+            return EFI_SUCCESS;
+
+        case 0x0B:  // vperm vD, vA, vB, vC
+            for (I = 0; I < 16; I++) {
+                UINT8 Idx = VBYTE(Vc, I) & 0x0F;
+                UINT8 Src = (VBYTE(Vc, I) & 0x10) ? Vb : Va;
+                VBYTE(Vd, I) = VBYTE(Src, Idx);
+            }
+            return EFI_SUCCESS;
+
+        case 0x0C:  // vsldoi vD, vA, vB, SHB
+            {
+                UINT8 Tmp[32];
+                UINT32 Sh = X5 & 0x0F;
+                for (I = 0; I < 16; I++) {
+                    Tmp[I] = VBYTE(Va, I);
+                    Tmp[I + 16] = VBYTE(Vb, I);
+                }
+                for (I = 0; I < 16; I++) {
+                    VBYTE(Vd, I) = Tmp[Sh + I];
+                }
+            }
+            return EFI_SUCCESS;
+
+        case 0x0D:  // vpermxor vD, vA, vB, vC: (vA ^ vB) permuted by vC
+            for (I = 0; I < 16; I++) {
+                UINT8 Idx = VBYTE(Vc, I) & 0x0F;
+                VBYTE(Vd, I) = VBYTE(Va, Idx) ^ VBYTE(Vb, Idx);
+            }
+            return EFI_SUCCESS;
+
+        case 0x0E:  // vmaddfp vD, vA, vC, vB: vD = vA*vC + vB
+            for (I = 0; I < 4; I++) {
+                PpcVecFS(Vd, I, PpcVecF(Va, I) * PpcVecF(Vc, I) + PpcVecF(Vb, I));
+            }
+            return EFI_SUCCESS;
+
+        case 0x0F:  // vnmsubfp vD, vA, vC, vB: vD = -(vA*vC - vB)
+            for (I = 0; I < 4; I++) {
+                PpcVecFS(Vd, I, PpcVecF(Vb, I) - PpcVecF(Va, I) * PpcVecF(Vc, I));
+            }
+            return EFI_SUCCESS;
+
+        case 0x1B:  // vpermr vD, vA, vB, vC (reverse of vperm: bit-0x10 selects vA)
+            for (I = 0; I < 16; I++) {
+                UINT8 Idx = VBYTE(Vc, I) & 0x0F;
+                UINT8 Src = (VBYTE(Vc, I) & 0x10) ? Va : Vb;
+                VBYTE(Vd, I) = VBYTE(Src, Idx);
+            }
+            return EFI_SUCCESS;
+
+        case 0x1C:  // vaddeuqm vD, vA, vB, vC (carry in/out in vC[127])
+        case 0x1D:  // vaddecuq
+        case 0x1E:  // vsubeuqm
+        case 0x1F:  // vsubecuq
+            {
+                UINT64 AHi = V64H(Va), ALo = V64L(Va);
+                UINT64 BHi = V64H(Vb), BLo = V64L(Vb);
+                UINT32 Cin = VBYTE(Vc, 15) & 1;
+                UINT64 RLo, RHi, Cout;
+
+                if (Tail == 0x1E || Tail == 0x1F) {
+                    UINT64 TLo = BLo + Cin;
+                    UINT32 Borrow1 = (ALo < TLo) ? 1 : 0;
+                    RLo = ALo - TLo;
+                    UINT64 THi = BHi + Borrow1;
+                    UINT32 Borrow2 = (AHi < THi) ? 1 : 0;
+                    RHi = AHi - THi;
+                    Cout = Borrow2;
+                } else {
+                    UINT64 TLo = ALo + BLo + Cin;
+                    UINT32 Carry1 = (TLo < ALo) ? 1 : 0;
+                    RLo = TLo;
+                    UINT64 THi = AHi + BHi + Carry1;
+                    UINT32 Carry2 = (THi < AHi) ? 1 : 0;
+                    RHi = THi;
+                    Cout = Carry2;
+                }
+                V64_SET_H(Vd, RHi);
+                V64_SET_L(Vd, RLo);
+                for (I = 0; I < 15; I++) {
+                    VBYTE(Vc, I) = 0;
+                }
+                VBYTE(Vc, 15) = (UINT8)Cout;
+            }
+            return EFI_SUCCESS;
+
+        default:
+            return EFI_UNSUPPORTED;
+        }
+    }
+
+    // V=0: fixed sub-opcode in X5 plus the tail.
+    switch (Tail) {
+    case 0x00:  // integer add/sub family
+        switch (X5) {
+        case 0x00:  // vaddubm
+            for (I = 0; I < 16; I++) VBYTE(Vd, I) = VBYTE(Va, I) + VBYTE(Vb, I);
+            return EFI_SUCCESS;
+        case 0x01:  // vadduhm
+            for (I = 0; I < 8; I++) VHW_SET(Vd, I, VHW(Va, I) + VHW(Vb, I));
+            return EFI_SUCCESS;
+        case 0x02:  // vadduwm
+            for (I = 0; I < 4; I++) VWD_SET(Vd, I, VWD(Va, I) + VWD(Vb, I));
+            return EFI_SUCCESS;
+        case 0x03:  // vaddudm
+            V64_SET_H(Vd, V64H(Va) + V64H(Vb));
+            V64_SET_L(Vd, V64L(Va) + V64L(Vb));
+            return EFI_SUCCESS;
+        case 0x04:  // vadduqm (128-bit)
+            {
+                UINT64 Lo = V64L(Va) + V64L(Vb);
+                V64_SET_L(Vd, Lo);
+                V64_SET_H(Vd, V64H(Va) + V64H(Vb) + (Lo < V64L(Va) ? 1 : 0));
+            }
+            return EFI_SUCCESS;
+        case 0x05:  // vaddcuq (carry out)
+            {
+                UINT64 Lo = V64L(Va) + V64L(Vb);
+                UINT64 Hi = V64H(Va) + V64H(Vb) + (Lo < V64L(Va) ? 1 : 0);
+                for (I = 0; I < 15; I++) VBYTE(Vd, I) = 0;
+                VBYTE(Vd, 15) = (Hi < V64H(Va)) ? 1 : 0;
+            }
+            return EFI_SUCCESS;
+        case 0x06:  // vaddcuw
+            for (I = 0; I < 4; I++) {
+                UINT64 T = (UINT64)VWD(Va, I) + VWD(Vb, I);
+                for (UINTN J = 0; J < 3; J++) VBYTE(Vd, I * 4 + J) = 0;
+                VBYTE(Vd, I * 4 + 3) = (T >> 32) ? 1 : 0;
+            }
+            return EFI_SUCCESS;
+        case 0x08:  // vaddubs
+            for (I = 0; I < 16; I++) VBYTE(Vd, I) = PpcSatU8(VBYTE(Va, I) + VBYTE(Vb, I));
+            return EFI_SUCCESS;
+        case 0x09:  // vadduhs
+            for (I = 0; I < 8; I++) VHW_SET(Vd, I, PpcSatU16((INT32)VHW(Va, I) + VHW(Vb, I)));
+            return EFI_SUCCESS;
+        case 0x0A:  // vadduws
+            for (I = 0; I < 4; I++) VWD_SET(Vd, I, PpcSatU32((INT64)VWD(Va, I) + VWD(Vb, I)));
+            return EFI_SUCCESS;
+        case 0x0C:  // vaddsbs
+            for (I = 0; I < 16; I++) VBYTE(Vd, I) = PpcSatS8((INT32)(INT8)VBYTE(Va, I) + (INT8)VBYTE(Vb, I));
+            return EFI_SUCCESS;
+        case 0x0D:  // vaddshs
+            for (I = 0; I < 8; I++) VHW_SET(Vd, I, PpcSatS16((INT32)(INT16)VHW(Va, I) + (INT16)VHW(Vb, I)));
+            return EFI_SUCCESS;
+        case 0x0E:  // vaddsws
+            for (I = 0; I < 4; I++) VWD_SET(Vd, I, PpcSatS32((INT64)(INT32)VWD(Va, I) + (INT32)VWD(Vb, I)));
+            return EFI_SUCCESS;
+        case 0x10:  // vsububm
+            for (I = 0; I < 16; I++) VBYTE(Vd, I) = VBYTE(Va, I) - VBYTE(Vb, I);
+            return EFI_SUCCESS;
+        case 0x11:  // vsubuhm
+            for (I = 0; I < 8; I++) VHW_SET(Vd, I, VHW(Va, I) - VHW(Vb, I));
+            return EFI_SUCCESS;
+        case 0x12:  // vsubuwm
+            for (I = 0; I < 4; I++) VWD_SET(Vd, I, VWD(Va, I) - VWD(Vb, I));
+            return EFI_SUCCESS;
+        case 0x13:  // vsubudm
+            V64_SET_H(Vd, V64H(Va) - V64H(Vb));
+            V64_SET_L(Vd, V64L(Va) - V64L(Vb));
+            return EFI_SUCCESS;
+        case 0x14:  // vsubuqm (128-bit)
+            {
+                UINT64 Lo = V64L(Va) - V64L(Vb);
+                UINT64 Borrow = (V64L(Va) < V64L(Vb)) ? 1 : 0;
+                V64_SET_L(Vd, Lo);
+                V64_SET_H(Vd, V64H(Va) - V64H(Vb) - Borrow);
+            }
+            return EFI_SUCCESS;
+        case 0x15:  // vsubcuq (borrow out)
+            {
+                for (I = 0; I < 15; I++) VBYTE(Vd, I) = 0;
+                VBYTE(Vd, 15) = (V64H(Va) < V64H(Vb) || (V64L(Va) < V64L(Vb))) ? 1 : 0;
+            }
+            return EFI_SUCCESS;
+        case 0x18:  // vsububs
+            for (I = 0; I < 16; I++) VBYTE(Vd, I) = PpcSatU8((INT32)VBYTE(Va, I) - VBYTE(Vb, I));
+            return EFI_SUCCESS;
+        case 0x19:  // vsubuhs
+            for (I = 0; I < 8; I++) VHW_SET(Vd, I, PpcSatU16((INT32)VHW(Va, I) - VHW(Vb, I)));
+            return EFI_SUCCESS;
+        case 0x1A:  // vsubuws
+            for (I = 0; I < 4; I++) VWD_SET(Vd, I, PpcSatU32((INT64)(INT32)VWD(Va, I) - (INT32)VWD(Vb, I)));
+            return EFI_SUCCESS;
+        case 0x1C:  // vsubsbs
+            for (I = 0; I < 16; I++) VBYTE(Vd, I) = PpcSatS8((INT32)(INT8)VBYTE(Va, I) - (INT8)VBYTE(Vb, I));
+            return EFI_SUCCESS;
+        case 0x1D:  // vsubshs
+            for (I = 0; I < 8; I++) VHW_SET(Vd, I, PpcSatS16((INT32)(INT16)VHW(Va, I) - (INT16)VHW(Vb, I)));
+            return EFI_SUCCESS;
+        case 0x1E:  // vsubsws
+            for (I = 0; I < 4; I++) VWD_SET(Vd, I, PpcSatS32((INT64)(INT32)VWD(Va, I) - (INT32)VWD(Vb, I)));
+            return EFI_SUCCESS;
+        default:
+            return EFI_UNSUPPORTED;
+        }
+
+    case 0x01:  // vmul10* / BCD (decimal floating point) - not needed for boot
+        return EFI_UNSUPPORTED;
+
+    case 0x02:  // max / min / average / count-leading-zeros
+        switch (X5) {
+        case 0x00:  // vmaxub
+            for (I = 0; I < 16; I++) VBYTE(Vd, I) = VBYTE(Va, I) > VBYTE(Vb, I) ? VBYTE(Va, I) : VBYTE(Vb, I);
+            return EFI_SUCCESS;
+        case 0x01:  // vmaxuh
+            for (I = 0; I < 8; I++) VHW_SET(Vd, I, VHW(Va, I) > VHW(Vb, I) ? VHW(Va, I) : VHW(Vb, I));
+            return EFI_SUCCESS;
+        case 0x02:  // vmaxuw
+            for (I = 0; I < 4; I++) VWD_SET(Vd, I, VWD(Va, I) > VWD(Vb, I) ? VWD(Va, I) : VWD(Vb, I));
+            return EFI_SUCCESS;
+        case 0x03:  // vmaxud
+            V64_SET_H(Vd, V64H(Va) > V64H(Vb) ? V64H(Va) : V64H(Vb));
+            V64_SET_L(Vd, V64L(Va) > V64L(Vb) ? V64L(Va) : V64L(Vb));
+            return EFI_SUCCESS;
+        case 0x04:  // vmaxsb
+            for (I = 0; I < 16; I++) VBYTE(Vd, I) = (INT8)VBYTE(Va, I) > (INT8)VBYTE(Vb, I) ? VBYTE(Va, I) : VBYTE(Vb, I);
+            return EFI_SUCCESS;
+        case 0x05:  // vmaxsh
+            for (I = 0; I < 8; I++) VHW_SET(Vd, I, (INT16)VHW(Va, I) > (INT16)VHW(Vb, I) ? VHW(Va, I) : VHW(Vb, I));
+            return EFI_SUCCESS;
+        case 0x06:  // vmaxsw
+            for (I = 0; I < 4; I++) VWD_SET(Vd, I, (INT32)VWD(Va, I) > (INT32)VWD(Vb, I) ? VWD(Va, I) : VWD(Vb, I));
+            return EFI_SUCCESS;
+        case 0x08:  // vminub
+            for (I = 0; I < 16; I++) VBYTE(Vd, I) = VBYTE(Va, I) < VBYTE(Vb, I) ? VBYTE(Va, I) : VBYTE(Vb, I);
+            return EFI_SUCCESS;
+        case 0x09:  // vminuh
+            for (I = 0; I < 8; I++) VHW_SET(Vd, I, VHW(Va, I) < VHW(Vb, I) ? VHW(Va, I) : VHW(Vb, I));
+            return EFI_SUCCESS;
+        case 0x0A:  // vminuw
+            for (I = 0; I < 4; I++) VWD_SET(Vd, I, VWD(Va, I) < VWD(Vb, I) ? VWD(Va, I) : VWD(Vb, I));
+            return EFI_SUCCESS;
+        case 0x0C:  // vminsb
+            for (I = 0; I < 16; I++) VBYTE(Vd, I) = (INT8)VBYTE(Va, I) < (INT8)VBYTE(Vb, I) ? VBYTE(Va, I) : VBYTE(Vb, I);
+            return EFI_SUCCESS;
+        case 0x0D:  // vminsh
+            for (I = 0; I < 8; I++) VHW_SET(Vd, I, (INT16)VHW(Va, I) < (INT16)VHW(Vb, I) ? VHW(Va, I) : VHW(Vb, I));
+            return EFI_SUCCESS;
+        case 0x0E:  // vminsw
+            for (I = 0; I < 4; I++) VWD_SET(Vd, I, (INT32)VWD(Va, I) < (INT32)VWD(Vb, I) ? VWD(Va, I) : VWD(Vb, I));
+            return EFI_SUCCESS;
+        case 0x10:  // vavgub
+            for (I = 0; I < 16; I++) VBYTE(Vd, I) = (VBYTE(Va, I) + VBYTE(Vb, I) + 1) >> 1;
+            return EFI_SUCCESS;
+        case 0x11:  // vavguh
+            for (I = 0; I < 8; I++) VHW_SET(Vd, I, (VHW(Va, I) + VHW(Vb, I) + 1) >> 1);
+            return EFI_SUCCESS;
+        case 0x14:  // vavgsb
+            for (I = 0; I < 16; I++) {
+                INT32 S = (INT32)(INT8)VBYTE(Va, I) + (INT8)VBYTE(Vb, I) + 1;
+                VBYTE(Vd, I) = (UINT8)(S >> 1);
+            }
+            return EFI_SUCCESS;
+        case 0x15:  // vavgsh
+            for (I = 0; I < 8; I++) {
+                INT32 S = (INT32)(INT16)VHW(Va, I) + (INT16)VHW(Vb, I) + 1;
+                VHW_SET(Vd, I, (UINT16)(S >> 1));
+            }
+            return EFI_SUCCESS;
+        case 0x1C:  // vclzb
+            for (I = 0; I < 16; I++) {
+                UINT8 B = VBYTE(Vb, I), N = 0;
+                while ((B & 0x80) == 0 && N < 8) { B <<= 1; N++; }
+                VBYTE(Vd, I) = N;
+            }
+            return EFI_SUCCESS;
+        case 0x1D:  // vclzh
+            for (I = 0; I < 8; I++) {
+                UINT32 H = VHW(Vb, I), N = 0;
+                while ((H & 0x8000) == 0 && N < 16) { H <<= 1; N++; }
+                VHW_SET(Vd, I, N);
+            }
+            return EFI_SUCCESS;
+        case 0x1E:  // vclzw
+            for (I = 0; I < 4; I++) {
+                UINT32 W = VWD(Vb, I), N = 0;
+                while ((W & 0x80000000) == 0 && N < 32) { W <<= 1; N++; }
+                VWD_SET(Vd, I, N);
+            }
+            return EFI_SUCCESS;
+        case 0x18:  // vextsb2d: sign-extend each byte to a doubleword
+            for (I = 0; I < 8; I++) {
+                INT64 S = (INT8)VBYTE(Vb, I);
+                VBYTE(Vd, 8 * I + 0) = (UINT8)(S >> 56);
+                VBYTE(Vd, 8 * I + 1) = (UINT8)(S >> 48);
+                VBYTE(Vd, 8 * I + 2) = (UINT8)(S >> 40);
+                VBYTE(Vd, 8 * I + 3) = (UINT8)(S >> 32);
+                VBYTE(Vd, 8 * I + 4) = (UINT8)(S >> 24);
+                VBYTE(Vd, 8 * I + 5) = (UINT8)(S >> 16);
+                VBYTE(Vd, 8 * I + 6) = (UINT8)(S >> 8);
+                VBYTE(Vd, 8 * I + 7) = (UINT8)S;
+            }
+            return EFI_SUCCESS;
+        default:
+            return EFI_UNSUPPORTED;
+        }
+
+    case 0x03:  // vabsdub / vabsduh
+        if (X5 == 0x10) {
+            for (I = 0; I < 16; I++) {
+                INT32 S = (INT8)VBYTE(Va, I) - (INT8)VBYTE(Vb, I);
+                VBYTE(Vd, I) = (UINT8)(S < 0 ? -S : S);
+            }
+            return EFI_SUCCESS;
+        }
+        if (X5 == 0x11) {
+            for (I = 0; I < 8; I++) {
+                INT32 S = (INT16)VHW(Va, I) - (INT16)VHW(Vb, I);
+                VHW_SET(Vd, I, (UINT16)(S < 0 ? -S : S));
+            }
+            return EFI_SUCCESS;
+        }
+        return EFI_UNSUPPORTED;
+
+    case 0x04:  // rotate / shift / logical / mfvscr / mtvscr
+        switch (X5) {
+        case 0x00:  // vrlb
+            for (I = 0; I < 16; I++) {
+                UINT32 N = VBYTE(Vb, I) & 7;
+                UINT8 B = VBYTE(Va, I);
+                VBYTE(Vd, I) = N ? (UINT8)((B << N) | (B >> (8 - N))) : B;
+            }
+            return EFI_SUCCESS;
+        case 0x01:  // vrlh
+            for (I = 0; I < 8; I++) {
+                UINT32 N = VHW(Vb, I) & 15;
+                UINT32 H = VHW(Va, I);
+                VHW_SET(Vd, I, N ? (UINT16)((H << N) | (H >> (16 - N))) : (UINT16)H);
+            }
+            return EFI_SUCCESS;
+        case 0x02:  // vrlw
+            for (I = 0; I < 4; I++) {
+                UINT32 N = VWD(Vb, I) & 31;
+                UINT32 W = VWD(Va, I);
+                VWD_SET(Vd, I, N ? (W << N) | (W >> (32 - N)) : W);
+            }
+            return EFI_SUCCESS;
+        case 0x04:  // vslb
+            for (I = 0; I < 16; I++) {
+                UINT32 N = VBYTE(Vb, I) & 7;
+                VBYTE(Vd, I) = N ? (UINT8)(VBYTE(Va, I) << N) : VBYTE(Va, I);
+            }
+            return EFI_SUCCESS;
+        case 0x05:  // vslh
+            for (I = 0; I < 8; I++) {
+                UINT32 N = VHW(Vb, I) & 15;
+                VHW_SET(Vd, I, N ? (UINT16)(VHW(Va, I) << N) : (UINT16)VHW(Va, I));
+            }
+            return EFI_SUCCESS;
+        case 0x06:  // vslw
+            for (I = 0; I < 4; I++) {
+                UINT32 N = VWD(Vb, I) & 31;
+                VWD_SET(Vd, I, N ? VWD(Va, I) << N : VWD(Va, I));
+            }
+            return EFI_SUCCESS;
+        case 0x08:  // vsrb
+            for (I = 0; I < 16; I++) {
+                UINT32 N = VBYTE(Vb, I) & 7;
+                VBYTE(Vd, I) = N ? (UINT8)(VBYTE(Va, I) >> N) : VBYTE(Va, I);
+            }
+            return EFI_SUCCESS;
+        case 0x09:  // vsrh
+            for (I = 0; I < 8; I++) {
+                UINT32 N = VHW(Vb, I) & 15;
+                VHW_SET(Vd, I, N ? (UINT16)(VHW(Va, I) >> N) : (UINT16)VHW(Va, I));
+            }
+            return EFI_SUCCESS;
+        case 0x0A:  // vsrw
+            for (I = 0; I < 4; I++) {
+                UINT32 N = VWD(Vb, I) & 31;
+                VWD_SET(Vd, I, N ? VWD(Va, I) >> N : VWD(Va, I));
+            }
+            return EFI_SUCCESS;
+        case 0x0C:  // vsrab
+            for (I = 0; I < 16; I++) {
+                UINT32 N = VBYTE(Vb, I) & 7;
+                VBYTE(Vd, I) = (UINT8)((INT8)VBYTE(Va, I) >> N);
+            }
+            return EFI_SUCCESS;
+        case 0x0D:  // vsrah
+            for (I = 0; I < 8; I++) {
+                UINT32 N = VHW(Vb, I) & 15;
+                VHW_SET(Vd, I, (UINT16)((INT16)VHW(Va, I) >> N));
+            }
+            return EFI_SUCCESS;
+        case 0x0E:  // vsraw
+            for (I = 0; I < 4; I++) {
+                UINT32 N = VWD(Vb, I) & 31;
+                VWD_SET(Vd, I, (UINT32)((INT32)VWD(Va, I) >> N));
+            }
+            return EFI_SUCCESS;
+        case 0x0F:  // vsrad: arithmetic shift each doubleword
+            {
+                UINT32 N0 = V64H(Vb) & 63, N1 = V64L(Vb) & 63;
+                V64_SET_H(Vd, (UINT64)((INT64)V64H(Va) >> N0));
+                V64_SET_L(Vd, (UINT64)((INT64)V64L(Va) >> N1));
+            }
+            return EFI_SUCCESS;
+        case 0x1B:  // vsrd: logical shift each doubleword
+            {
+                UINT32 N0 = V64H(Vb) & 63, N1 = V64L(Vb) & 63;
+                V64_SET_H(Vd, V64H(Va) >> N0);
+                V64_SET_L(Vd, V64L(Va) >> N1);
+            }
+            return EFI_SUCCESS;
+        case 0x1C:  // vsrv: per-byte variable shift right
+            for (I = 0; I < 16; I++) {
+                UINT32 N = VBYTE(Vb, I) & 7;
+                VBYTE(Vd, I) = (UINT8)(VBYTE(Va, I) >> N);
+            }
+            return EFI_SUCCESS;
+        case 0x1D:  // vslv: per-byte variable shift left
+            for (I = 0; I < 16; I++) {
+                UINT32 N = VBYTE(Vb, I) & 7;
+                VBYTE(Vd, I) = (UINT8)(VBYTE(Va, I) << N);
+            }
+            return EFI_SUCCESS;
+        case 0x10:  // vand
+            for (I = 0; I < 16; I++) VBYTE(Vd, I) = VBYTE(Va, I) & VBYTE(Vb, I);
+            return EFI_SUCCESS;
+        case 0x11:  // vandc
+            for (I = 0; I < 16; I++) VBYTE(Vd, I) = VBYTE(Va, I) & ~VBYTE(Vb, I);
+            return EFI_SUCCESS;
+        case 0x12:  // vor / vmr
+            for (I = 0; I < 16; I++) VBYTE(Vd, I) = VBYTE(Va, I) | VBYTE(Vb, I);
+            return EFI_SUCCESS;
+        case 0x13:  // vxor
+            for (I = 0; I < 16; I++) VBYTE(Vd, I) = VBYTE(Va, I) ^ VBYTE(Vb, I);
+            return EFI_SUCCESS;
+        case 0x14:  // vnor
+            for (I = 0; I < 16; I++) VBYTE(Vd, I) = ~(VBYTE(Va, I) | VBYTE(Vb, I));
+            return EFI_SUCCESS;
+        case 0x18:  // mfvscr vD
+            VWD_SET(Vd, 3, g_PpcContext.Vscr);
+            return EFI_SUCCESS;
+        case 0x19:  // mtvscr vB
+            g_PpcContext.Vscr = VWD(Vb, 3);
+            return EFI_SUCCESS;
+        default:
+            return EFI_UNSUPPORTED;
+        }
+
+    case 0x05:  // rotate-and-mask (POWER6+)
+        switch (X5) {
+        case 0x02:  // vrlwmi: rotl, AND mask = most-significant (s+1) bits
+            for (I = 0; I < 4; I++) {
+                UINT32 N = VWD(Vb, I) & 31;
+                UINT32 W = VWD(Va, I);
+                UINT32 M = (N == 31) ? 0xFFFFFFFF : (0xFFFFFFFF << (31 - N));
+                VWD_SET(Vd, I, (N ? (W << N) | (W >> (32 - N)) : W) & M);
+            }
+            return EFI_SUCCESS;
+        case 0x03:  // vrldmi
+            {
+                UINT32 N0 = V64H(Vb) & 63, N1 = V64L(Vb) & 63;
+                UINT64 A0 = V64H(Va), A1 = V64L(Va);
+                UINT64 M0 = (N0 == 63) ? ~0ULL : (~0ULL << (63 - N0));
+                UINT64 M1 = (N1 == 63) ? ~0ULL : (~0ULL << (63 - N1));
+                V64_SET_H(Vd, (N0 ? (A0 << N0) | (A0 >> (64 - N0)) : A0) & M0);
+                V64_SET_L(Vd, (N1 ? (A1 << N1) | (A1 >> (64 - N1)) : A1) & M1);
+            }
+            return EFI_SUCCESS;
+        case 0x07:  // vrldnm: rotl, AND NOT mask
+            {
+                UINT32 N0 = V64H(Vb) & 63, N1 = V64L(Vb) & 63;
+                UINT64 A0 = V64H(Va), A1 = V64L(Va);
+                UINT64 M0 = (N0 == 63) ? ~0ULL : (~0ULL << (63 - N0));
+                UINT64 M1 = (N1 == 63) ? ~0ULL : (~0ULL << (63 - N1));
+                V64_SET_H(Vd, (N0 ? (A0 << N0) | (A0 >> (64 - N0)) : A0) & ~M0);
+                V64_SET_L(Vd, (N1 ? (A1 << N1) | (A1 >> (64 - N1)) : A1) & ~M1);
+            }
+            return EFI_SUCCESS;
+        default:
+            return EFI_UNSUPPORTED;
+        }
+
+    case 0x06:  // vector compares (update vD masks + CR6)
+        {
+            BOOLEAN All = TRUE, Any = FALSE, Nan = FALSE;
+            switch (X5) {
+            case 0x00: case 0x10:  // vcmpequb
+                for (I = 0; I < 16; I++) {
+                    BOOLEAN T = (VBYTE(Va, I) == VBYTE(Vb, I));
+                    VBYTE(Vd, I) = T ? 0xFF : 0x00;
+                    All &= T; Any |= T;
+                }
+                break;
+            case 0x01: case 0x11:  // vcmpequh
+                for (I = 0; I < 8; I++) {
+                    BOOLEAN T = (VHW(Va, I) == VHW(Vb, I));
+                    VHW_SET(Vd, I, T ? 0xFFFF : 0x0000);
+                    All &= T; Any |= T;
+                }
+                break;
+            case 0x02: case 0x12:  // vcmpequw
+                for (I = 0; I < 4; I++) {
+                    BOOLEAN T = (VWD(Va, I) == VWD(Vb, I));
+                    VWD_SET(Vd, I, T ? 0xFFFFFFFF : 0x00000000);
+                    All &= T; Any |= T;
+                }
+                break;
+            case 0x03: case 0x13:  // vcmpeqfp
+                for (I = 0; I < 4; I++) {
+                    float A = PpcVecF(Va, I), B = PpcVecF(Vb, I);
+                    BOOLEAN T = (A == B);
+                    if (A != A || B != B) Nan = TRUE;
+                    VWD_SET(Vd, I, T ? 0xFFFFFFFF : 0x00000000);
+                    All &= T; Any |= T;
+                }
+                break;
+            case 0x04: case 0x0C: case 0x14: case 0x1C:  // vcmpgtsb(.)
+                for (I = 0; I < 16; I++) {
+                    BOOLEAN T = ((INT8)VBYTE(Va, I) > (INT8)VBYTE(Vb, I));
+                    VBYTE(Vd, I) = T ? 0xFF : 0x00;
+                    All &= T; Any |= T;
+                }
+                break;
+            case 0x05: case 0x0D: case 0x15: case 0x1D:  // vcmpgtsh(.)
+                for (I = 0; I < 8; I++) {
+                    BOOLEAN T = ((INT16)VHW(Va, I) > (INT16)VHW(Vb, I));
+                    VHW_SET(Vd, I, T ? 0xFFFF : 0x0000);
+                    All &= T; Any |= T;
+                }
+                break;
+            case 0x06: case 0x0E: case 0x16: case 0x1E:  // vcmpgtsw(.)
+                for (I = 0; I < 4; I++) {
+                    BOOLEAN T = ((INT32)VWD(Va, I) > (INT32)VWD(Vb, I));
+                    VWD_SET(Vd, I, T ? 0xFFFFFFFF : 0x00000000);
+                    All &= T; Any |= T;
+                }
+                break;
+            case 0x07: case 0x17:  // vcmpgefp
+                for (I = 0; I < 4; I++) {
+                    float A = PpcVecF(Va, I), B = PpcVecF(Vb, I);
+                    BOOLEAN T = (A >= B);
+                    if (A != A || B != B) Nan = TRUE;
+                    VWD_SET(Vd, I, T ? 0xFFFFFFFF : 0x00000000);
+                    All &= T; Any |= T;
+                }
+                break;
+            case 0x08: case 0x18:  // vcmpgtub
+                for (I = 0; I < 16; I++) {
+                    BOOLEAN T = (VBYTE(Va, I) > VBYTE(Vb, I));
+                    VBYTE(Vd, I) = T ? 0xFF : 0x00;
+                    All &= T; Any |= T;
+                }
+                break;
+            case 0x09: case 0x19:  // vcmpgtuh
+                for (I = 0; I < 8; I++) {
+                    BOOLEAN T = (VHW(Va, I) > VHW(Vb, I));
+                    VHW_SET(Vd, I, T ? 0xFFFF : 0x0000);
+                    All &= T; Any |= T;
+                }
+                break;
+            case 0x0A: case 0x1A:  // vcmpgtuw
+                for (I = 0; I < 4; I++) {
+                    BOOLEAN T = (VWD(Va, I) > VWD(Vb, I));
+                    VWD_SET(Vd, I, T ? 0xFFFFFFFF : 0x00000000);
+                    All &= T; Any |= T;
+                }
+                break;
+            case 0x0B: case 0x1B:  // vcmpgtfp
+                for (I = 0; I < 4; I++) {
+                    float A = PpcVecF(Va, I), B = PpcVecF(Vb, I);
+                    BOOLEAN T = (A > B);
+                    if (A != A || B != B) Nan = TRUE;
+                    VWD_SET(Vd, I, T ? 0xFFFFFFFF : 0x00000000);
+                    All &= T; Any |= T;
+                }
+                break;
+            case 0x0F: case 0x1F:  // vcmpbfp (bounded: |a-b| <= (|a|+|b|)/4)
+                for (I = 0; I < 4; I++) {
+                    float A = PpcVecF(Va, I), B = PpcVecF(Vb, I);
+                    BOOLEAN T = (__builtin_fabsf(A - B) <= (__builtin_fabsf(A) + __builtin_fabsf(B)) * 0.25f);
+                    VWD_SET(Vd, I, T ? 0xFFFFFFFF : 0x00000000);
+                    All &= T; Any |= T;
+                }
+                break;
+            default:
+                return EFI_UNSUPPORTED;
+            }
+            PpcVecSetCr6(All, Any, Nan);
+        }
+        return EFI_SUCCESS;
+
+    case 0x07:  // 64-bit / not-equal compares (update vD masks + CR6)
+        {
+            BOOLEAN All = TRUE, Any = FALSE;
+            switch (X5) {
+            case 0x00: case 0x10:  // vcmpneb
+                for (I = 0; I < 16; I++) {
+                    BOOLEAN T = (VBYTE(Va, I) != VBYTE(Vb, I));
+                    VBYTE(Vd, I) = T ? 0xFF : 0x00;
+                    All &= T; Any |= T;
+                }
+                break;
+            case 0x01: case 0x11:  // vcmpneh
+                for (I = 0; I < 8; I++) {
+                    BOOLEAN T = (VHW(Va, I) != VHW(Vb, I));
+                    VHW_SET(Vd, I, T ? 0xFFFF : 0x0000);
+                    All &= T; Any |= T;
+                }
+                break;
+            case 0x03: case 0x13:  // vcmpequd
+                {
+                    BOOLEAN T0 = (V64H(Va) == V64H(Vb));
+                    BOOLEAN T1 = (V64L(Va) == V64L(Vb));
+                    V64_SET_H(Vd, T0 ? ~0ULL : 0ULL);
+                    V64_SET_L(Vd, T1 ? ~0ULL : 0ULL);
+                    All &= T0 & T1; Any |= T0 | T1;
+                }
+                break;
+            case 0x04: case 0x14:  // vcmpnezb: true unless equal and non-zero
+                for (I = 0; I < 16; I++) {
+                    UINT8 A = VBYTE(Va, I), B = VBYTE(Vb, I);
+                    BOOLEAN T = (A != B) || (A == 0) || (B == 0);
+                    VBYTE(Vd, I) = T ? 0xFF : 0x00;
+                    All &= T; Any |= T;
+                }
+                break;
+            default:
+                return EFI_UNSUPPORTED;
+            }
+            PpcVecSetCr6(All, Any, FALSE);
+        }
+        return EFI_SUCCESS;
+
+    case 0x08:  // integer multiply
+        switch (X5) {
+        case 0x00:  // vmuloub
+            for (I = 0; I < 8; I++) VHW_SET(Vd, I, (UINT32)VBYTE(Va, 2 * I) * VBYTE(Vb, 2 * I));
+            return EFI_SUCCESS;
+        case 0x01:  // vmulouh
+            for (I = 0; I < 4; I++) VWD_SET(Vd, I, (UINT32)VHW(Va, 2 * I) * VHW(Vb, 2 * I));
+            return EFI_SUCCESS;
+        case 0x02:  // vmulouw
+            {
+                UINT64 P0 = (UINT64)VWD(Va, 0) * VWD(Vb, 0);
+                UINT64 P1 = (UINT64)VWD(Va, 2) * VWD(Vb, 2);
+                V64_SET_H(Vd, P0);
+                V64_SET_L(Vd, P1);
+            }
+            return EFI_SUCCESS;
+        case 0x04:  // vmulosb
+            for (I = 0; I < 8; I++) VHW_SET(Vd, I, (UINT16)((INT32)(INT8)VBYTE(Va, 2 * I) * (INT8)VBYTE(Vb, 2 * I)));
+            return EFI_SUCCESS;
+        case 0x05:  // vmulosh
+            for (I = 0; I < 4; I++) VWD_SET(Vd, I, (UINT32)((INT32)(INT16)VHW(Va, 2 * I) * (INT16)VHW(Vb, 2 * I)));
+            return EFI_SUCCESS;
+        case 0x06:  // vmulosw
+            {
+                UINT64 P0 = (UINT64)(INT64)(INT32)VWD(Va, 0) * (INT32)VWD(Vb, 0);
+                UINT64 P1 = (UINT64)(INT64)(INT32)VWD(Va, 2) * (INT32)VWD(Vb, 2);
+                V64_SET_H(Vd, P0);
+                V64_SET_L(Vd, P1);
+            }
+            return EFI_SUCCESS;
+        case 0x08:  // vmuleub
+            for (I = 0; I < 8; I++) VHW_SET(Vd, I, (UINT32)VBYTE(Va, 2 * I + 1) * VBYTE(Vb, 2 * I + 1));
+            return EFI_SUCCESS;
+        case 0x09:  // vmuleuh
+            for (I = 0; I < 4; I++) VWD_SET(Vd, I, (UINT32)VHW(Va, 2 * I + 1) * VHW(Vb, 2 * I + 1));
+            return EFI_SUCCESS;
+        case 0x0A:  // vmuleuw
+            {
+                UINT64 P0 = (UINT64)VWD(Va, 1) * VWD(Vb, 1);
+                UINT64 P1 = (UINT64)VWD(Va, 3) * VWD(Vb, 3);
+                V64_SET_H(Vd, P0);
+                V64_SET_L(Vd, P1);
+            }
+            return EFI_SUCCESS;
+        case 0x0C:  // vmulesb
+            for (I = 0; I < 8; I++) VHW_SET(Vd, I, (UINT16)((INT32)(INT8)VBYTE(Va, 2 * I + 1) * (INT8)VBYTE(Vb, 2 * I + 1)));
+            return EFI_SUCCESS;
+        case 0x0D:  // vmulesh
+            for (I = 0; I < 4; I++) VWD_SET(Vd, I, (UINT32)((INT32)(INT16)VHW(Va, 2 * I + 1) * (INT16)VHW(Vb, 2 * I + 1)));
+            return EFI_SUCCESS;
+        case 0x0E:  // vmulesw
+            {
+                UINT64 P0 = (UINT64)(INT64)(INT32)VWD(Va, 1) * (INT32)VWD(Vb, 1);
+                UINT64 P1 = (UINT64)(INT64)(INT32)VWD(Va, 3) * (INT32)VWD(Vb, 3);
+                V64_SET_H(Vd, P0);
+                V64_SET_L(Vd, P1);
+            }
+            return EFI_SUCCESS;
+        case 0x18:  // vsum4ubs
+            for (I = 0; I < 4; I++) {
+                INT64 T = (UINT32)VWD(Vb, I);
+                UINTN J;
+                for (J = 0; J < 4; J++) T += (UINT32)VBYTE(Va, I * 4 + J);
+                VWD_SET(Vd, I, PpcSatU32(T));
+            }
+            return EFI_SUCCESS;
+        case 0x19:  // vsum4shs
+            for (I = 0; I < 4; I++) {
+                INT64 T = (UINT32)VWD(Vb, I);
+                UINTN J;
+                for (J = 0; J < 2; J++) T += (INT32)(INT16)VHW(Va, I * 2 + J);
+                VWD_SET(Vd, I, PpcSatS32(T));
+            }
+            return EFI_SUCCESS;
+        case 0x1A:  // vsum2sws
+            {
+                INT64 T0 = (INT32)(UINT32)VWD(Vb, 0) + (INT32)(UINT32)VWD(Va, 0) + (INT32)(UINT32)VWD(Va, 2);
+                INT64 T2 = (INT32)(UINT32)VWD(Vb, 2) + (INT32)(UINT32)VWD(Va, 1) + (INT32)(UINT32)VWD(Va, 3);
+                VWD_SET(Vd, 0, PpcSatS32(T0));
+                VWD_SET(Vd, 1, VWD(Vb, 1));
+                VWD_SET(Vd, 2, PpcSatS32(T2));
+                VWD_SET(Vd, 3, VWD(Vb, 3));
+            }
+            return EFI_SUCCESS;
+        case 0x1C:  // vsum4sbs
+            for (I = 0; I < 4; I++) {
+                INT64 T = (UINT32)VWD(Vb, I);
+                UINTN J;
+                for (J = 0; J < 4; J++) T += (INT32)(INT8)VBYTE(Va, I * 4 + J);
+                VWD_SET(Vd, I, PpcSatS32(T));
+            }
+            return EFI_SUCCESS;
+        default:
+            return EFI_UNSUPPORTED;
+        }
+
+    case 0x0A:  // floating-point arithmetic / conversion
+        switch (X5) {
+        case 0x00:  // vaddfp
+            for (I = 0; I < 4; I++) PpcVecFS(Vd, I, PpcVecF(Va, I) + PpcVecF(Vb, I));
+            return EFI_SUCCESS;
+        case 0x01:  // vsubfp
+            for (I = 0; I < 4; I++) PpcVecFS(Vd, I, PpcVecF(Va, I) - PpcVecF(Vb, I));
+            return EFI_SUCCESS;
+        case 0x02:  // vmaxfp
+            for (I = 0; I < 4; I++) PpcVecFS(Vd, I, PpcVecF(Va, I) > PpcVecF(Vb, I) ? PpcVecF(Va, I) : PpcVecF(Vb, I));
+            return EFI_SUCCESS;
+        case 0x03:  // vminfp
+            for (I = 0; I < 4; I++) PpcVecFS(Vd, I, PpcVecF(Va, I) < PpcVecF(Vb, I) ? PpcVecF(Va, I) : PpcVecF(Vb, I));
+            return EFI_SUCCESS;
+        case 0x04:  // vrefp
+            for (I = 0; I < 4; I++) PpcVecFS(Vd, I, 1.0f / PpcVecF(Vb, I));
+            return EFI_SUCCESS;
+        case 0x05:  // vrsqrtefp
+            for (I = 0; I < 4; I++) PpcVecFS(Vd, I, 1.0f / __builtin_sqrtf(PpcVecF(Vb, I)));
+            return EFI_SUCCESS;
+        case 0x06:  // vexptefp (2^x)
+            for (I = 0; I < 4; I++) PpcVecFS(Vd, I, __builtin_expf(PpcVecF(Vb, I) * 0.6931471805599453f));
+            return EFI_SUCCESS;
+        case 0x07:  // vlogefp (log2 x)
+            for (I = 0; I < 4; I++) PpcVecFS(Vd, I, __builtin_logf(PpcVecF(Vb, I)) / 0.6931471805599453f);
+            return EFI_SUCCESS;
+        case 0x08:  // vrfin
+            for (I = 0; I < 4; I++) PpcVecFS(Vd, I, __builtin_rintf(PpcVecF(Vb, I)));
+            return EFI_SUCCESS;
+        case 0x09:  // vrfiz
+            for (I = 0; I < 4; I++) PpcVecFS(Vd, I, __builtin_truncf(PpcVecF(Vb, I)));
+            return EFI_SUCCESS;
+        case 0x0A:  // vrfip
+            for (I = 0; I < 4; I++) PpcVecFS(Vd, I, __builtin_ceilf(PpcVecF(Vb, I)));
+            return EFI_SUCCESS;
+        case 0x0B:  // vrfim
+            for (I = 0; I < 4; I++) PpcVecFS(Vd, I, __builtin_floorf(PpcVecF(Vb, I)));
+            return EFI_SUCCESS;
+        case 0x0C:  // vcfux vD, vB, UIM
+            for (I = 0; I < 4; I++) {
+                PpcVecFS(Vd, I, (float)(UINT32)VWD(Vb, I) * __builtin_expf((float)UIM(w) * 0.6931471805599453f));
+            }
+            return EFI_SUCCESS;
+        case 0x0D:  // vcfsx vD, vB, UIM
+            for (I = 0; I < 4; I++) {
+                PpcVecFS(Vd, I, (float)(INT32)VWD(Vb, I) * __builtin_expf((float)UIM(w) * 0.6931471805599453f));
+            }
+            return EFI_SUCCESS;
+        case 0x0E:  // vctuxs vD, vB, UIM
+            for (I = 0; I < 4; I++) {
+                VWD_SET(Vd, I, PpcVecCvtToU32(PpcVecF(Vb, I)) >> (UIM(w) & 31));
+            }
+            return EFI_SUCCESS;
+        case 0x0F:  // vctsxs vD, vB, UIM
+            for (I = 0; I < 4; I++) {
+                VWD_SET(Vd, I, (UINT32)((INT32)PpcVecCvtToS32(PpcVecF(Vb, I)) >> (UIM(w) & 31)));
+            }
+            return EFI_SUCCESS;
+        default:
+            return EFI_UNSUPPORTED;
+        }
+
+    case 0x0C:  // merge / splat
+        switch (X5) {
+        case 0x00:  // vmrghb
+            for (I = 0; I < 8; I++) {
+                VBYTE(Vd, 2 * I) = VBYTE(Va, I);
+                VBYTE(Vd, 2 * I + 1) = VBYTE(Vb, I);
+            }
+            return EFI_SUCCESS;
+        case 0x01:  // vmrghh
+            for (I = 0; I < 4; I++) {
+                VHW_SET(Vd, 2 * I, VHW(Va, I));
+                VHW_SET(Vd, 2 * I + 1, VHW(Vb, I));
+            }
+            return EFI_SUCCESS;
+        case 0x02:  // vmrghw
+            for (I = 0; I < 2; I++) {
+                VWD_SET(Vd, 2 * I, VWD(Va, I));
+                VWD_SET(Vd, 2 * I + 1, VWD(Vb, I));
+            }
+            return EFI_SUCCESS;
+        case 0x04:  // vmrglb
+            for (I = 0; I < 8; I++) {
+                VBYTE(Vd, 2 * I) = VBYTE(Va, I + 8);
+                VBYTE(Vd, 2 * I + 1) = VBYTE(Vb, I + 8);
+            }
+            return EFI_SUCCESS;
+        case 0x05:  // vmrglh
+            for (I = 0; I < 4; I++) {
+                VHW_SET(Vd, 2 * I, VHW(Va, I + 4));
+                VHW_SET(Vd, 2 * I + 1, VHW(Vb, I + 4));
+            }
+            return EFI_SUCCESS;
+        case 0x06:  // vmrglw
+            for (I = 0; I < 2; I++) {
+                VWD_SET(Vd, 2 * I, VWD(Va, I + 2));
+                VWD_SET(Vd, 2 * I + 1, VWD(Vb, I + 2));
+            }
+            return EFI_SUCCESS;
+        case 0x08:  // vspltb vD, vB, UIM
+            for (I = 0; I < 16; I++) VBYTE(Vd, I) = VBYTE(Vb, UIM(w) & 15);
+            return EFI_SUCCESS;
+        case 0x09:  // vsplth vD, vB, UIM
+            for (I = 0; I < 8; I++) VHW_SET(Vd, I, VHW(Vb, UIM(w) & 7));
+            return EFI_SUCCESS;
+        case 0x0A:  // vspltw vD, vB, UIM
+            for (I = 0; I < 4; I++) VWD_SET(Vd, I, VWD(Vb, UIM(w) & 3));
+            return EFI_SUCCESS;
+        case 0x0C:  // vspltisb vD, IMM
+            {
+                UINT32 Imm = (UIM(w) & 0x10) ? (UIM(w) | 0xFFFFFFE0) : UIM(w);
+                for (I = 0; I < 16; I++) VBYTE(Vd, I) = (UINT8)(INT32)Imm;
+            }
+            return EFI_SUCCESS;
+        case 0x0D:  // vspltish vD, IMM
+            {
+                UINT32 Imm = (UIM(w) & 0x10) ? (UIM(w) | 0xFFFFFFE0) : UIM(w);
+                for (I = 0; I < 8; I++) VHW_SET(Vd, I, (UINT16)(INT32)Imm);
+            }
+            return EFI_SUCCESS;
+        case 0x0E:  // vspltisw vD, IMM
+            {
+                UINT32 Imm = (UIM(w) & 0x10) ? (UIM(w) | 0xFFFFFFE0) : UIM(w);
+                for (I = 0; I < 4; I++) VWD_SET(Vd, I, Imm);
+            }
+            return EFI_SUCCESS;
+        case 0x1E:  // vmrgew
+            for (I = 0; I < 2; I++) {
+                VWD_SET(Vd, 2 * I, VWD(Va, 2 * I));
+                VWD_SET(Vd, 2 * I + 1, VWD(Vb, 2 * I));
+            }
+            return EFI_SUCCESS;
+        default:
+            return EFI_UNSUPPORTED;
+        }
+
+    case 0x0E:  // pack
+        switch (X5) {
+        case 0x00:  // vpkuhum
+            for (I = 0; I < 16; I++) {
+                UINT32 Src = (I < 8) ? Va : Vb;
+                VBYTE(Vd, I) = VBYTE(Src, ((I & 7) * 2) + 1);
+            }
+            return EFI_SUCCESS;
+        case 0x01:  // vpkuwum
+            for (I = 0; I < 8; I++) {
+                UINT32 Src = (I < 4) ? Va : Vb;
+                VHW_SET(Vd, I, VWD(Src, I & 3) & 0xFFFF);
+            }
+            return EFI_SUCCESS;
+        case 0x04:  // vpkshus
+            for (I = 0; I < 16; I++) {
+                UINT32 Src = (I < 8) ? Va : Vb;
+                INT32 V = (INT16)VHW(Src, I & 7);
+                VBYTE(Vd, I) = (V < 0) ? 0 : (V > 0xFF ? 0xFF : (UINT8)V);
+            }
+            return EFI_SUCCESS;
+        case 0x05:  // vpkshss
+            for (I = 0; I < 16; I++) {
+                UINT32 Src = (I < 8) ? Va : Vb;
+                VBYTE(Vd, I) = PpcSatS8((INT16)VHW(Src, I & 7));
+            }
+            return EFI_SUCCESS;
+        case 0x06:  // vpkswus
+            for (I = 0; I < 8; I++) {
+                UINT32 Src = (I < 4) ? Va : Vb;
+                INT32 V = (INT32)VWD(Src, I & 3);
+                VHW_SET(Vd, I, (V < 0) ? 0 : (V > 0xFFFF ? 0xFFFF : (UINT16)V));
+            }
+            return EFI_SUCCESS;
+        case 0x07:  // vpkswss
+            for (I = 0; I < 8; I++) {
+                UINT32 Src = (I < 4) ? Va : Vb;
+                VHW_SET(Vd, I, PpcSatS16((INT32)VWD(Src, I & 3)));
+            }
+            return EFI_SUCCESS;
+        case 0x0A:  // vpkuhus
+            for (I = 0; I < 16; I++) {
+                UINT32 Src = (I < 8) ? Va : Vb;
+                VBYTE(Vd, I) = PpcSatU8((INT32)VHW(Src, I & 7));
+            }
+            return EFI_SUCCESS;
+        case 0x0C:  // vpkuwus
+            for (I = 0; I < 8; I++) {
+                UINT32 Src = (I < 4) ? Va : Vb;
+                VHW_SET(Vd, I, PpcSatU16((INT32)VWD(Src, I & 3)));
+            }
+            return EFI_SUCCESS;
+        case 0x13:  // vpkudus
+            {
+                UINT64 S[4] = { V64H(Va), V64L(Va), V64H(Vb), V64L(Vb) };
+                for (I = 0; I < 4; I++) VWD_SET(Vd, I, S[I] > 0xFFFFFFFFULL ? 0xFFFFFFFF : (UINT32)S[I]);
+            }
+            return EFI_SUCCESS;
+        case 0x15:  // vpksdus
+            {
+                INT64 S[4] = { (INT64)V64H(Va), (INT64)V64L(Va), (INT64)V64H(Vb), (INT64)V64L(Vb) };
+                for (I = 0; I < 4; I++) {
+                    VWD_SET(Vd, I, S[I] < 0 ? 0 : (S[I] > 0xFFFFFFFFLL ? 0xFFFFFFFF : (UINT32)S[I]));
+                }
+            }
+            return EFI_SUCCESS;
+        case 0x17:  // vpksdss
+            {
+                INT64 S[4] = { (INT64)V64H(Va), (INT64)V64L(Va), (INT64)V64H(Vb), (INT64)V64L(Vb) };
+                for (I = 0; I < 4; I++) VWD_SET(Vd, I, PpcSatS32(S[I]));
+            }
+            return EFI_SUCCESS;
+        default:
+            return EFI_UNSUPPORTED;
+        }
+
+    default:
+        return EFI_UNSUPPORTED;
+    }
+}
+
+// Execute an AltiVec opcode-31 X-form vector load/store.
+static EFI_STATUS
+PpcExecuteVectorMem (
+    IN UINT32 w
+    )
+{
+    UINT32 Ea  = EaX(w, RA(w), RB(w));
+    UINT32 Vt  = RT(w);
+    UINT32 EaA = Ea & ~0xF;
+    UINT32 I;
+
+    switch (XO10(w)) {
+    case XO_LVX:  // lvx: 16-byte aligned load
+        for (I = 0; I < 16; I++) {
+            VBYTE(Vt, I) = g_ReadByte(EaA + I);
+        }
+        return EFI_SUCCESS;
+
+    case XO_LVXL:  // lvxl: same as lvx (streaming hint ignored)
+        for (I = 0; I < 16; I++) {
+            VBYTE(Vt, I) = g_ReadByte(EaA + I);
+        }
+        return EFI_SUCCESS;
+
+    case XO_LVSL:  // lvsl: little-endian permute constant for alignment offset
+        for (I = 0; I < 16; I++) {
+            VBYTE(Vt, I) = (UINT8)(Ea & 0xF) + I;
+        }
+        return EFI_SUCCESS;
+
+    case XO_LVSR:  // lvsr
+        for (I = 0; I < 16; I++) {
+            VBYTE(Vt, I) = (UINT8)(16 + (Ea & 0xF) - I);
+        }
+        return EFI_SUCCESS;
+
+    case XO_LVEBX:  // lvebx: byte load to element
+        VBYTE(Vt, Ea & 0xF) = g_ReadByte(Ea);
+        return EFI_SUCCESS;
+
+    case XO_LVEHX:  // lvehx: halfword load to element
+        {
+            UINT32 El = (Ea >> 1) & 7;
+            VHW_SET(Vt, El, g_ReadByte(Ea) << 8 | g_ReadByte(Ea + 1));
+        }
+        return EFI_SUCCESS;
+
+    case XO_LVEWX:  // lvewx: word load to element
+        {
+            UINT32 El = (Ea >> 2) & 3;
+            VWD_SET(Vt, El, ((UINT32)g_ReadByte(Ea) << 24) | ((UINT32)g_ReadByte(Ea + 1) << 16) |
+                             ((UINT32)g_ReadByte(Ea + 2) << 8) | g_ReadByte(Ea + 3));
+        }
+        return EFI_SUCCESS;
+
+    case XO_STVX:   // stvx: 16-byte aligned store
+    case XO_STVXL:
+        for (I = 0; I < 16; I++) {
+            g_WriteByte(EaA + I, VBYTE(Vt, I));
+        }
+        return EFI_SUCCESS;
+
+    case XO_STVEBX:  // stvebx
+        g_WriteByte(Ea, VBYTE(Vt, Ea & 0xF));
+        return EFI_SUCCESS;
+
+    case XO_STVEHX:  // stvehx
+        {
+            UINT32 El = (Ea >> 1) & 7;
+            UINT32 H = VHW(Vt, El);
+            g_WriteByte(Ea, (UINT8)(H >> 8));
+            g_WriteByte(Ea + 1, (UINT8)H);
+        }
+        return EFI_SUCCESS;
+
+    case XO_STVEWX:  // stvewx
+        {
+            UINT32 El = (Ea >> 2) & 3;
+            UINT32 W = VWD(Vt, El);
+            g_WriteByte(Ea, (UINT8)(W >> 24));
+            g_WriteByte(Ea + 1, (UINT8)(W >> 16));
+            g_WriteByte(Ea + 2, (UINT8)(W >> 8));
+            g_WriteByte(Ea + 3, (UINT8)W);
+        }
+        return EFI_SUCCESS;
+
+    default:
+        return EFI_UNSUPPORTED;
+    }
+}
+
 static double
 PpcFpAbs (
     IN double D
@@ -1232,6 +2620,16 @@ PpcExecuteInstruction (
     }
 
     switch (Op) {
+    case 4:  // AltiVec VX/VA-form (opcode 4)
+        {
+            EFI_STATUS VecStatus = PpcExecuteVectorOp(w);
+            if (EFI_ERROR(VecStatus)) {
+                return VecStatus;
+            }
+            *NextAddress = Next;
+            return EFI_SUCCESS;
+        }
+
     case 3:  // twi
         if (PpcTrapCondition((w >> 21) & 0x1F, g_PpcContext.Gpr[RA(w)], SIMM(w))) {
             g_PpcContext.ExceptionPending = PPC_EXCEPTION_TRAP;
@@ -1250,6 +2648,14 @@ PpcExecuteInstruction (
             UINT32 Ca;
             g_PpcContext.Gpr[RD(w)] = PpcDoSub(g_PpcContext.Gpr[RA(w)], SIMM(w), 0, &Ca, NULL);
             PpcSetXerCarry(Ca);
+        }
+        break;
+
+    case 9:  // dozi (601/POWER: RT = (RA > SIMM) ? 0 : SIMM - RA)
+        if ((INT32)g_PpcContext.Gpr[RA(w)] > (INT32)SIMM(w)) {
+            g_PpcContext.Gpr[RD(w)] = 0;
+        } else {
+            g_PpcContext.Gpr[RD(w)] = (UINT32)((INT32)SIMM(w) - (INT32)g_PpcContext.Gpr[RA(w)]);
         }
         break;
 
@@ -1657,11 +3063,18 @@ PpcExecuteInstruction (
                 if (Rc(w)) PpcSetCr0FromResult(g_PpcContext.Gpr[RT(w)]);
                 break;
 
-            case XO_MFCR:  // mfcr / mfocrf
+            case XO_MFCR:  // mfcr / mfcrf / mfocrf
                 {
+                    // Plain 32-bit `mfcr RT` has FXM == 0x00 (bits 12-19) and
+                    // must copy the whole CR; `mfcrf FXM,RT` selects fields in
+                    // place; `mfocrf FXM,RT` (single FXM bit) replicates the
+                    // field. Treating 0x00 as mfocrf returned 0 and silently
+                    // corrupted every CR save/restore via mfcr/mtcrf.
                     UINT32 Fxm = (w >> 12) & 0xFF;
-                    UINT32 Value = g_PpcContext.Cr;
-                    if (Fxm != 0xFF) {
+                    UINT32 Value;
+                    if (Fxm == 0x00 || Fxm == 0xFF) {
+                        Value = g_PpcContext.Cr;
+                    } else if ((Fxm & (Fxm - 1)) == 0) {
                         UINT32 I, Field = 0;
                         for (I = 0; I < 8; I++) {
                             if (Fxm & (0x80 >> I)) {
@@ -1670,6 +3083,14 @@ PpcExecuteInstruction (
                             }
                         }
                         Value = Field * 0x11111111;
+                    } else {
+                        UINT32 I;
+                        Value = 0;
+                        for (I = 0; I < 8; I++) {
+                            if (Fxm & (0x80 >> I)) {
+                                Value |= (g_PpcContext.Cr & (0xFUL << (28 - I * 4)));
+                            }
+                        }
                     }
                     g_PpcContext.Gpr[RT(w)] = Value;
                 }
@@ -1681,6 +3102,14 @@ PpcExecuteInstruction (
 
             case XO_LWZX:  // lwzx
                 g_PpcContext.Gpr[RT(w)] = CpuRead32(EaX(w, RA(w), RB(w)));
+                break;
+
+            case XO_LWZUX:  // lwzux
+                {
+                    UINT32 Ea = EaX(w, RA(w), RB(w));
+                    g_PpcContext.Gpr[RT(w)] = CpuRead32(Ea);
+                    g_PpcContext.Gpr[RA(w)] = Ea;
+                }
                 break;
 
             case XO_SLW:  // slw / slw.
@@ -1896,6 +3325,189 @@ PpcExecuteInstruction (
                     }
                     if (Rc(w)) PpcSetCr0FromResult(g_PpcContext.Gpr[RT(w)]);
                 }
+                break;
+
+            // -------- PowerPC 601 / POWER integer ops --------
+            // The 601 splits the 64-bit product across rD (bits 0-31) and the
+            // MQ register (SPR 0, bits 32-63); CR0 (Rc=1) reflects MQ, and OE
+            // signals SO/OV when the product cannot be represented in 32 bits.
+            case XO_MUL | 0x200:  // with-OE form
+            case XO_MUL:  // mul / mul. / mulo / mulo. (601/POWER)
+                {
+                    INT64 P = (INT64)(INT32)g_PpcContext.Gpr[RA(w)] * (INT64)(INT32)g_PpcContext.Gpr[RB(w)];
+                    g_PpcContext.Gpr[RT(w)] = (UINT32)(P >> 32);
+                    g_PpcContext.Spr[0] = (UINT32)P;  // MQ = low 32 bits
+                    if ((w >> 10) & 1) {
+                        PpcSetXerOverflow(((P >> 32) != 0) && ((P >> 32) != -1));
+                    }
+                    if (Rc(w)) PpcSetCr0FromResult(g_PpcContext.Spr[0]);
+                }
+                break;
+
+            // div (601/POWER): 64-bit dividend (rA)||(MQ) divided by (rB);
+            // quotient -> rD, remainder -> MQ. Remainder sign follows the
+            // dividend (zero always positive); CR0 (Rc=1) reflects MQ.
+            case XO_DIV | 0x200:  // with-OE form
+            case XO_DIV:  // div / div. / divo / divo. (601/POWER)
+                {
+                    INT64 D = (INT64)(((UINT64)(UINT32)g_PpcContext.Gpr[RA(w)] << 32) |
+                                      (UINT64)(UINT32)g_PpcContext.Spr[0]);
+                    INT64 Dv = (INT32)g_PpcContext.Gpr[RB(w)];
+                    INT64 Q = 0, R = 0;
+                    UINT32 Ov = 0;
+                    if (Dv == 0) {
+                        Q = 0; R = 0; Ov = 1;
+                    } else if (Dv == -1) {
+                        if (D == (INT64)-2147483648) {  // -2^31 / -1
+                            Q = 0x80000000; R = 0; Ov = 1;
+                        } else {
+                            Q = -D; R = 0;
+                            Ov = (Q > 0x7FFFFFFF) || (Q < (INT64)-2147483648);
+                        }
+                    } else {
+                        Q = D / Dv;
+                        R = D % Dv;
+                        Ov = (Q > 0x7FFFFFFF) || (Q < (INT64)-2147483648);
+                    }
+                    g_PpcContext.Gpr[RT(w)] = (UINT32)Q;
+                    g_PpcContext.Spr[0] = (UINT32)R;
+                    if ((w >> 10) & 1) PpcSetXerOverflow(Ov);
+                    if (Rc(w)) PpcSetCr0FromResult(g_PpcContext.Spr[0]);
+                }
+                break;
+
+            // divs (601/POWER): 32-bit dividend (rA) divided by (rB);
+            // quotient -> rD, remainder -> MQ. Defined overflows (divisor zero,
+            // or -2^31 / -1) yield rD = -2^31 and MQ = 0.
+            case XO_DIVS | 0x200:  // with-OE form
+            case XO_DIVS:  // divs / divs. / divso / divso. (601/POWER)
+                {
+                    INT64 D = (INT32)g_PpcContext.Gpr[RA(w)];
+                    INT64 Dv = (INT32)g_PpcContext.Gpr[RB(w)];
+                    INT64 Q = 0, R = 0;
+                    UINT32 Ov = 0;
+                    if (Dv == 0) {
+                        Q = 0x80000000; R = 0; Ov = 1;
+                    } else if (Dv == -1 && D == (INT64)-2147483648) {
+                        Q = 0x80000000; R = 0; Ov = 1;
+                    } else {
+                        Q = D / Dv;
+                        R = D % Dv;
+                    }
+                    g_PpcContext.Gpr[RT(w)] = (UINT32)Q;
+                    g_PpcContext.Spr[0] = (UINT32)R;
+                    if ((w >> 10) & 1) PpcSetXerOverflow(Ov);
+                    if (Rc(w)) PpcSetCr0FromResult(g_PpcContext.Spr[0]);
+                }
+                break;
+
+            // abs (601/POWER): rD = |rA|. abs(0x80000000) stays 0x80000000 and
+            // signals overflow (rA is the most negative number).
+            case XO_ABS | 0x200:  // with-OE form
+            case XO_ABS:  // abs / abs. / abso / abso. (601/POWER)
+                {
+                    UINT32 A = g_PpcContext.Gpr[RA(w)];
+                    UINT32 R;
+                    if (A == 0x80000000) {
+                        R = A;
+                        if ((w >> 10) & 1) PpcSetXerOverflow(1);
+                    } else {
+                        R = ((INT32)A < 0) ? (UINT32)(-(INT32)A) : A;
+                        if ((w >> 10) & 1) PpcSetXerOverflow(0);
+                    }
+                    g_PpcContext.Gpr[RT(w)] = R;
+                    if (Rc(w)) PpcSetCr0FromResult(R);
+                }
+                break;
+
+            // nabs (601/POWER): rD = -|rA|. Never overflows; with OE, XER[OV]
+            // is cleared but XER[SO] is left unchanged.
+            case XO_NABS | 0x200:  // with-OE form
+            case XO_NABS:  // nabs / nabs. / nabso / nabso. (601/POWER)
+                {
+                    UINT32 A = g_PpcContext.Gpr[RA(w)];
+                    UINT32 AbsA = (A == 0x80000000) ? 0x80000000U : ((INT32)A < 0 ? (UINT32)(-(INT32)A) : A);
+                    UINT32 R = 0U - AbsA;
+                    if ((w >> 10) & 1) g_PpcContext.Xer &= ~PPC_XER_OV;
+                    g_PpcContext.Gpr[RT(w)] = R;
+                    if (Rc(w)) PpcSetCr0FromResult(R);
+                }
+                break;
+
+            // doz (601/POWER): rD = rB - rA, or 0 if rA > rB algebraically.
+            // With OE, OV is only set on a positive overflow.
+            case XO_DOZ | 0x200:  // with-OE form
+            case XO_DOZ:  // doz / doz. / dozo / dozo. (601/POWER)
+                {
+                    INT32 A = (INT32)g_PpcContext.Gpr[RA(w)];
+                    INT32 B = (INT32)g_PpcContext.Gpr[RB(w)];
+                    INT64 Diff = (INT64)B - (INT64)A;
+                    UINT32 R = (A > B) ? 0 : (UINT32)Diff;
+                    if ((w >> 10) & 1) PpcSetXerOverflow(Diff > 0x7FFFFFFF);
+                    g_PpcContext.Gpr[RT(w)] = R;
+                    if (Rc(w)) PpcSetCr0FromResult(R);
+                }
+                break;
+
+            // maskg (601/POWER): rA = mask of ones from rS[27-31] to rB[27-31]
+            // (bit 0 = MSB). start == stop+1 yields all ones; start > stop+1
+            // yields ones everywhere except the enclosed zero run. Rc only.
+            case XO_MASKG:  // maskg / maskg. (601/POWER)
+                {
+                    UINT32 Start = g_PpcContext.Gpr[RS(w)] & 0x1F;
+                    UINT32 Stop = g_PpcContext.Gpr[RB(w)] & 0x1F;
+                    UINT32 R;
+                    if (Start < Stop + 1) {
+                        UINT32 Len = Stop - Start + 1;
+                        R = (Len == 32) ? 0xFFFFFFFF : ((0xFFFFFFFFU >> (32 - Len)) << (31 - Stop));
+                    } else if (Start == Stop + 1) {
+                        R = 0xFFFFFFFF;
+                    } else {
+                        UINT32 Lo = Stop + 1;
+                        UINT32 Hi = Start - 1;
+                        UINT32 Len = Hi - Lo + 1;
+                        UINT32 ZeroMask = (Len == 32) ? 0xFFFFFFFF : ((0xFFFFFFFFU >> (32 - Len)) << (31 - Hi));
+                        R = ~ZeroMask;
+                    }
+                    g_PpcContext.Gpr[RA(w)] = R;
+                    if (Rc(w)) PpcSetCr0FromResult(R);
+                }
+                break;
+
+            // maskir (601/POWER): rS is inserted into rA under the mask in rB
+            // (a 1 bit copies the rS bit, a 0 bit leaves rA unchanged). Rc only.
+            case XO_MASKIR:  // maskir / maskir. (601/POWER)
+                {
+                    UINT32 Mask = g_PpcContext.Gpr[RB(w)];
+                    UINT32 R = (g_PpcContext.Gpr[RA(w)] & ~Mask) | (g_PpcContext.Gpr[RS(w)] & Mask);
+                    g_PpcContext.Gpr[RA(w)] = R;
+                    if (Rc(w)) PpcSetCr0FromResult(R);
+                }
+                break;
+
+            // rrib (601/POWER): bit 0 of rS is rotated right by rB[27-31] and
+            // inserted at that bit position of rA; other rA bits are unchanged.
+            case XO_RRIB:  // rrib / rrib. (601/POWER)
+                {
+                    UINT32 N = g_PpcContext.Gpr[RB(w)] & 0x1F;
+                    UINT32 Bit = (g_PpcContext.Gpr[RS(w)] >> 31) & 1;
+                    UINT32 R = (g_PpcContext.Gpr[RA(w)] & ~(0x80000000U >> N)) | (Bit << (31 - N));
+                    g_PpcContext.Gpr[RA(w)] = R;
+                    if (Rc(w)) PpcSetCr0FromResult(R);
+                }
+                break;
+
+            // eciwx/ecowx (601/POWER external control): read/write a 32-bit word
+            // at EA. The EAR external-control facility is not modeled, so these
+            // behave like plain lwzx/stwx memory accesses.
+            case XO_ECIWX | 0x200:
+            case XO_ECIWX:  // eciwx rD,rA,rB
+                g_PpcContext.Gpr[RT(w)] = CpuRead32(EaX(w, RA(w), RB(w)));
+                break;
+
+            case XO_ECOWX | 0x200:
+            case XO_ECOWX:  // ecowx rS,rA,rB
+                CpuWrite32(EaX(w, RA(w), RB(w)), g_PpcContext.Gpr[RS(w)]);
                 break;
 
             case XO_MTSRIN:  // mtsrin
@@ -2165,6 +3777,26 @@ PpcExecuteInstruction (
                 }
                 break;
 
+            case XO_LVSL:
+            case XO_LVEBX:
+            case XO_LVSR:
+            case XO_LVEHX:
+            case XO_LVEWX:
+            case XO_LVX:
+            case XO_STVEBX:
+            case XO_STVEHX:
+            case XO_STVEWX:
+            case XO_STVX:
+            case XO_LVXL:
+            case XO_STVXL:
+                {
+                    EFI_STATUS VecStatus = PpcExecuteVectorMem(w);
+                    if (EFI_ERROR(VecStatus)) {
+                        return VecStatus;
+                    }
+                }
+                break;
+
             default:
                 return EFI_UNSUPPORTED;
             }
@@ -2243,6 +3875,7 @@ PpcRunGuest (
     static UINT32 FlushProbed = 0;
     static UINT32 HelperDumped = 0;
     static UINT32 SccPollTraced = 0;
+    static UINT32 HelperStep = 0;
 
     if (ExecutedCount == NULL) {
         return EFI_INVALID_PARAMETER;
@@ -2357,6 +3990,19 @@ PpcRunGuest (
                   SccPollTraced, g_PpcContext.Gpr[28], g_PpcContext.Gpr[28] + 2,
                   g_PpcContext.Gpr[29]);
             SccPollTraced++;
+        }
+        // Step through the flush helper (0x40B28A98..0x40B28C04) one instruction
+        // at a time, printing state BEFORE each instruction executes. State shown
+        // at PC=X is therefore the result of the instruction at PC-4.
+        if (HelperStep < 45 && Current >= 0x40B28A98 && Current <= 0x40B28C04) {
+            UINT32 R1 = g_PpcContext.Gpr[1];
+            Print(L"  HELPER[%d] PC=0x%08x r1=0x%08x r14=0x%08x r15=0x%08x r16=0x%08x r26=0x%08x CR=0x%08x CR0=%x CR7=%x LR=0x%08x next=0x%08x [r1-3F0]=0x%08x [r1-3EC]=0x%08x [r1+EDC]=0x%08x\n",
+                  HelperStep, Current, R1, g_PpcContext.Gpr[14], g_PpcContext.Gpr[15],
+                  g_PpcContext.Gpr[16], g_PpcContext.Gpr[26], g_PpcContext.Cr,
+                  (g_PpcContext.Cr >> 28) & 0xF, g_PpcContext.Cr & 0xF,
+                  g_PpcContext.Lr, Next, CpuRead32(R1 - 0x3F0), CpuRead32(R1 - 0x3EC),
+                  CpuRead32(R1 + 0xEDC));
+            HelperStep++;
         }
         TailInst[TailStart] = Instr;
         TailPc[TailStart] = Current;
@@ -2630,8 +4276,8 @@ PpcRunGuest (
         UINT32 Loops[][2] = { { 0x40A00000u, 0x40A01000u }, { 0x40B10000u, 0x40B16000u },
                               { 0x40B11B00u, 0x40B11E60u }, { 0x40B1F800u, 0x40B1FC00u },
                               { 0x40B23F00u, 0x40B24400u }, { 0x40B26000u, 0x40B28000u },
-                              { 0x40B28700u, 0x40B28B00u } };
-        for (W = 0; W < 7; W++) {
+                              { 0x40B28700u, 0x40B28B00u }, { 0x40B23700u, 0x40B23800u } };
+        for (W = 0; W < 8; W++) {
             for (A = Loops[W][0]; A < Loops[W][1]; A += 16) {
                 Print(L"  ROM[0x%08x] %08x %08x %08x %08x\n",
                       A, CpuRead32(A), CpuRead32(A + 4),
@@ -2660,7 +4306,7 @@ PpcRunGuest (
 // ---------------------------------------------------------------------------
 static const CHAR16* g_DOpcodeNames[] = {
     L"reserved", L"reserved", L"reserved", L"twi",      L"reserved", L"reserved",
-    L"reserved", L"mulli",    L"subfic",   L"reserved", L"cmpli",    L"cmpi",
+    L"reserved", L"mulli",    L"subfic",   L"dozi",     L"cmpli",    L"cmpi",
     L"addic",    L"addic.",   L"addi",     L"addis",    L"bc",       L"sc",
     L"b",        L"XL-form",  L"rlwimi",   L"rlwinm",   L"reserved", L"rlwnm",
     L"ori",      L"oris",     L"xori",     L"xoris",    L"andi.",    L"andis.",
@@ -2749,7 +4395,11 @@ PpcDecodeInstruction (
     }
 
     if (Op == 31) {
-        switch (XO(w)) {
+        // XO10() keeps the 9-bit XO field plus the OE bit (0x200). XO() clears
+        // bit 0, which drops the low bit of odd-valued XO fields (mullw=235,
+        // divw=491, the 601 mul/div/divs/maskg/maskir/rrib), so decode from
+        // XO10() so those mnemonics resolve. Rc is a separate word bit 31.
+        switch (XO10(w)) {
         case XO_ADD:       Name = L"add";   break;
         case XO_SUBF:      Name = L"subf";  break;
         case XO_AND:       Name = L"and";   break;
@@ -2777,6 +4427,7 @@ PpcDecodeInstruction (
         case XO_DIVWU:     Name = L"divwu"; break;
         case XO_NEG:       Name = L"neg";   break;
         case XO_LWZX:      Name = L"lwzx";  break;
+        case XO_LWZUX:     Name = L"lwzux"; break;
         case XO_LBZX:      Name = L"lbzx";  break;
         case XO_LHZX:      Name = L"lhzx";  break;
         case XO_LHAX:      Name = L"lhax";  break;
@@ -2788,6 +4439,17 @@ PpcDecodeInstruction (
         case XO_SYNC:      Name = L"sync";  break;
         case XO_TLBSYNC:   Name = L"tlbsync"; break;
         case XO_EIEIO:     Name = L"eieio"; break;
+        case XO_MUL:       Name = L"mul";   break;
+        case XO_DIV:       Name = L"div";   break;
+        case XO_DIVS:      Name = L"divs";  break;
+        case XO_ABS:       Name = L"abs";   break;
+        case XO_NABS:      Name = L"nabs";  break;
+        case XO_DOZ:       Name = L"doz";   break;
+        case XO_MASKG:     Name = L"maskg"; break;
+        case XO_MASKIR:    Name = L"maskir";break;
+        case XO_RRIB:      Name = L"rrib";  break;
+        case XO_ECIWX:     Name = L"eciwx"; break;
+        case XO_ECOWX:     Name = L"ecowx"; break;
         default:           Name = L"X-op";  break;
         }
     } else if (Op == 19) {

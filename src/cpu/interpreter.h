@@ -23,6 +23,8 @@ typedef struct {
     UINT32  TimeBaseH;      // Time base upper (TBU)
     UINT64  Fpr[32];        // Floating-point registers (IEEE-754 double bit patterns)
     UINT32  Fpscr;          // Floating-point status/control register (classic 32-bit layout)
+    UINT8   Vr[32][16];     // AltiVec vector registers VR0..VR31 (big-endian byte order)
+    UINT32  Vscr;           // Vector status/control register
     UINT32  ExceptionPending;  // 0 = none, else PPC_EXCEPTION_*
 } PPC_CPU_CONTEXT;
 
