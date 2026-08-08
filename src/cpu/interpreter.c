@@ -3871,6 +3871,7 @@ PpcRunGuest (
     static UINT32 PcsDumped = 0;
     static UINT32 TraceDumped = 0;
     static UINT32 StoreProbed = 0;
+    static UINT32 RamProbed = 0;
     static UINT32 AllocTraced = 0;
     static UINT32 FlushProbed = 0;
     static UINT32 HelperDumped = 0;
@@ -3920,6 +3921,24 @@ PpcRunGuest (
                   CpuRead32(P - 0xAB0), CpuRead32(P - 0xAA0), CpuRead32(P - 0xA9C));
             Print(L"  STOREPROBE mem@0x8C40:\n");
             for (T = 0x8C40; T < 0x8D40; T += 16) {
+                Print(L"    0x%08x: %08x %08x %08x %08x\n",
+                      T, CpuRead32(T), CpuRead32(T + 4), CpuRead32(T + 8), CpuRead32(T + 0xC));
+            }
+        }
+        if (RamProbed == 0 && Current == 0x40B1243C) {
+            UINT32 P = g_PpcContext.Gpr[1];
+            UINT32 T;
+            RamProbed = 1;
+            Print(L"  RAMPROBE@0x%08x r1=0x%08x r17=0x%08x r18=0x%08x r19=0x%08x r21=0x%08x r22=0x%08x r29=0x%08x r30=0x%08x r31=0x%08x\n",
+                  Current, P, g_PpcContext.Gpr[17], g_PpcContext.Gpr[18],
+                  g_PpcContext.Gpr[19], g_PpcContext.Gpr[21], g_PpcContext.Gpr[22],
+                  g_PpcContext.Gpr[29], g_PpcContext.Gpr[30], g_PpcContext.Gpr[31]);
+            Print(L"  RAMPROBE loc[1704]=0x%08x loc[1708]=0x%08x loc[1716]=0x%08x loc[1592]=0x%08x loc[1596]=0x%08x loc[-32]=0x%08x abs[6A8]=0x%08x abs[6AC]=0x%08x\n",
+                  CpuRead32(P + 0x6A8), CpuRead32(P + 0x6AC), CpuRead32(P + 0x6B4),
+                  CpuRead32(P + 0x638), CpuRead32(P + 0x63C), CpuRead32(P - 0x20),
+                  CpuRead32(0x000006A8), CpuRead32(0x000006AC));
+            Print(L"  RAMPROBE memmap@r1+120:\n");
+            for (T = P + 0x78; T < P + 0x178; T += 16) {
                 Print(L"    0x%08x: %08x %08x %08x %08x\n",
                       T, CpuRead32(T), CpuRead32(T + 4), CpuRead32(T + 8), CpuRead32(T + 0xC));
             }

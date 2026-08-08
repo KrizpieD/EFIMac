@@ -341,9 +341,9 @@ PpcBootGateWait (
             }
         }
 
-        // One timer tick per second (WaitForEvent re-arms the periodic
-        // timer, so CheckEvent reports the tick that just fired).
-        if (BS->CheckEvent(TimerEvent) == EFI_SUCCESS && SecondsLeft > 0) {
+        // WaitForEvent clears the periodic timer's signal, so the timer tick is
+        // detected via the event index rather than CheckEvent.
+        if (Index == 0 && SecondsLeft > 0) {
             SecondsLeft--;
         }
     }
