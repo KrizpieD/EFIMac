@@ -23,9 +23,17 @@ typedef struct {
 #define PPC_ROM_DEFAULT_PATH    L"\\System\\MacOS\\ROM"
 #define PPC_RESET_VECTOR        (PPC_ROM_GUEST_BASE + 0x100)
 #define PPC_NANOKERNEL_BOOT_OFFSET 0x310000  // New World nanokernel boot entry (SheepShaver)
-#define PPC_GUEST_STEP_BUDGET   10000000    // Continuous-run instruction budget
+#define PPC_GUEST_STEP_BUDGET   150000000   // Continuous-run instruction budget
 #define PPC_LOW_MEM_GUEST_BASE  0x00000000  // Low-memory globals
 #define PPC_LOW_MEM_SIZE        0x00040000  // 256 KB (covers the nanokernel's fixed stack/context at 0xA000-0x1A000)
+
+// Classic Mac OS PPC kernel/system area. The nanokernel hard-codes its kernel
+// stack/heap in the 0x68F0xxxx range (e.g. addis/ori 0x68F168F1 at the boot
+// entry and in the first-task setup), which is the standard 0x68000000 system
+// area on every New World Mac. The emulator has no MMU/BAT translation, so the
+// logical area is backed directly with guest RAM.
+#define PPC_NK_SYSTEM_AREA_GUEST_BASE 0x68000000
+#define PPC_NK_SYSTEM_AREA_SIZE       0x08000000  // 128 MB
 
 // New World "Mac OS ROM" images are 4 MB but boot from offset 0x310000. A 4 MB
 // window at PPC_ROM_GUEST_BASE (the top of the 32-bit space) can only address
@@ -294,6 +302,20 @@ EFIAPI
 PpcInstallLowMemory (
     OUT UINT64* LowMemAddress,
     OUT UINT64* LowMemSize
+    );
+
+/**
+  Install the classic Mac OS kernel/system area region at guest 0x68000000
+  (128 MB, read/write). The nanokernel keeps its kernel stack and heap in
+  this range (fixed 0x68F0xxxx addresses) on all New World Macs; back it
+  directly since the emulator does not implement segment/BAT translation.
+  @retval EFI_ALREADY_STARTED  Region already installed
+  @retval EFI_STATUS
+**/
+EFI_STATUS
+EFIAPI
+PpcInstallNkSystemArea (
+    VOID
     );
 
 /**

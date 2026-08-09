@@ -3877,6 +3877,12 @@ PpcRunGuest (
     static UINT32 HelperDumped = 0;
     static UINT32 SccPollTraced = 0;
     static UINT32 HelperStep = 0;
+    static UINT32 TermEntries = 0;
+    static UINT32 AutoResumed = 0;
+    static UINT32 PmdWalked = 0;
+    static UINT32 PmdEntry = 0;
+    static UINT32 PmdArrDump = 0;
+    static UINT32 MergeTraced = 0;
 
     if (ExecutedCount == NULL) {
         return EFI_INVALID_PARAMETER;
@@ -3970,6 +3976,62 @@ PpcRunGuest (
                   AllocTraced, R, g_PpcContext.Lr, CpuRead32(R1 - 0xAB0 + 8),
                   CpuRead32(R - 4), CpuRead32(R - 8));
             AllocTraced++;
+        }
+        // PMDT chunk-pointer array: the walk reads the PMDT base for each 256MB
+        // chunk via 'lwzu r25, 8(r27)' (r27 = r1 + 0x78), so the 32-bit pointers
+        // live at [r1+0x80 + 8k]. Dump them once to see how many chunks are
+        // populated and whether adjacent slots alias the same table.
+        if (PmdArrDump == 0 && Current == 0x40B1F404) {
+            UINT32 R1 = g_PpcContext.Gpr[1];
+            UINT32 K;
+            PmdArrDump = 1;
+            Print(L"  PMDTARR r1=0x%08x r26=0x%08x pointers [r1+0x80+8k]:\n",
+                  R1, g_PpcContext.Gpr[26]);
+            for (K = 0; K < 16; K++) {
+                Print(L"    k=%2d @0x%08x: 0x%08x\n", K, R1 + 0x80 + 8 * K,
+                      CpuRead32(R1 + 0x80 + 8 * K));
+            }
+        }
+        // PMDT table dump: 0x40B1F418 ('lwz r17, 4(r25)') is the top of the
+        // per-chunk entry scan; r25 holds the current 8-byte entry base. Dump 64
+        // entries from the first entry read to see the table the walk is scanning.
+        if (PmdWalked < 1 && Current == 0x40B1F418) {
+            UINT32 Base = g_PpcContext.Gpr[25];
+            UINT32 I;
+            PmdWalked++;
+            Print(L"  PMDTDUMP r25=0x%08x r26=0x%08x r27=0x%08x r1=0x%08x 64 entries:\n",
+                  Base, g_PpcContext.Gpr[26], g_PpcContext.Gpr[27],
+                  g_PpcContext.Gpr[1]);
+            for (I = 0; I < 64; I++) {
+                UINT32 E = Base + I * 8;
+                Print(L"    PMDT[%2d] @0x%08x page=0x%04x count=0x%04x type=0x%08x\n",
+                      I, E, CpuRead16(E), CpuRead16(E + 2), CpuRead32(E + 4));
+            }
+        }
+        // PMDT per-entry read: at 0x40B1F428 (after andi. r17,r8,0xE00) r25 is the
+        // entry base, r15=page, r16=count, r17=type&0xE00, r8=type, r26=chunk base.
+        if (PmdEntry < 40 && Current == 0x40B1F428) {
+            PmdEntry++;
+            Print(L"  PMDENTRY[%d] base=0x%08x page=0x%04x count=0x%04x type=0x%08x r8=0x%08x r26=0x%08x r27=0x%08x\n",
+                  PmdEntry, g_PpcContext.Gpr[25], g_PpcContext.Gpr[15],
+                  g_PpcContext.Gpr[16], g_PpcContext.Gpr[17],
+                  g_PpcContext.Gpr[8], g_PpcContext.Gpr[26],
+                  g_PpcContext.Gpr[27]);
+        }
+        // Merge path: 0x40B1F668 is reached via the beq at 0x40B1F614 when
+        // [new+0x24] == [existing+0x24]. r24 = existing area, r31 = new area.
+        // Log the fields that the guard at 0x40B1F67C compares: the 0x28 fields
+        // are never written by the creation code, so they should be pool garbage.
+        if (MergeTraced < 8 && Current == 0x40B1F668) {
+            UINT32 Ex = g_PpcContext.Gpr[24];
+            UINT32 Nw = g_PpcContext.Gpr[31];
+            MergeTraced++;
+            Print(L"  MERGE[%d] existing=0x%08x new=0x%08x [ex+0x24]=0x%08x [ex+0x28]=0x%08x [ex+0x2C]=0x%08x [new+0x24]=0x%08x [new+0x28]=0x%08x [new+0x2C]=0x%08x r25=0x%08x r26=0x%08x r15=0x%08x r16=0x%08x r9=0x%08x\n",
+                  MergeTraced, Ex, Nw,
+                  CpuRead32(Ex + 0x24), CpuRead32(Ex + 0x28), CpuRead32(Ex + 0x2C),
+                  CpuRead32(Nw + 0x24), CpuRead32(Nw + 0x28), CpuRead32(Nw + 0x2C),
+                  g_PpcContext.Gpr[25], g_PpcContext.Gpr[26],
+                  g_PpcContext.Gpr[15], g_PpcContext.Gpr[16], g_PpcContext.Gpr[9]);
         }
         // Banner CR/LF flush-tail diagnostics. The guest spins at the SCC
         // Tx-empty poll (PC=0x40B26500, LBZ 2(r28) / ANDI. bit 2) because the
@@ -4168,6 +4230,37 @@ PpcRunGuest (
                           CpuRead32(A + 8), CpuRead32(A + 12));
                 }
             }
+        }
+        // Log EVERY nanodebugger (Termination) entry with its caller so we can
+        // see each fatal check the guest hits as boot progresses. r29 is loaded
+        // from LR (the caller's return address) at 0x40B272F8; [KDP+0x904] holds
+        // the same value once stored. The 'g' handler's optional context
+        // re-save (0x40B27A90 -> Termination) shows up here as caller 0x40B27A94.
+        if (TermEntries < 60 && Current == 0x40B272F8) {
+            UINT32 Ewa = g_PpcContext.Spr[272];
+            UINT32 Kdp = CpuRead32(Ewa - 4);
+            UINT32 Caller = g_PpcContext.Gpr[29];
+            TermEntries++;
+            Print(L"  TERMENTRY[%d] PC=0x%08x caller=0x%08x%s r1=0x%08x r8=0x%08x r9=0x%08x r31=0x%08x KDP=0x%08x EWA=0x%08x\n",
+                  TermEntries, Current, Caller,
+                  (Caller == 0x40B27A94) ? L" (g re-save)" : L"",
+                  g_PpcContext.Gpr[1], g_PpcContext.Gpr[8], g_PpcContext.Gpr[9],
+                  g_PpcContext.Gpr[31], Kdp, Ewa);
+        }
+        // Auto-answer the nanodebugger wait loop: when the guest is spinning
+        // (PC=0x40B2751C) with an empty SCC Rx FIFO, queue the same
+        // 'g' CR 'g' CR sequence the host pre-queues for the first entry so the
+        // boot continues past each subsequent fatal check. Cap it so a
+        // pathological re-panic loop cannot flood the log forever.
+        if (AutoResumed < 25 && Current == 0x40B2751C &&
+            g_SccRxFifoHead == g_SccRxFifoTail) {
+            AutoResumed++;
+            Print(L"  AUTORESUME[%d] queued 'g' CR 'g' CR at PC=0x%08x r1=0x%08x LR=0x%08x\n",
+                  AutoResumed, Current, g_PpcContext.Gpr[1], g_PpcContext.Lr);
+            PpcSccPutChar('g');
+            PpcSccPutChar(0x0D);
+            PpcSccPutChar('g');
+            PpcSccPutChar(0x0D);
         }
         if (TraceDumped == 0 && (Current == 0x40B272E0 || Current == 0x40B272E8 || Current == 0x40B272EC)) {
             UINTN I;

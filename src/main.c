@@ -723,6 +723,14 @@ efi_main (
             PpcSccPutChar(0x0D);
             Print(L"  Queued SCC input: 'g' CR 'g' CR (nanodebugger go)\n");
           }
+          // The NK entry tests MSR bit 0x10 (rlwinm r0,r0,0,0x1b,0x1b at
+          // 0x40B10014) and takes the cold/BAT path (beql 0x40B104A8) when
+          // the bit is clear. PpcPrepareSystemForBoot left MSR = ME|RI
+          // (0x1002), so bit 0x10 is clear. With it set, the fall-through
+          // rfis to r3+0x40 and executes "crset cr5eq" (0x40B10040), so
+          // CR5.EQ=1 at the 0x40B123A4 gate and the free-list walk is
+          // skipped. PPC_MSR_DR is the emulator's label for bit 0x10.
+          g_PpcContext.Msr = PPC_MSR_ME | PPC_MSR_RI | PPC_MSR_DR;
         } else {
           g_PpcContext.Pc = PPC_RESET_VECTOR;
           Print(L"\n--- Executing system ROM from reset vector ---\n");

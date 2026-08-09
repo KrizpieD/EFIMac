@@ -23,6 +23,7 @@ typedef struct {
     BOOLEAN LowMemoryInstalled;
     UINT64  LowMemoryAddress;
     UINT64  LowMemorySize;
+    BOOLEAN NkSystemAreaInstalled;
     BOOLEAN RomLoaded;
     UINT64  RomAddress;
     UINT64  RomSize;
@@ -1599,6 +1600,45 @@ PpcInstallLowMemory (
 }
 
 EFI_STATUS
+PpcInstallNkSystemArea (
+    VOID
+    )
+{
+    UINTN Pages;
+    EFI_PHYSICAL_ADDRESS Base = 0;
+    EFI_STATUS Status;
+
+    if (g_BootContext.NkSystemAreaInstalled) {
+        return EFI_ALREADY_STARTED;
+    }
+
+    Pages = PPC_NK_SYSTEM_AREA_SIZE / EFI_PAGE_SIZE;
+    Status = BS->AllocatePages(AllocateAnyPages, EfiBootServicesData, Pages, &Base);
+    if (EFI_ERROR(Status)) {
+        Print(L"Failed to allocate nanokernel system-area pages: %r\n", Status);
+        return Status;
+    }
+    ZeroMem((VOID*)(UINTN)Base, PPC_NK_SYSTEM_AREA_SIZE);
+
+    Status = PpcAddGuestMemoryRegion((VOID*)(UINTN)Base,
+                                     PPC_NK_SYSTEM_AREA_GUEST_BASE,
+                                     PPC_NK_SYSTEM_AREA_SIZE,
+                                     FALSE);
+    if (EFI_ERROR(Status)) {
+        BS->FreePages(Base, Pages);
+        Print(L"Failed to map nanokernel system area into guest memory: %r\n", Status);
+        return Status;
+    }
+
+    g_BootContext.NkSystemAreaInstalled = TRUE;
+
+    Print(L"Nanokernel system area installed: %d bytes at guest 0x%x\n",
+          (UINT64)PPC_NK_SYSTEM_AREA_SIZE, PPC_NK_SYSTEM_AREA_GUEST_BASE);
+
+    return EFI_SUCCESS;
+}
+
+EFI_STATUS
 PpcVerifyKernel (
     IN  EFI_PHYSICAL_ADDRESS KernelAddress,
     IN  UINT64               KernelSize
@@ -1697,6 +1737,10 @@ PpcPrepareSystemForBoot (
     if (!g_BootContext.LowMemoryInstalled) {
         PpcInstallLowMemory(NULL, NULL);
     }
+    // The nanokernel keeps its kernel stack/heap in the 0x68000000 system area
+    // (fixed 0x68F0xxxx logical addresses); back it so those accesses land in
+    // RAM instead of reading as zero.
+    PpcInstallNkSystemArea();
     if (!g_BootContext.RomLoaded) {
         Print(L"Warning: no system ROM installed; boot would fail at the reset vector\n");
     }
