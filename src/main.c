@@ -684,6 +684,19 @@ efi_main (
             PpcWriteGuestByte(B + 0x5E8 + 1, (UINT8)(B >> 16));
             PpcWriteGuestByte(B + 0x5E8 + 2, (UINT8)(B >> 8));
             PpcWriteGuestByte(B + 0x5E8 + 3, (UINT8)(B));
+            // VMMaxVirtualPages/VMLogicalPages: the NK prints these from
+            // caller[0x6B4]/[0x6B8] (copied to [r1+0x6B4]/[r1+0x6B8]). They are
+            // 0 in the degenerate build -> zero virtual memory -> the PMDT gets
+            // no RAM descriptors and the walk panics on duplicate [0,0xFFF].
+            // Seed the page count for 256 MB of RAM (0x10000 pages @ 4 KB).
+            PpcWriteGuestByte(B + 0x6B4 + 0, 0x00);
+            PpcWriteGuestByte(B + 0x6B4 + 1, 0x00);
+            PpcWriteGuestByte(B + 0x6B4 + 2, 0x01);
+            PpcWriteGuestByte(B + 0x6B4 + 3, 0x00);
+            PpcWriteGuestByte(B + 0x6B8 + 0, 0x00);
+            PpcWriteGuestByte(B + 0x6B8 + 1, 0x00);
+            PpcWriteGuestByte(B + 0x6B8 + 2, 0x01);
+            PpcWriteGuestByte(B + 0x6B8 + 3, 0x00);
           }
           Print(L"  Seeded SPRG4 caller structure at 0x30000: version [0x30FE4]=0x0101\n");
           Print(L"\n--- Executing system ROM from nanokernel boot entry (0x%08x) ---\n",
@@ -707,11 +720,16 @@ efi_main (
           {
             UINT32 ReturnTarget =
               (UINT32)RunInfo.MemoryMap.RomBase + PPC_NANOKERNEL_BOOT_OFFSET;
-            PpcWriteGuestByte(0x648 + 0, (UINT8)(ReturnTarget >> 24));
-            PpcWriteGuestByte(0x648 + 1, (UINT8)(ReturnTarget >> 16));
-            PpcWriteGuestByte(0x648 + 2, (UINT8)(ReturnTarget >> 8));
-            PpcWriteGuestByte(0x648 + 3, (UINT8)(ReturnTarget));
-            Print(L"  Seeded NK return-address slot [0x648] = 0x%08x\n", ReturnTarget);
+            // The NK copies the SPRG4 caller structure [0x30004..0x31000] onto
+            // its own stack at [r1+4..r1+0x1000] with r1=0xA000, and the boot
+            // code returns via `lwz r4,0x648(r1)` (reads [0xA648]). The seed
+            // must therefore land in the caller structure, not at absolute
+            // 0x648, so the copy delivers it to [0xA648].
+            PpcWriteGuestByte(0x30000 + 0x648 + 0, (UINT8)(ReturnTarget >> 24));
+            PpcWriteGuestByte(0x30000 + 0x648 + 1, (UINT8)(ReturnTarget >> 16));
+            PpcWriteGuestByte(0x30000 + 0x648 + 2, (UINT8)(ReturnTarget >> 8));
+            PpcWriteGuestByte(0x30000 + 0x648 + 3, (UINT8)(ReturnTarget));
+            Print(L"  Seeded NK return-address slot [0x30648] = 0x%08x\n", ReturnTarget);
             // The NK prints "Nanodebugger activated." and then idles at the
             // nanokernel debugger prompt, polling the SCC for a command. The
             // first byte queued is consumed by the "Old KDP" break-in check

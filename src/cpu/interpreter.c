@@ -3868,6 +3868,7 @@ PpcRunGuest (
     static UINT32 TailR28[4096];
     static UINT32 TailR8[4096];
     static UINT32 TailR17[4096];
+    static UINT32 TailLr[4096];
     static UINT32 PcsDumped = 0;
     static UINT32 TraceDumped = 0;
     static UINT32 StoreProbed = 0;
@@ -3883,6 +3884,7 @@ PpcRunGuest (
     static UINT32 PmdEntry = 0;
     static UINT32 PmdArrDump = 0;
     static UINT32 MergeTraced = 0;
+    static UINT32 PmdFixed = 0;
 
     if (ExecutedCount == NULL) {
         return EFI_INVALID_PARAMETER;
@@ -3992,6 +3994,45 @@ PpcRunGuest (
                       CpuRead32(R1 + 0x80 + 8 * K));
             }
         }
+        // PMDT RAM injection (one-shot): the DR=1 boot path skips the NK's PMDT
+        // builder, so the table only has the [0xFFF7,9] top-of-block-0
+        // reservation followed by 63 zero entries. The walk dispatches on
+        // flags&0xE00: 0 = area create, 0xC00 = special area, any other value
+        // with page=0 && count=0xFFFF = chunk terminator (r26 += 256MB).
+        // Rewrite chunk 0's table as reservation + [0,0xFFF6) RAM + a real
+        // terminator, and point chunks 1..15 at the terminator entry so each
+        // 256MB chunk walks cleanly and the walk ends when r26 wraps.
+        if (PmdFixed == 0 && Current == 0x40B1F418) {
+            UINT32 Base = g_PpcContext.Gpr[25];
+            UINT32 R1  = g_PpcContext.Gpr[1];
+            UINT32 K;
+            PmdFixed = 1;
+            // chunk 0 table: r25 was already loaded from [r1+0x78] (original
+            // pointer array); rewrite it explicitly for self-consistency.
+            CpuWrite32(R1 + 0x78, Base);
+            // chunks 1..15: point at the terminator-only entry (no areas).
+            for (K = 1; K < 16; K++) {
+                CpuWrite32(R1 + 0x80 + 8 * K, Base + 16);
+            }
+            // entry 0 [0xFFF7,9] already holds the top-of-block-0 reservation.
+            // entry 1: RAM [0, 0xFFF7000).
+            CpuWrite16(Base + 8, 0x0000);
+            CpuWrite16(Base + 10, 0xFFF6);
+            CpuWrite32(Base + 12, 0x00000000);
+            // entry 2: chunk terminator, flags&0xE00 = 0x400 (not 0, not 0xC00).
+            CpuWrite16(Base + 16, 0x0000);
+            CpuWrite16(Base + 18, 0xFFFF);
+            CpuWrite32(Base + 20, 0x00000400);
+            // entries 3..63: unreachable (chunk advances at entry 2), but keep
+            // them as terminators so a stray entry can never walk an area.
+            for (K = 24; K < 64 * 8; K += 8) {
+                CpuWrite16(Base + K, 0x0000);
+                CpuWrite16(Base + K + 2, 0xFFFF);
+                CpuWrite32(Base + K + 4, 0x00000400);
+            }
+            Print(L"  PMDTINJECT base=0x%08x chunk0=[0xFFF7,9]+[0,0xFFF6]+TERM chunks1..15=TERM\n",
+                  Base);
+        }
         // PMDT table dump: 0x40B1F418 ('lwz r17, 4(r25)') is the top of the
         // per-chunk entry scan; r25 holds the current 8-byte entry base. Dump 64
         // entries from the first entry read to see the table the walk is scanning.
@@ -4091,6 +4132,7 @@ PpcRunGuest (
         TailR28[TailStart] = g_PpcContext.Gpr[28];
         TailR8[TailStart] = g_PpcContext.Gpr[8];
         TailR17[TailStart] = g_PpcContext.Gpr[17];
+        TailLr[TailStart] = g_PpcContext.Lr;
         TailStart = (TailStart + 1) % 4096;
         if (TailCount < 4096) TailCount++;
         if ((Executed % 250000) == 0) {
@@ -4294,9 +4336,9 @@ PpcRunGuest (
                 for (I = 0; I < TailCount; I++) {
                     UINTN Idx = (TailStart + TailCount - 1 - I) % 4096;
                     PpcDecodeInstruction(TailInst[Idx], Mn, sizeof(Mn));
-                    Print(L"  TRACE[-%d] PC=0x%08x 0x%08x %s -> 0x%08x r28=0x%08x r8=0x%08x\n",
+                    Print(L"  TRACE[-%d] PC=0x%08x 0x%08x %s -> 0x%08x r28=0x%08x r8=0x%08x LR=0x%08x\n",
                           (UINTN)I + 1, TailPc[Idx], TailInst[Idx], Mn, TailNext[Idx],
-                          TailR28[Idx], TailR8[Idx]);
+                          TailR28[Idx], TailR8[Idx], TailLr[Idx]);
                 }
                 {
                     CHAR16 StopMn[16];
@@ -4404,9 +4446,9 @@ PpcRunGuest (
         for (I = 0; I < TailCount && I < 300; I++) {
             UINTN Idx = (TailStart + TailCount - 1 - I) % 4096;
             PpcDecodeInstruction(TailInst[Idx], Mn, sizeof(Mn));
-            Print(L"  TRACE[-%d] PC=0x%08x 0x%08x %s -> 0x%08x r28=0x%08x r8=0x%08x r17=0x%08x\n",
+            Print(L"  TRACE[-%d] PC=0x%08x 0x%08x %s -> 0x%08x r28=0x%08x r8=0x%08x r17=0x%08x LR=0x%08x\n",
                   (UINTN)I + 1, TailPc[Idx], TailInst[Idx], Mn, TailNext[Idx],
-                  TailR28[Idx], TailR8[Idx], TailR17[Idx]);
+                  TailR28[Idx], TailR8[Idx], TailR17[Idx], TailLr[Idx]);
         }
     }
     *ExecutedCount = Executed;
