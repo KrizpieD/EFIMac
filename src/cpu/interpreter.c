@@ -471,6 +471,60 @@ PpcWriteGuestByte (
     g_WriteByte(Address, Value);
 }
 
+// Copy up to one page-agnostic contiguous run per iteration by resolving the
+// host pointers for both sides and memcpy-ing the overlapping extent. Falls
+// back to byte-at-a-time guest access so reads of unmapped pages still yield
+// zero (matching PpcReadGuestByte) and writes to unmapped pages are dropped.
+VOID
+PpcCopyGuestMemory (
+    IN UINT32 DstGuest,
+    IN UINT32 SrcGuest,
+    IN UINT32 Size
+    )
+{
+    UINT32 Offset = 0;
+
+    while (Offset < Size) {
+        UINTN  I;
+        UINT8* SrcHost = NULL;
+        UINT8* DstHost = NULL;
+        UINT32 Chunk   = Size - Offset;
+
+        for (I = 0; I < PPC_MAX_GUEST_REGIONS; I++) {
+            if (!g_GuestRegions[I].Active) {
+                continue;
+            }
+            if (SrcHost == NULL &&
+                SrcGuest + Offset >= g_GuestRegions[I].GuestBase &&
+                (UINT64)(SrcGuest + Offset - g_GuestRegions[I].GuestBase) <
+                    g_GuestRegions[I].Size) {
+                UINT32 Run = (UINT32)(g_GuestRegions[I].Size -
+                                      (SrcGuest + Offset - g_GuestRegions[I].GuestBase));
+                SrcHost = (UINT8*)((UINTN)g_GuestRegions[I].HostBase +
+                                   (SrcGuest + Offset - g_GuestRegions[I].GuestBase));
+                if (Run < Chunk) { Chunk = Run; }
+            }
+            if (DstHost == NULL &&
+                DstGuest + Offset >= g_GuestRegions[I].GuestBase &&
+                (UINT64)(DstGuest + Offset - g_GuestRegions[I].GuestBase) <
+                    g_GuestRegions[I].Size) {
+                UINT32 Run = (UINT32)(g_GuestRegions[I].Size -
+                                      (DstGuest + Offset - g_GuestRegions[I].GuestBase));
+                DstHost = (UINT8*)((UINTN)g_GuestRegions[I].HostBase +
+                                   (DstGuest + Offset - g_GuestRegions[I].GuestBase));
+                if (Run < Chunk) { Chunk = Run; }
+            }
+        }
+
+        if (SrcHost == NULL || DstHost == NULL || Chunk == 0) {
+            break;
+        }
+
+        CopyMem(DstHost, SrcHost, Chunk);
+        Offset += Chunk;
+    }
+}
+
 static UINT32 CpuRead16 (UINT32 A) { return ((UINT32)g_ReadByte(A) << 8) | g_ReadByte(A + 1); }
 static UINT32 CpuRead32 (UINT32 A) { return (CpuRead16(A) << 16) | CpuRead16(A + 2); }
 static VOID   CpuWrite16(UINT32 A, UINT32 V) { g_WriteByte(A, (UINT8)(V >> 8)); g_WriteByte(A + 1, (UINT8)V); }
@@ -4395,6 +4449,14 @@ PpcRunGuest (
                       CpuRead32(g_PpcContext.Gpr[1] - 0x404 + 0x14),
                       CpuRead32(g_PpcContext.Gpr[1] - 0x404 + 0x18),
                       CpuRead32(g_PpcContext.Gpr[1] - 0x404 + 0x1C));
+                {
+                    UINTN A;
+                    for (A = 0x00000000u; A < 0x00000400u; A += 16) {
+                        Print(L"  LOW[0x%08x] %08x %08x %08x %08x\n",
+                              A, CpuRead32(A), CpuRead32(A + 4),
+                              CpuRead32(A + 8), CpuRead32(A + 12));
+                    }
+                }
             }
             *ExecutedCount = Executed;
             return Status;
@@ -4425,6 +4487,14 @@ PpcRunGuest (
           g_PpcContext.Gpr[17], g_PpcContext.Gpr[18], g_PpcContext.Gpr[26],
           g_PpcContext.Gpr[27], g_PpcContext.Gpr[28], g_PpcContext.Gpr[29],
           g_PpcContext.Gpr[30], g_PpcContext.Gpr[31]);
+    {
+        UINTN A;
+        for (A = 0x00000000u; A < 0x00000300u; A += 16) {
+            Print(L"  LOW[0x%08x] %08x %08x %08x %08x\n",
+                  A, CpuRead32(A), CpuRead32(A + 4),
+                  CpuRead32(A + 8), CpuRead32(A + 12));
+        }
+    }
     {
         UINTN A, W;
         UINT32 Loops[][2] = { { 0x40A00000u, 0x40A01000u }, { 0x40B10000u, 0x40B16000u },

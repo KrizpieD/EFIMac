@@ -651,6 +651,15 @@ efi_main (
           // path rfis to r3 + 0x40 (InitReplacement), so r3 must point at the
           // nanokernel image itself (ROM base + 0x310000).
           g_PpcContext.Gpr[3] = (UINT32)RunInfo.MemoryMap.RomBase + PPC_NANOKERNEL_BOOT_OFFSET;
+          // r4 = nanokernel boot-workspace base (the boot entry's zero-loop,
+          // stack r1 = r4+0xA000, guard-fill [r4, r4+0x1000), and the NK pool
+          // FreeNext = r4+0x3008 / FreeList = r4+0x9BB0 all derive from it).
+          // ISOLATION EXPERIMENT: keep r4 = 0 (the value the committed milestone
+          // d98bc92 used) so the boot reaches the 0x13F handoff again; the r4 =
+          // 0x10000 workspace move regressed the nanokernel area setup (all
+          // CreateArea calls come back "skipped" and the boot task terminates in
+          // the area-merge gap check at 0x40B1F67C).
+          g_PpcContext.Gpr[4] = 0x00000000;
           // r5 = nanokernel output-device base. The NK boot printer polls
           // [base+2] bit 2 until set and writes output characters to [base+6].
           // Point it at a spare region of low memory pre-marked "ready" so the

@@ -1743,6 +1743,19 @@ PpcPrepareSystemForBoot (
     PpcInstallNkSystemArea();
     if (!g_BootContext.RomLoaded) {
         Print(L"Warning: no system ROM installed; boot would fail at the reset vector\n");
+    } else if (g_BootContext.RomType == PPC_ROM_TYPE_NEW_WORLD) {
+        // Materialize the ROM's 68K emulator in the system area. The
+        // ConfigInfo table (ROM + 0x30d000) bakes in LA_EmulatorCode =
+        // 0x68060000 and LA_DispatchTable = 0x68080000: real hardware maps
+        // those logical pages to the emulator code (ROM + 0x360000) and the
+        // opcode table (ROM + 0x380000). This emulator has no MMU, so the
+        // nanokernel's jump into the emulator would execute zeroed RAM; copy
+        // the code and table into the 0x68000000 system area instead.
+        UINT32 RomBase = (UINT32)g_BootContext.RomAddress;
+        PpcCopyGuestMemory(0x68060000, RomBase + 0x360000, 0x00020000);
+        PpcCopyGuestMemory(0x68080000, RomBase + 0x380000, 0x00080000);
+        Print(L"68K emulator staged: code 0x68060000 <- ROM+0x360000 (128 KB), "
+              L"opcode table 0x68080000 <- ROM+0x380000 (512 KB)\n");
     }
 
     Status = PpcGetGuestMemoryRegion(NULL, &RamBase, &RamSize);

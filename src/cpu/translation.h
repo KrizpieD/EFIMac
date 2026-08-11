@@ -358,6 +358,29 @@ PpcWriteGuestByte (
     );
 
 /**
+  Bulk-copy bytes between two guest addresses using the interpreter's active
+  memory path. The destination is written byte-by-byte through the same path
+  used by store instructions, so guest stores to the destination behave
+  identically to stores executed by the CPU.
+
+  This is used to materialize the New World ROM's 68K emulator (code and
+  opcode table) at the fixed system-area addresses the nanokernel expects
+  (LA_EmulatorCode=0x68060000, LA_DispatchTable=0x68080000). Real hardware
+  maps those logical pages to the ROM; the emulator has no MMU, so the copy
+  puts the bytes in backing RAM instead.
+
+  @param[in] DstGuest  Guest address to copy to
+  @param[in] SrcGuest  Guest address to copy from
+  @param[in] Size      Number of bytes to copy
+**/
+VOID
+PpcCopyGuestMemory (
+    IN UINT32 DstGuest,
+    IN UINT32 SrcGuest,
+    IN UINT32 Size
+    );
+
+/**
   Execute a block of translated PowerPC instructions
   @param[in] InstructionBlock   Pointer to the instruction block
   @param[in] BlockSize          Size of the instruction block in bytes
