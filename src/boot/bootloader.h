@@ -23,6 +23,11 @@ typedef struct {
 #define PPC_ROM_DEFAULT_PATH    L"\\System\\MacOS\\ROM"
 #define PPC_RESET_VECTOR        (PPC_ROM_GUEST_BASE + 0x100)
 #define PPC_NANOKERNEL_BOOT_OFFSET 0x310000  // New World nanokernel boot entry (SheepShaver)
+// The 68K emulator's kernel-trap table: LA_EmulatorCode (0x68060000, baked into
+// the ROM's ConfigInfo) + KernelTrapTableOffset (0xE8C0). The nanokernel's boot
+// tail blrls to this address, executing `twui r31,0` (trap 0 =
+// ReturnFromException); IntProgram decodes it and the emulator starts.
+#define PPC_EMULATOR_TRAP_TABLE 0x6806E8C0
 #define PPC_GUEST_STEP_BUDGET   150000000   // Continuous-run instruction budget
 #define PPC_LOW_MEM_GUEST_BASE  0x00000000  // Low-memory globals
 #define PPC_LOW_MEM_SIZE        0x00040000  // 256 KB (covers the nanokernel's fixed stack/context at 0xA000-0x1A000)

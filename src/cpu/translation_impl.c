@@ -488,6 +488,19 @@ PpcExecuteTranslatedBlock (
     return PpcExecuteBlock(InstructionBlock, BlockSize / sizeof(UINT32), &Executed);
 }
 
+// Read a 32-bit big-endian word from guest memory through the interpreter's
+// active memory path (unmapped addresses read as zero).
+static UINT32
+PpcReadGuestWord (
+    IN UINT32 Address
+    )
+{
+    return ((UINT32)PpcReadGuestByte(Address)     << 24) |
+           ((UINT32)PpcReadGuestByte(Address + 1) << 16) |
+           ((UINT32)PpcReadGuestByte(Address + 2) << 8)  |
+           ((UINT32)PpcReadGuestByte(Address + 3));
+}
+
 EFI_STATUS
 EFIAPI
 PpcHandleException (
@@ -513,12 +526,47 @@ PpcHandleException (
     g_PpcContext.Srr0 = ExceptionAddress;
     g_PpcContext.Srr1 = g_PpcContext.Msr;
     g_PpcContext.Msr &= ~(PPC_MSR_EE | PPC_MSR_RI);
-    g_PpcContext.Pc = Vector;
-    g_PpcContext.ExceptionPending = 1;
 
-    Print(L"PowerPC exception %d at 0x%x: SRR0=0x%x SRR1=0x%x PC=0x%x\n",
-          ExceptionType, ExceptionAddress, g_PpcContext.Srr0,
-          g_PpcContext.Srr1, g_PpcContext.Pc);
+    // On real hardware the low-memory vector area (0x100..0xFFF) holds small
+    // stubs installed by the firmware before the Mac OS ROM boots. Each stub
+    // saves the interrupted r1 and LR to SPRG1/SPRG2, loads the vector table
+    // base from SPRG3 (the NK's KDP VecTbl), and branches to the entry for its
+    // vector. In this emulator there is no Open Firmware, so the low-memory
+    // vector slots are filled by the NK area creation with guard data and are
+    // never installed -- dispatch through the VecTbl ourselves instead.
+    //
+    // VecTbl layout (NanoKernel Defines.s): the entry for vector N is at
+    // (SPRG3 + (N >> 8) * 4); Program(0x700) -> +0x1C, External(0x500) -> +0x14.
+    {
+        UINT32 VecTblBase = g_PpcContext.Spr[275];   // SPRG3
+        UINT32 Handler    = (VecTblBase != 0) ? PpcReadGuestWord(VecTblBase + ((Vector >> 8) * 4)) : 0;
+
+        if (VecTblBase != 0 && Handler != 0 &&
+            Handler != 0x68F168F1u && Handler != 0xFFFFFFFFu) {
+            // Perform the vector stub's register effects before entering the
+            // handler: save the interrupted context, then let the handler
+            // re-read it through the SPRGs (NanoKernel Exceptions.s
+            // LoadInterruptRegisters: SPRG0 = KDP, SPRG1 = interrupted r1,
+            // SPRG2 = interrupted LR).
+            g_PpcContext.Spr[273] = g_PpcContext.Gpr[1];   // SPRG1 = user r1
+            g_PpcContext.Spr[274] = g_PpcContext.Lr;       // SPRG2 = user LR
+            g_PpcContext.Gpr[1]   = g_PpcContext.Spr[272]; // r1 = KDP (SPRG0)
+            g_PpcContext.Gpr[0]   = Handler;               // stub's final r0
+            g_PpcContext.Pc       = Handler;
+            Print(L"VECDISP vector=0x%x VecTbl=0x%x offset=0x%x handler=0x%x "
+                  L"SPRG1=0x%x SPRG2=0x%x\n",
+                  Vector, VecTblBase, ((Vector >> 8) * 4), Handler,
+                  g_PpcContext.Spr[273], g_PpcContext.Spr[274]);
+        } else {
+            // No usable vector table / handler: keep the hardware PC behaviour
+            // and execute whatever sits at the vector slot.
+            g_PpcContext.Pc = Vector;
+            Print(L"PowerPC exception %d at 0x%x: SRR0=0x%x SRR1=0x%x PC=0x%x "
+                  L"(VecTbl=0x%x handler=0x%x)\n",
+                  ExceptionType, ExceptionAddress, g_PpcContext.Srr0,
+                  g_PpcContext.Srr1, g_PpcContext.Pc, VecTblBase, Handler);
+        }
+    }
 
     return EFI_SUCCESS;
 }

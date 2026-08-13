@@ -727,18 +727,30 @@ efi_main (
             }
           }
           {
-            UINT32 ReturnTarget =
-              (UINT32)RunInfo.MemoryMap.RomBase + PPC_NANOKERNEL_BOOT_OFFSET;
             // The NK copies the SPRG4 caller structure [0x30004..0x31000] onto
             // its own stack at [r1+4..r1+0x1000] with r1=0xA000, and the boot
-            // code returns via `lwz r4,0x648(r1)` (reads [0xA648]). The seed
-            // must therefore land in the caller structure, not at absolute
-            // 0x648, so the copy delivers it to [0xA648].
+            // tail (NKInit.s: old_world_rfi_to_userspace_boot -> ReturnCode)
+            // calls the emulator via `lwz r4,0x648(r1); ...; blrl`, i.e. it
+            // blrls to KDP.LA_EmulatorKernelTrapTable [0xA648]. The seed must
+            // therefore land in the caller structure, not at absolute 0x648,
+            // so the copy delivers it to [0xA648].
+            //
+            // The value the real machine uses is LA_EmulatorCode +
+            // KernelTrapTableOffset = 0x68060000 + 0xE8C0 = 0x6806E8C0: the
+            // 68K emulator's kernel-trap table (a `twui r31,n` dispatch table
+            // at the top of the emulator image). The boot tail's blrl executes
+            // `twui r31,0` (trap 0 = ReturnFromException), the NK's IntProgram
+            // handler decodes it and calls KDP.NanoKernelCallTable[0], and the
+            // emulator starts running. Seeding 0x40B10000 (the old behaviour)
+            // re-entered the NK boot entry instead, which rfi'd to r3+0x40 =
+            // 0x13F (guard-fill -> crash).
+            UINT32 ReturnTarget = PPC_EMULATOR_TRAP_TABLE;
             PpcWriteGuestByte(0x30000 + 0x648 + 0, (UINT8)(ReturnTarget >> 24));
             PpcWriteGuestByte(0x30000 + 0x648 + 1, (UINT8)(ReturnTarget >> 16));
             PpcWriteGuestByte(0x30000 + 0x648 + 2, (UINT8)(ReturnTarget >> 8));
             PpcWriteGuestByte(0x30000 + 0x648 + 3, (UINT8)(ReturnTarget));
-            Print(L"  Seeded NK return-address slot [0x30648] = 0x%08x\n", ReturnTarget);
+            Print(L"  Seeded NK emulator-entry slot [0x30648] = 0x%08x "
+                  L"(emulator kernel trap table)\n", ReturnTarget);
             // The NK prints "Nanodebugger activated." and then idles at the
             // nanokernel debugger prompt, polling the SCC for a command. The
             // first byte queued is consumed by the "Old KDP" break-in check

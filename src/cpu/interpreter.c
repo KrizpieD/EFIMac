@@ -2653,6 +2653,7 @@ PpcExecuteInstruction (
     UINT32 w = Instruction;
     UINT32 Op = OP(w);
     UINT32 Next = CurrentAddress + 4;
+    static UINT32 HandoffDumped = 0;
 
     if (NextAddress == NULL) {
         return EFI_INVALID_PARAMETER;
@@ -2788,6 +2789,74 @@ PpcExecuteInstruction (
                 Print(L"  DBG rfi @0x%08x: SRR0=0x%08x SRR1=0x%08x MSR=0x%08x -> PC=0x%08x\n",
                       CurrentAddress, g_PpcContext.Srr0, g_PpcContext.Srr1,
                       g_PpcContext.Msr, g_PpcContext.Srr0);
+            }
+            if (g_PpcContext.Srr0 == 0x0000013F && HandoffDumped == 0) {
+                UINT32 I;
+                HandoffDumped = 1;
+                Print(L"  HANDOFF rfi @0x%08x -> PC=0x0000013F (68K emulator entry)\n", CurrentAddress);
+                Print(L"  HANDOFF r0-r11: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                      g_PpcContext.Gpr[0], g_PpcContext.Gpr[1], g_PpcContext.Gpr[2],
+                      g_PpcContext.Gpr[3], g_PpcContext.Gpr[4], g_PpcContext.Gpr[5],
+                      g_PpcContext.Gpr[6], g_PpcContext.Gpr[7], g_PpcContext.Gpr[8],
+                      g_PpcContext.Gpr[9], g_PpcContext.Gpr[10], g_PpcContext.Gpr[11]);
+                Print(L"  HANDOFF r12-r23: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                      g_PpcContext.Gpr[12], g_PpcContext.Gpr[13], g_PpcContext.Gpr[14],
+                      g_PpcContext.Gpr[15], g_PpcContext.Gpr[16], g_PpcContext.Gpr[17],
+                      g_PpcContext.Gpr[18], g_PpcContext.Gpr[19], g_PpcContext.Gpr[20],
+                      g_PpcContext.Gpr[21], g_PpcContext.Gpr[22], g_PpcContext.Gpr[23]);
+                Print(L"  HANDOFF r24-r31: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                      g_PpcContext.Gpr[24], g_PpcContext.Gpr[25], g_PpcContext.Gpr[26],
+                      g_PpcContext.Gpr[27], g_PpcContext.Gpr[28], g_PpcContext.Gpr[29],
+                      g_PpcContext.Gpr[30], g_PpcContext.Gpr[31]);
+                Print(L"  HANDOFF CR=0x%08x XER=0x%08x CTR=0x%08x LR=0x%08x SPRG4=0x%08x SDR1=0x%08x\n",
+                      g_PpcContext.Cr, g_PpcContext.Xer, g_PpcContext.Ctr,
+                      g_PpcContext.Lr, g_PpcContext.Spr[272], g_PpcContext.Spr[25]);
+                Print(L"  HANDOFF mem@0x013F (8 words):\n");
+                for (I = 0; I < 8; I++) {
+                    UINT32 A = 0x0130 + I * 4;
+                    Print(L"    0x%08x: %08x\n", A, CpuRead32(A));
+                }
+                Print(L"  HANDOFF vectors 0x000-0x080:\n");
+                for (I = 0; I < 8; I++) {
+                    UINT32 A = I * 16;
+                    Print(L"    0x%08x: %08x %08x %08x %08x\n",
+                          A, CpuRead32(A), CpuRead32(A + 4), CpuRead32(A + 8), CpuRead32(A + 0xC));
+                }
+                Print(L"  HANDOFF stack r1=0x%08x: [r1]=0x%08x [r1-4]=0x%08x [r1+0x648]=0x%08x [r1+0x5a0]=0x%08x [r1+0x5a4]=0x%08x [r1-0x964]=0x%08x\n",
+                      g_PpcContext.Gpr[1], CpuRead32(g_PpcContext.Gpr[1]),
+                      CpuRead32(g_PpcContext.Gpr[1] - 4), CpuRead32(g_PpcContext.Gpr[1] + 0x648),
+                      CpuRead32(g_PpcContext.Gpr[1] + 0x5a0), CpuRead32(g_PpcContext.Gpr[1] + 0x5a4),
+                      CpuRead32(g_PpcContext.Gpr[1] - 0x964));
+                // SheepShaver's jump68k-caller patch loads r3=[r1+0x634] (EDP),
+                // r4=[r1+0x119c] (opcode table), r0=[r1+0x1184] (emulator
+                // entry), then mtctr r0 / bctr. Dump those slots to confirm the
+                // nanokernel has populated the emulator entry state.
+                Print(L"  HANDOFF SS-slots: [r1+0x634]=0x%08x [r1+0x638]=0x%08x [r1+0x1180]=0x%08x [r1+0x1184]=0x%08x [r1+0x119c]=0x%08x [r1+0x1190]=0x%08x\n",
+                      CpuRead32(g_PpcContext.Gpr[1] + 0x634),
+                      CpuRead32(g_PpcContext.Gpr[1] + 0x638),
+                      CpuRead32(g_PpcContext.Gpr[1] + 0x1180),
+                      CpuRead32(g_PpcContext.Gpr[1] + 0x1184),
+                      CpuRead32(g_PpcContext.Gpr[1] + 0x119c),
+                      CpuRead32(g_PpcContext.Gpr[1] + 0x1190));
+                // Scan low memory for the ContextBlock markers the nanokernel
+                // populates (ECB+0x84=LA_EmulatorEntry=0x6806E8B0, ECB+0x88=
+                // LA_EmulatorData=0x68FFF000, ECB+0x8C=LA_DispatchTable=
+                // 0x68080000) and print the first ECB-sized candidate found.
+                for (I = 0x0000; I + 0x100 < 0x00040000; I += 4) {
+                    if (CpuRead32(I + 0x84) == 0x6806E8B0 &&
+                        CpuRead32(I + 0x88) == 0x68FFF000) {
+                        Print(L"  HANDOFF ECB candidate at 0x%08x: +0x80=%08x +0x84=%08x +0x88=%08x +0x8C=%08x +0x90=%08x +0x94=%08x\n",
+                              I, CpuRead32(I + 0x80), CpuRead32(I + 0x84),
+                              CpuRead32(I + 0x88), CpuRead32(I + 0x8C),
+                              CpuRead32(I + 0x90), CpuRead32(I + 0x94));
+                        break;
+                    }
+                }
+                // LowMem init region (0x0-0x2000): the NK zeroes it from
+                // PA_RelocatedLowMemInit (0xFFFFFFFF wraps to low addresses).
+                Print(L"  HANDOFF lowmem 0x1000:%08x 0x1800:%08x 0x1FF0:%08x 0x1FF4:%08x 0x1FF8:%08x 0x1FFC:%08x\n",
+                      CpuRead32(0x1000), CpuRead32(0x1800), CpuRead32(0x1FF0),
+                      CpuRead32(0x1FF4), CpuRead32(0x1FF8), CpuRead32(0x1FFC));
             }
             g_PpcContext.Msr = g_PpcContext.Srr1;
             Next = g_PpcContext.Srr0;
@@ -3939,6 +4008,8 @@ PpcRunGuest (
     static UINT32 PmdArrDump = 0;
     static UINT32 MergeTraced = 0;
     static UINT32 PmdFixed = 0;
+    static UINT32 BootTailProbed = 0;
+    static UINT32 TrapProbed = 0;
 
     if (ExecutedCount == NULL) {
         return EFI_INVALID_PARAMETER;
@@ -3966,6 +4037,35 @@ PpcRunGuest (
                   CpuRead32(g_PpcContext.Gpr[1] + 0x5A4),
                   CpuRead32(g_PpcContext.Gpr[1] - 0x964),
                   CpuRead32(g_PpcContext.Gpr[1] - 0x20));
+        }
+        // The NK boot tail's `blrl` at 0x40B126F0 calls
+        // KDP.LA_EmulatorKernelTrapTable ([r1+0x648]) = 0x6806E8C0
+        // (the 68K emulator's kernel-trap table, `twui r31,0`). This is the
+        // exact moment of the 68K handoff: dump the trap-entry protocol state
+        // the interpreter must reproduce for IntProgram.
+        if (BootTailProbed == 0 && Current == 0x40B126F0) {
+            UINT32 K = g_PpcContext.Gpr[1];
+            BootTailProbed = 1;
+            Print(L"  BOOTTAIL@0x%08x r1=0x%08x r3=0x%08x r4=0x%08x MSR=0x%08x SRR0=0x%08x SRR1=0x%08x\n",
+                  Current, K, g_PpcContext.Gpr[3], g_PpcContext.Gpr[4],
+                  g_PpcContext.Msr, g_PpcContext.Srr0, g_PpcContext.Srr1);
+            Print(L"  BOOTTAIL SPRG0=0x%08x SPRG1=0x%08x SPRG2=0x%08x SPRG3=0x%08x SPRG4=0x%08x\n",
+                  g_PpcContext.Spr[272], g_PpcContext.Spr[273],
+                  g_PpcContext.Spr[274], g_PpcContext.Spr[275],
+                  g_PpcContext.Spr[276]);
+            Print(L"  BOOTTAIL KDP.PA_ConfigInfo[r1+630]=0x%08x PA_EmulatorData[r1+634]=0x%08x "
+                  L"PA_CurAS[r1-1C]=0x%08x PA_PSA[r1-18]=0x%08x PA_KDP[r1-4]=0x%08x\n",
+                  CpuRead32(K + 0x630), CpuRead32(K + 0x634),
+                  CpuRead32(K - 0x1C), CpuRead32(K - 0x18), CpuRead32(K - 0x04));
+            Print(L"  BOOTTAIL KDP.LA_EmulatorKernelTrapTable[r1+648]=0x%08x PA_ECB[r1+658]=0x%08x "
+                  L"LA_ECB[r1+654]=0x%08x NanoKernelCallTable[0][r1+5F0]=0x%08x\n",
+                  CpuRead32(K + 0x648), CpuRead32(K + 0x658),
+                  CpuRead32(K + 0x654), CpuRead32(K + 0x5F0));
+            Print(L"  BOOTTAIL CallTable[1]=0x%08x [2]=0x%08x [3]=0x%08x [4]=0x%08x "
+                  L"trapinstr=0x%08x\n",
+                  CpuRead32(K + 0x5F4), CpuRead32(K + 0x5F8),
+                  CpuRead32(K + 0x5FC), CpuRead32(K + 0x600),
+                  CpuRead32(0x6806E8C0));
         }
         if (StoreProbed == 0 && (Current == 0x40B11B64 || Current == 0x40B11B48)) {
             UINT32 P = g_PpcContext.Gpr[1];
@@ -4464,6 +4564,20 @@ PpcRunGuest (
 
         if (g_PpcContext.ExceptionPending != 0) {
             UINT32 Pending = g_PpcContext.ExceptionPending;
+            if (Pending == PPC_EXCEPTION_TRAP && TrapProbed == 0) {
+                TrapProbed = 1;
+                Print(L"  TRAPDIS@PC=0x%08x Next=0x%08x r1=0x%08x r3=0x%08x r31=0x%08x "
+                      L"MSR=0x%08x SRR0=0x%08x SRR1=0x%08x\n",
+                      Current, Next, g_PpcContext.Gpr[1], g_PpcContext.Gpr[3],
+                      g_PpcContext.Gpr[31], g_PpcContext.Msr,
+                      g_PpcContext.Srr0, g_PpcContext.Srr1);
+                Print(L"  TRAPDIS SPRG0=0x%08x SPRG1=0x%08x SPRG2=0x%08x SPRG3=0x%08x "
+                      L"SPRG4=0x%08x vec0x700=0x%08x vec0x708=0x%08x vec0x7F0=0x%08x\n",
+                      g_PpcContext.Spr[272], g_PpcContext.Spr[273],
+                      g_PpcContext.Spr[274], g_PpcContext.Spr[275],
+                      g_PpcContext.Spr[276],
+                      CpuRead32(0x700), CpuRead32(0x708), CpuRead32(0x7F0));
+            }
             g_PpcContext.ExceptionPending = 0;
             Status = PpcHandleException(Pending, Current);
             if (EFI_ERROR(Status)) {
