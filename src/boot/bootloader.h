@@ -23,11 +23,82 @@ typedef struct {
 #define PPC_ROM_DEFAULT_PATH    L"\\System\\MacOS\\ROM"
 #define PPC_RESET_VECTOR        (PPC_ROM_GUEST_BASE + 0x100)
 #define PPC_NANOKERNEL_BOOT_OFFSET 0x310000  // New World nanokernel boot entry (SheepShaver)
-// The 68K emulator's kernel-trap table: LA_EmulatorCode (0x68060000, baked into
-// the ROM's ConfigInfo) + KernelTrapTableOffset (0xE8C0). The nanokernel's boot
-// tail blrls to this address, executing `twui r31,0` (trap 0 =
-// ReturnFromException); IntProgram decodes it and the emulator starts.
-#define PPC_EMULATOR_TRAP_TABLE 0x6806E8C0
+// The 68K emulator's kernel-trap table, as patched by PpcPatchNewWorldRom:
+// LA_EmulatorCode is redirected from the baked 0x68060000 (RAM) to the ROM
+// window at ROM base + 0x360000, so LA_EmulatorCode + KernelTrapTableOffset
+// (0xE8C0) = ROM base + 0x36E8C0 = 0x40B6E8C0. The nanokernel's boot tail
+// blrls to this address; the original `twui r31,0` dispatch table there is
+// patched to `b 0x36f900` (the emulator-start routine), so no trap fires.
+#define PPC_NEW_WORLD_ROM_LA_EMULCODE_BASE (PPC_NEW_WORLD_ROM_GUEST_BASE + 0x360000)
+#define PPC_NEW_WORLD_ROM_KERNEL_TRAP_TABLE_OFFSET 0xE8C0
+#define PPC_EMULATOR_TRAP_TABLE (PPC_NEW_WORLD_ROM_LA_EMULCODE_BASE + PPC_NEW_WORLD_ROM_KERNEL_TRAP_TABLE_OFFSET)
+
+// SheepShaver-faithful 68K emulator activation (New World ROM only).
+// PpcPatchNewWorldRom writes:
+//  - the ROM boot structure (ROM + 0x30d000): LA_InfoRecord/LA_KernelData/
+//    LA_EmulatorData = 0x68ffe000/0x68fff000, LA_DispatchTable = ROM + 0x380000,
+//    LA_EmulatorCode = ROM + 0x360000, physical RAM base = 0, 68K reset vector
+//    = ROM + 0x2a;
+//  - the kernel-trap table (ROM + 0x36E8C0, the `twui r31,n` table) as
+//    absolute branches to the emulator-entry routines at ROM + 0x36F900..0x36FD00;
+//  - those entry routines (SheepShaver's emulator-start/MixedMode/Reset/FC1E/
+//    FE0A/FE0F fragments, 27 words each), with the emulator-start fragment's
+//    final `blr` redirected to the injected 68K DR-emulator entry routine
+//    (ROM + 0x36f700, SheepShaver's execute_68k contract: full 68K context +
+//    first opcode dispatch) and the ed.v[0x814] dispatch helper (ROM + 0x36f7c0);
+//  - the 68K opcode dispatch table (ROM + 0x380000, one 8-byte entry per 16-bit
+//    opcode): slots for the EMUL_OP extended opcodes (0xFE40..0xFE40+OP_MAX+2)
+//    at ROM + 0x3FF200 become `POWERPC_EMUL_OP | n` markers ("mulli r0,r0,n")
+//    followed by `b 0x366084` (re-enter the DR emulator loop). The interpreter
+//    intercepts those markers (see PpcEmulatorDispatchOp in interpreter.c).
+#define PPC_NEW_WORLD_ROM_BOOT_STRUCT_OFFSET     0x30D000
+#define PPC_NEW_WORLD_ROM_TRAP_TABLE_OFFSET      0x36E8C0
+#define PPC_NEW_WORLD_ROM_EMUL_START_OFFSET      0x36F900
+#define PPC_NEW_WORLD_ROM_DISPATCH_TABLE_OFFSET  0x380000
+#define PPC_NEW_WORLD_ROM_EMUL_OP_ENTRY_OFFSET   0x3FF200  // (0xFE40 << 3)
+#define PPC_NEW_WORLD_ROM_EMUL_OP_END_OFFSET     0x3FF400
+#define PPC_EMUL_OP_MARKER                       0x18000000  // mulli r0,r0,n (n = marker)
+#define PPC_EMUL_OP_DISPATCH_GUEST_BASE (PPC_NEW_WORLD_ROM_GUEST_BASE + PPC_NEW_WORLD_ROM_EMUL_OP_ENTRY_OFFSET)
+#define PPC_EMUL_OP_DISPATCH_GUEST_END  (PPC_NEW_WORLD_ROM_GUEST_BASE + PPC_NEW_WORLD_ROM_EMUL_OP_END_OFFSET)
+
+// XLM ("eXtra Low Memory") globals written by the bootloader and consumed by the
+// 68K emulator entry routines (SheepShaver's xlowmem.h layout). They live above
+// the 0x0-0x2000 low-memory region the nanokernel zeroes during boot.
+#define PPC_XLM_SIGNATURE_OFFSET   0x2800  // 'Baah'
+#define PPC_XLM_KERNEL_DATA_OFFSET 0x2804  // r1 the emulator switches to
+#define PPC_XLM_TOC_OFFSET         0x2808
+#define PPC_XLM_SHEEP_OBJ_OFFSET   0x280C
+#define PPC_XLM_RUN_MODE_OFFSET    0x2810  // MODE_68K=0, MODE_NATIVE=1, MODE_EMUL_OP=2
+#define PPC_XLM_68K_R25_OFFSET     0x2814  // native 68K PC slot
+#define PPC_XLM_IRQ_NEST_OFFSET    0x2818
+#define PPC_XLM_PVR_OFFSET         0x281C
+#define PPC_XLM_BUS_CLOCK_OFFSET   0x2820
+
+// OP_* selectors for the EMUL_OP markers (SheepShaver's emul_op.h order). The
+// marker n in `mulli r0,r0,n` maps to EmulOp(selector) = n - 3 for n >= 3.
+enum {
+    PPC_OP_BREAK = 0,
+    PPC_OP_XPRAM1, PPC_OP_XPRAM2, PPC_OP_XPRAM3,
+    PPC_OP_NVRAM1, PPC_OP_NVRAM2, PPC_OP_NVRAM3,
+    PPC_OP_FIX_MEMTOP, PPC_OP_FIX_MEMSIZE, PPC_OP_FIX_BOOTSTACK,
+    PPC_OP_SONY_OPEN, PPC_OP_SONY_PRIME, PPC_OP_SONY_CONTROL, PPC_OP_SONY_STATUS,
+    PPC_OP_DISK_OPEN, PPC_OP_DISK_PRIME, PPC_OP_DISK_CONTROL, PPC_OP_DISK_STATUS,
+    PPC_OP_CDROM_OPEN, PPC_OP_CDROM_PRIME, PPC_OP_CDROM_CONTROL, PPC_OP_CDROM_STATUS,
+    PPC_OP_AUDIO_DISPATCH,
+    PPC_OP_SOUNDIN_OPEN, PPC_OP_SOUNDIN_PRIME, PPC_OP_SOUNDIN_CONTROL,
+    PPC_OP_SOUNDIN_STATUS, PPC_OP_SOUNDIN_CLOSE,
+    PPC_OP_ADBOP,
+    PPC_OP_INSTIME, PPC_OP_RMVTIME, PPC_OP_PRIMETIME, PPC_OP_MICROSECONDS,
+    PPC_OP_ZERO_SCRAP, PPC_OP_PUT_SCRAP, PPC_OP_GET_SCRAP,
+    PPC_OP_DEBUG_STR, PPC_OP_INSTALL_DRIVERS, PPC_OP_NAME_REGISTRY,
+    PPC_OP_RESET, PPC_OP_IRQ,
+    PPC_OP_SCSI_DISPATCH, PPC_OP_SCSI_ATOMIC,
+    PPC_OP_CHECK_SYSV, PPC_OP_NTRB_17_PATCH, PPC_OP_NTRB_17_PATCH2,
+    PPC_OP_NTRB_17_PATCH3, PPC_OP_NTRB_17_PATCH4, PPC_OP_CHECKLOAD,
+    PPC_OP_EXTFS_COMM, PPC_OP_EXTFS_HFS,
+    PPC_OP_IDLE_TIME, PPC_OP_IDLE_TIME_2,
+    PPC_OP_MAX
+};
 #define PPC_GUEST_STEP_BUDGET   150000000   // Continuous-run instruction budget
 #define PPC_LOW_MEM_GUEST_BASE  0x00000000  // Low-memory globals
 #define PPC_LOW_MEM_SIZE        0x00040000  // 256 KB (covers the nanokernel's fixed stack/context at 0xA000-0x1A000)

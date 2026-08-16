@@ -511,6 +511,7 @@ PpcHandleException (
     // Real 32-bit PowerPC exception semantics: the address of the faulting
     // instruction goes to SRR0, the MSR at exception time is saved to SRR1,
     // interrupts are disabled, and execution vectors to the exception handler.
+    static UINT32 VecTblDumped = 0;
     UINT32 Vector;
     switch (ExceptionType) {
         case PPC_EXCEPTION_INTERRUPT:   Vector = PPC_EXCEPTION_VECTOR_INTERRUPT;   break;
@@ -518,12 +519,18 @@ PpcHandleException (
         case PPC_EXCEPTION_SYSTEM_CALL: Vector = PPC_EXCEPTION_VECTOR_SYSTEM_CALL; break;
         case PPC_EXCEPTION_FP_UNAVAILABLE: Vector = PPC_EXCEPTION_VECTOR_FP_UNAVAILABLE; break;
         case PPC_EXCEPTION_PROGRAM:     Vector = PPC_EXCEPTION_VECTOR_PROGRAM;     break;
+        case PPC_EXCEPTION_DECREMENTER: Vector = PPC_EXCEPTION_VECTOR_DECREMENTER; break;
         default:
             Print(L"Unhandled PowerPC exception type: %d\n", ExceptionType);
             return EFI_UNSUPPORTED;
     }
 
-    g_PpcContext.Srr0 = ExceptionAddress;
+    // For `sc` the interpreter already saved SRR0 = EA(sc) + 4 (real hardware
+    // semantics); do not overwrite it with the sc's own address, or the
+    // handler's rfi returns into the sc again and the guest loops forever.
+    if (ExceptionType != PPC_EXCEPTION_SYSTEM_CALL) {
+        g_PpcContext.Srr0 = ExceptionAddress;
+    }
     g_PpcContext.Srr1 = g_PpcContext.Msr;
     g_PpcContext.Msr &= ~(PPC_MSR_EE | PPC_MSR_RI);
 
@@ -543,20 +550,34 @@ PpcHandleException (
 
         if (VecTblBase != 0 && Handler != 0 &&
             Handler != 0x68F168F1u && Handler != 0xFFFFFFFFu) {
+            // Dump the NK's vector table once to see which vector handlers are
+            // installed (0x500 external interrupt, 0x900 decrementer, etc.).
+            if (VecTblDumped == 0 && VecTblBase == 0xA360) {
+                UINT32 V;
+                VecTblDumped = 1;
+                Print(L"VECTBL @0x%x:", VecTblBase);
+                for (V = 0x100; V <= 0xF00; V += 0x100) {
+                    Print(L" %x=0x%x", V, PpcReadGuestWord(VecTblBase + ((V >> 8) * 4)));
+                }
+                Print(L"\n");
+            }
             // Perform the vector stub's register effects before entering the
             // handler: save the interrupted context, then let the handler
             // re-read it through the SPRGs (NanoKernel Exceptions.s
             // LoadInterruptRegisters: SPRG0 = KDP, SPRG1 = interrupted r1,
-            // SPRG2 = interrupted LR).
+            // SPRG2 = interrupted LR). r0 is deliberately NOT touched: the
+            // system-call handler reads it for the syscall number (`cmpwi
+            // r0,-3` at 0x40B14AC0) and stores it to [ECB+0x104] for the
+            // dispatch table index.
             g_PpcContext.Spr[273] = g_PpcContext.Gpr[1];   // SPRG1 = user r1
             g_PpcContext.Spr[274] = g_PpcContext.Lr;       // SPRG2 = user LR
             g_PpcContext.Gpr[1]   = g_PpcContext.Spr[272]; // r1 = KDP (SPRG0)
-            g_PpcContext.Gpr[0]   = Handler;               // stub's final r0
             g_PpcContext.Pc       = Handler;
             Print(L"VECDISP vector=0x%x VecTbl=0x%x offset=0x%x handler=0x%x "
-                  L"SPRG1=0x%x SPRG2=0x%x\n",
+                  L"SPRG1=0x%x SPRG2=0x%x SRR0=0x%x DEC=0x%x\n",
                   Vector, VecTblBase, ((Vector >> 8) * 4), Handler,
-                  g_PpcContext.Spr[273], g_PpcContext.Spr[274]);
+                  g_PpcContext.Spr[273], g_PpcContext.Spr[274],
+                  g_PpcContext.Srr0, g_PpcContext.Spr[22]);
         } else {
             // No usable vector table / handler: keep the hardware PC behaviour
             // and execute whatever sits at the vector slot.

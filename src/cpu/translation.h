@@ -63,6 +63,7 @@
 #define PPC_EXCEPTION_SYSTEM_CALL      3
 #define PPC_EXCEPTION_FP_UNAVAILABLE   4
 #define PPC_EXCEPTION_PROGRAM          5
+#define PPC_EXCEPTION_DECREMENTER      6
 
 // PowerPC exception vector offsets (real 32-bit PPC)
 #define PPC_EXCEPTION_VECTOR_INTERRUPT        0x500
@@ -70,6 +71,7 @@
 #define PPC_EXCEPTION_VECTOR_PROGRAM          0x700
 #define PPC_EXCEPTION_VECTOR_FP_UNAVAILABLE   0x800
 #define PPC_EXCEPTION_VECTOR_FP_ASSIST        0x900
+#define PPC_EXCEPTION_VECTOR_DECREMENTER      0x900
 #define PPC_EXCEPTION_VECTOR_SYSTEM_CALL      0xC00
 
 // MSR bit definitions (bit 0 = most significant)

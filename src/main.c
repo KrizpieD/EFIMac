@@ -735,15 +735,16 @@ efi_main (
             // therefore land in the caller structure, not at absolute 0x648,
             // so the copy delivers it to [0xA648].
             //
-            // The value the real machine uses is LA_EmulatorCode +
-            // KernelTrapTableOffset = 0x68060000 + 0xE8C0 = 0x6806E8C0: the
-            // 68K emulator's kernel-trap table (a `twui r31,n` dispatch table
-            // at the top of the emulator image). The boot tail's blrl executes
-            // `twui r31,0` (trap 0 = ReturnFromException), the NK's IntProgram
-            // handler decodes it and calls KDP.NanoKernelCallTable[0], and the
-            // emulator starts running. Seeding 0x40B10000 (the old behaviour)
-            // re-entered the NK boot entry instead, which rfi'd to r3+0x40 =
-            // 0x13F (guard-fill -> crash).
+            // The real machine uses LA_EmulatorCode + KernelTrapTableOffset =
+            // 0x68060000 + 0xE8C0 = 0x6806E8C0: the 68K emulator's kernel-trap
+            // table (`twui r31,n`). PpcPatchNewWorldRom redirects
+            // LA_EmulatorCode into the ROM window (ROM + 0x360000) and
+            // overwrites that trap table with absolute branches to the
+            // emulator-start routines (b 0x36f900..0x36fd00), so the boot
+            // tail's blrl jumps straight into the 68K emulator without raising
+            // a trap. Seeding 0x40B10000 (the old behaviour) re-entered the NK
+            // boot entry instead, which rfi'd to r3+0x40 = 0x13F (guard-fill
+            // -> crash).
             UINT32 ReturnTarget = PPC_EMULATOR_TRAP_TABLE;
             PpcWriteGuestByte(0x30000 + 0x648 + 0, (UINT8)(ReturnTarget >> 24));
             PpcWriteGuestByte(0x30000 + 0x648 + 1, (UINT8)(ReturnTarget >> 16));
@@ -751,16 +752,11 @@ efi_main (
             PpcWriteGuestByte(0x30000 + 0x648 + 3, (UINT8)(ReturnTarget));
             Print(L"  Seeded NK emulator-entry slot [0x30648] = 0x%08x "
                   L"(emulator kernel trap table)\n", ReturnTarget);
-            // The NK prints "Nanodebugger activated." and then idles at the
-            // nanokernel debugger prompt, polling the SCC for a command. The
-            // first byte queued is consumed by the "Old KDP" break-in check
-            // during debugger setup; feed the nanodebugger's command line its
-            // own "go" ('g') + CR so it resumes the boot sequence.
-            PpcSccPutChar('g');
-            PpcSccPutChar(0x0D);
-            PpcSccPutChar('g');
-            PpcSccPutChar(0x0D);
-            Print(L"  Queued SCC input: 'g' CR 'g' CR (nanodebugger go)\n");
+            // NOTE: do NOT pre-queue a nanodebugger "go" ('g' CR) here. The NK
+            // polls the SCC during normal boot and drops into the nanodebugger
+            // on any character, so an early 'g' derails boot. The interpreter's
+            // AUTORESUME probe feeds 'g' only when the guest is actually idling
+            // at the nanodebugger prompt (PC=0x40B2751C).
           }
           // The NK entry tests MSR bit 0x10 (rlwinm r0,r0,0,0x1b,0x1b at
           // 0x40B10014) and takes the cold/BAT path (beql 0x40B104A8) when

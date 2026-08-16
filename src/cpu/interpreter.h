@@ -21,6 +21,8 @@ typedef struct {
     UINT32  Spr[1024];      // Special Purpose Register file
     UINT32  TimeBaseL;      // Time base lower (TBL)
     UINT32  TimeBaseH;      // Time base upper (TBU)
+    UINT32  DecrementerNegative;  // 1 while DEC (SPR 22) is negative
+    UINT32  DecrementerWritten;   // 1 once the guest has armed DEC via mtspr
     UINT64  Fpr[32];        // Floating-point registers (IEEE-754 double bit patterns)
     UINT32  Fpscr;          // Floating-point status/control register (classic 32-bit layout)
     UINT8   Vr[32][16];     // AltiVec vector registers VR0..VR31 (big-endian byte order)

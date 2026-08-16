@@ -1,5 +1,6 @@
 #include "interpreter.h"
 #include "translation.h"
+#include "boot/bootloader.h"
 #include <efi.h>
 #include <efilib.h>
 
@@ -164,6 +165,8 @@ PPC_CPU_CONTEXT g_PpcContext = {0};
 #define XO_SRAWI     824
 #define XO_EIEIO     854
 #define XO_STHBRX    918
+#define XO_EXTSH     922
+#define XO_EXTSB     954
 #define XO_ICBI      982
 #define XO_DCBZ     1014
 
@@ -246,9 +249,18 @@ PPC_CPU_CONTEXT g_PpcContext = {0};
 #define SPR_XER    1
 #define SPR_LR     8
 #define SPR_CTR    9
+#define SPR_DEC   22
 #define SPR_SRR0  26
 #define SPR_SRR1  27
+#define SPR_TBL  268
+#define SPR_TBU  269
 #define SPR_PVR  287
+
+// Timebase/decrementer "ticks" advanced per guest instruction. The NK assumes
+// a 50 MHz timebase (XLM BUS_CLOCK); the interpreter runs ~1M instr/s, so 50
+// ticks per instruction approximates the real rate while keeping DEC and the
+// timebase mutually consistent.
+#define PPC_TIMEBASE_SCALE  50
 
 // ---------------------------------------------------------------------------
 // Memory access (default: identity-mapped, big-endian guest memory)
@@ -2632,6 +2644,110 @@ PpcExecuteFpXform (
 }
 
 // ---------------------------------------------------------------------------
+// 68K EMUL_OP dispatch (SheepShaver-faithful)
+//
+// The DR emulator in the New World ROM is a threaded 68K interpreter written
+// in PPC. Its 68K opcode table (ROM + 0x380000) carries, for the EMUL_OP
+// extended opcodes (0xFE40+), the marker `mulli r0,r0,n` (POWERPC_EMUL_OP | n)
+// followed by `b 0x366084` (re-enter the DR emulator loop). The interpreter
+// intercepts those markers here: n = 0..2 are the emulator control opcodes,
+// n >= 3 select EmulOp(n - 3). The 68K register window matches SheepShaver's
+// emul_ppc mapping: d0..d7 = r8..r15, a0..a6 = r16..r22, a7 = r1.
+// ---------------------------------------------------------------------------
+
+static UINTN g_EmulOpProbed = 0;
+
+STATIC VOID
+PpcEmulOp (
+    IN UINT32 Selector
+    )
+{
+    UINT32* Gpr = g_PpcContext.Gpr;
+
+    if (g_EmulOpProbed == 0) {
+        g_EmulOpProbed = 1;
+        Print(L"  EMULOP[%u] first: a7=0x%08x a0=0x%08x d0=0x%08x d1=0x%08x "
+              L"LR=0x%08x PC=0x%08x\n",
+              Selector, Gpr[1], Gpr[16], Gpr[8], Gpr[9],
+              g_PpcContext.Lr, g_PpcContext.Pc);
+    }
+
+    switch (Selector) {
+    case PPC_OP_BREAK:                    // breakpoint
+        break;
+
+    case PPC_OP_INSTIME:                  // InsTime(TMTask*): enqueue timer
+        Gpr[8] = 0;                       // noErr
+        break;
+
+    case PPC_OP_RMVTIME:                  // RmvTime(TMTask*)
+        Gpr[8] = 0;
+        break;
+
+    case PPC_OP_PRIMETIME:                // PrimeTime(TMTask*, UInt32)
+        Gpr[8] = 0;
+        break;
+
+    case PPC_OP_MICROSECONDS: {           // Microseconds(UnsignedWide*)
+        UINT32 Ptr = Gpr[16];
+        CpuWrite32(Ptr, 0);
+        CpuWrite32(Ptr + 4, 0);
+        break;
+    }
+
+    case PPC_OP_IDLE_TIME:                // idle loop callback
+        Gpr[16] = CpuRead32(0x2b6);       // CurrentA5
+        break;
+
+    case PPC_OP_IDLE_TIME_2:
+        Gpr[8] = (UINT32)-2;
+        break;
+
+    case PPC_OP_DEBUG_STR: {              // DebugStr(PascalString* on stack)
+        UINT32 Ptr = CpuRead32(Gpr[1] + 4);
+        UINT8  Len = g_ReadByte(Ptr);
+        UINTN  I;
+        Print(L"  DebugStr: \"");
+        for (I = 0; I < Len && I < 255; I++) {
+            UINT8 C = g_ReadByte(Ptr + 1 + I);
+            if (C >= 0x20 && C <= 0x7E) {
+                Print(L"%c", (UINTN)C);
+            }
+        }
+        Print(L"\"\n");
+        break;
+    }
+
+    default:
+        // Unimplemented selector: report and fail the request gracefully so
+        // the boot code skips the device/service instead of hanging on a
+        // phantom success.
+        Print(L"  EMULOP[%u] not implemented: a7=0x%08x a0=0x%08x d0=0x%08x "
+              L"d1=0x%08x\n",
+              Selector, Gpr[1], Gpr[16], Gpr[8], Gpr[9]);
+        Gpr[8] = 0xFFFFFFF4;              // noMacSW
+        break;
+    }
+}
+
+STATIC VOID
+PpcEmulatorDispatchOp (
+    IN UINT32 Marker
+    )
+{
+    if (Marker <= 2) {
+        Print(L"  EMUL_%s at PC=0x%08x a7=0x%08x (halting guest)\n",
+              Marker == 0 ? L"RETURN" : (Marker == 1 ? L"EXEC_RETURN" : L"EXEC_NATIVE"),
+              g_PpcContext.Pc, g_PpcContext.Gpr[1]);
+        g_PpcContext.ExceptionPending = PPC_EXCEPTION_TRAP;
+        g_PpcContext.Srr0 = g_PpcContext.Pc;
+        g_PpcContext.Srr1 = g_PpcContext.Msr;
+        return;
+    }
+    PpcEmulOp(Marker - 3);
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -2735,6 +2851,16 @@ PpcExecuteInstruction (
         break;
 
     case 14: // addi / li
+        // 68K emulator hook: the ROM's opcode table carries POWERPC_EMUL_OP
+        // markers (`mulli r0,r0,n`) for the EMUL_OP extended opcodes. The
+        // gate is narrow (address range + marker word) so ordinary execution
+        // of real addi/mulli in the DR emulator is unaffected.
+        if (CurrentAddress >= PPC_EMUL_OP_DISPATCH_GUEST_BASE &&
+            CurrentAddress <  PPC_EMUL_OP_DISPATCH_GUEST_END &&
+            (w & 0xFFFF0000) == PPC_EMUL_OP_MARKER) {
+            PpcEmulatorDispatchOp(w & 0x3F);
+            break;
+        }
         g_PpcContext.Gpr[RD(w)] =
             (RA(w) == 0 ? 0 : g_PpcContext.Gpr[RA(w)]) + SIMM(w);
         break;
@@ -2860,6 +2986,11 @@ PpcExecuteInstruction (
             }
             g_PpcContext.Msr = g_PpcContext.Srr1;
             Next = g_PpcContext.Srr0;
+            if ((g_PpcContext.Msr & PPC_MSR_EE) && g_PpcContext.DecrementerNegative &&
+                g_PpcContext.DecrementerWritten &&
+                g_PpcContext.ExceptionPending == 0) {
+                g_PpcContext.ExceptionPending = PPC_EXCEPTION_DECREMENTER;
+            }
             break;
 
         case XO19_ISYNC:  // isync (no-op)
@@ -3367,6 +3498,11 @@ PpcExecuteInstruction (
 
             case XO_MTMSR:  // mtmsr
                 g_PpcContext.Msr = g_PpcContext.Gpr[RS(w)];
+                if ((g_PpcContext.Msr & PPC_MSR_EE) && g_PpcContext.DecrementerNegative &&
+                    g_PpcContext.DecrementerWritten &&
+                    g_PpcContext.ExceptionPending == 0) {
+                    g_PpcContext.ExceptionPending = PPC_EXCEPTION_DECREMENTER;
+                }
                 break;
 
             case XO_STWCX_:  // stwcx. (no reservation tracking)
@@ -3703,6 +3839,8 @@ PpcExecuteInstruction (
                     case SPR_SRR0: Value = g_PpcContext.Srr0; break;
                     case SPR_SRR1: Value = g_PpcContext.Srr1; break;
                     case SPR_PVR:  Value = 0x00010000; break;   // fabricated PVR
+                    case SPR_TBL:  Value = g_PpcContext.TimeBaseL; break;
+                    case SPR_TBU:  Value = g_PpcContext.TimeBaseH; break;
                     default:       Value = g_PpcContext.Spr[SprNum]; break;
                     }
                     g_PpcContext.Gpr[RT(w)] = Value;
@@ -3717,7 +3855,7 @@ PpcExecuteInstruction (
                 break;
 
             case XO_MFTB:  // mftb
-                g_PpcContext.Gpr[RT(w)] = 0;
+                g_PpcContext.Gpr[RT(w)] = g_PpcContext.TimeBaseL;
                 break;
 
             case XO_LHAUX:  // lhaux
@@ -3764,6 +3902,7 @@ PpcExecuteInstruction (
 
             case XO_MTSPR:  // mtspr
                 {
+                    static UINT32 DecWriteLog = 0;
                     UINT32 SprNum = SPR(w);
                     UINT32 Value = g_PpcContext.Gpr[RS(w)];
                     switch (SprNum) {
@@ -3772,6 +3911,15 @@ PpcExecuteInstruction (
                     case SPR_CTR:  g_PpcContext.Ctr = Value; break;
                     case SPR_SRR0: g_PpcContext.Srr0 = Value; break;
                     case SPR_SRR1: g_PpcContext.Srr1 = Value; break;
+        case SPR_DEC:
+            g_PpcContext.Spr[SPR_DEC] = Value;
+            g_PpcContext.DecrementerNegative = (Value & 0x80000000) ? 1 : 0;
+            g_PpcContext.DecrementerWritten = (Value == 0) ? 0 : 1;
+            if (DecWriteLog < 40) {
+                DecWriteLog++;
+                Print(L"  DECWRITE PC=0x%08x value=0x%08x\n", g_PpcContext.Pc, Value);
+            }
+                        break;
                     default:       g_PpcContext.Spr[SprNum] = Value; break;
                     }
                 }
@@ -3878,6 +4026,16 @@ PpcExecuteInstruction (
                     PpcSetXerCarry(Ca);
                     if (Rc(w)) PpcSetCr0FromResult(R);
                 }
+                break;
+
+            case XO_EXTSH:  // extsh / extsh.
+                g_PpcContext.Gpr[RA(w)] = (UINT32)(INT32)(INT16)g_PpcContext.Gpr[RS(w)];
+                if (Rc(w)) PpcSetCr0FromResult(g_PpcContext.Gpr[RA(w)]);
+                break;
+
+            case XO_EXTSB:  // extsb / extsb.
+                g_PpcContext.Gpr[RA(w)] = (UINT32)(INT32)(INT8)g_PpcContext.Gpr[RS(w)];
+                if (Rc(w)) PpcSetCr0FromResult(g_PpcContext.Gpr[RA(w)]);
                 break;
 
             case XO_EIEIO:  // eieio (no-op)
@@ -3992,6 +4150,13 @@ PpcRunGuest (
     static UINT32 TailR8[4096];
     static UINT32 TailR17[4096];
     static UINT32 TailLr[4096];
+    static UINT32 TailR24[4096];
+    static UINT32 TailR27[4096];
+    static UINT32 TailR7[4096];
+    static UINT32 TailR5[4096];
+    static UINT32 TailR15[4096];
+    static UINT32 TailR16[4096];
+    static UINT32 TailCr[4096];
     static UINT32 PcsDumped = 0;
     static UINT32 TraceDumped = 0;
     static UINT32 StoreProbed = 0;
@@ -4009,7 +4174,18 @@ PpcRunGuest (
     static UINT32 MergeTraced = 0;
     static UINT32 PmdFixed = 0;
     static UINT32 BootTailProbed = 0;
+    static UINT32 TailProbed = 0;
+    static UINT32 EmulStartProbed = 0;
+    static UINT32 EmulTrapProbed = 0;
+    static UINT32 CallTblProbed = 0;
+    static UINT32 ScSiteCount = 0;
+    static UINT32 SyscallDispatchProbed = 0;
     static UINT32 TrapProbed = 0;
+    static UINT32 EcbProbed = 0;
+    static UINT32 SchedProbes = 0;
+    static UINT32 EmulWindowProbed = 0;
+    static UINT32 InjectedEntryProbed = 0;
+    static UINT32 WalkProbed = 0;
 
     if (ExecutedCount == NULL) {
         return EFI_INVALID_PARAMETER;
@@ -4025,7 +4201,98 @@ PpcRunGuest (
 
         Instr = CpuRead32(g_PpcContext.Pc);
         Current = g_PpcContext.Pc;
-        Status = PpcExecuteInstruction(Instr, Current, &Next);
+        // ---- 68K DR-emulator software-function hooks ----
+        // The ROM dispatches certain 68K opcodes through "software function"
+        // pointers stored in ed.v (offsets 0x800..0x834 of the emulator data
+        // block at 0xB000). The ROM never seeds these slots, so the dispatch
+        // machinery falls into the tail at 0x40B6CA60 and executes `bctrl`
+        // with CTR == ed.v[0x80C] == 0, branching to address 0. The missing
+        // functions are emulated here in C and the context is handed back to
+        // the ROM's common dispatch (0x40B67C60).
+        UINT32 Hooked = 0;
+        if (Current == 0x40B6CA84 && Instr == 0x4E800421) {
+            // Tail's `bctrl` (software fn ed.v[0x80C]). 68K MOVE #<imm>,SR
+            // (0x46FC) routes here via entry[0x46FC] -> 0x40B6C570 bnsl cr2
+            // -> 0x40B6CA68. r3/r24 = imm address (PC+2), r27 = SR value.
+            if (CpuRead32(0x0000B80C) == 0 && CpuRead16(g_PpcContext.Gpr[3] - 2) == 0x46FC) {
+                UINT16 Sr = CpuRead16(g_PpcContext.Gpr[3]);
+                g_PpcContext.Gpr[24] = g_PpcContext.Gpr[3] + 2;
+                g_PpcContext.Gpr[25] = Sr >> 8;
+                g_PpcContext.Gpr[26] = 0;
+                g_PpcContext.Gpr[27] = 0;
+                g_PpcContext.Gpr[29] = 0x40B80000;
+                g_PpcContext.Xer = 0;
+                g_PpcContext.Cr &= ~0x0F00000F;             // CCR==0: clear cr1, cr7
+                g_PpcContext.Cr = (g_PpcContext.Cr & ~0x00F00000) | 0x00100000;  // cr2 = SO (supervisor)
+                Next = 0x40B67C60;
+                Hooked = 1;
+                Print(L"  MOVE-SR-HOOK 46FC SR=0x%04x r24=0x%08x CR=0x%08x -> 0x40b67c60\n",
+                      Sr, g_PpcContext.Gpr[24], g_PpcContext.Cr);
+            }
+        }
+        if (Current == 0x40BA7380) {
+            // entry[0x4E70] = 68K RESET (software fn ed.v[0x828]): reset the
+            // external devices. Treated as a no-op; continue at opcode+2
+            // (r24 already points there from the common dispatch).
+            if (CpuRead32(0x0000B828) == 0 && CpuRead16(g_PpcContext.Gpr[24] - 2) == 0x4E70) {
+                g_PpcContext.Gpr[27] = 0;
+                g_PpcContext.Gpr[29] = 0x40B80000;
+                Next = 0x40B67C60;
+                Hooked = 1;
+                Print(L"  RESET-HOOK 4E70 r24=0x%08x CR=0x%08x -> 0x40b67c60\n",
+                      g_PpcContext.Gpr[24], g_PpcContext.Cr);
+            }
+        }
+        if (Current == 0x40BA73D8 && Instr == 0x80BF087C) {
+            // entry[0x4E7B] = 68K escape (software fn ed.v[0x87C]): the
+            // dispatch has already consumed the 2-byte parameter word into
+            // r27 and advanced r24 past the opcode (r24 = param address).
+            // Treated as a no-op; advance r24 past the parameter and resume
+            // the DR loop at the next 68K opcode.
+            if (CpuRead32(0x0000B87C) == 0 && CpuRead16(g_PpcContext.Gpr[24] - 2) == 0x4E7B) {
+                UINT32 Resume = g_PpcContext.Gpr[24] + 2;
+                UINT16 Param = (UINT16)g_PpcContext.Gpr[27];
+                g_PpcContext.Gpr[24] = Resume;
+                g_PpcContext.Gpr[27] = 0;
+                g_PpcContext.Gpr[29] = 0x40B80000;
+                Next = 0x40B67C60;
+                Hooked = 1;
+                Print(L"  4E7B-HOOK param=0x%04x resume=0x%08x CR=0x%08x -> 0x40b67c60\n",
+                      Param, Resume, g_PpcContext.Cr);
+            }
+        }
+        if (Current == 0x40BBF8D0 && Instr == 0x80BF0800) {
+            // entry[0x7F1A] = 68K MOVEQ #imm,Dn (software fn ed.v[0x800],
+            // the r6=0x10 trampoline at 0x40B6D750). The ROM implements the
+            // MOVEQ table natively as `addic. rD,r0,signext(imm8)` thunks but
+            // routes this one entry through the unseeded ed.v[0x800] slot.
+            // Emulate the same addic. the native thunk would have executed,
+            // leave r24 pointing at the next 68K opcode, and resume the DR
+            // loop. (r24 is already past the 1-word MOVEQ at this point.)
+            if (CpuRead32(0x0000B800) == 0) {
+                UINT16 Op = CpuRead16(g_PpcContext.Gpr[24] - 2);
+                if ((Op & 0xF000) == 0x7000) {
+                    UINT32 Ca;
+                    INT32 Imm = (INT32)(INT8)(Op & 0xFF);
+                    UINT32 Rd = 8 + ((Op >> 9) & 7);   // r8..r15 = d0..d7
+                    g_PpcContext.Gpr[Rd] = PpcDoAdd(0, Imm, 0, &Ca, NULL);
+                    PpcSetXerCarry(Ca);
+                    PpcSetCr0FromResult(g_PpcContext.Gpr[Rd]);
+                    g_PpcContext.Gpr[27] = 0;
+                    g_PpcContext.Gpr[29] = 0x40B80000;
+                    Next = 0x40B67C60;
+                    Hooked = 1;
+                    Print(L"  MOVEQ-HOOK op=0x%04x imm=%d d%u=0x%08x r24=0x%08x CR=0x%08x -> 0x40b67c60\n",
+                          Op, Imm, (Op >> 9) & 7, g_PpcContext.Gpr[Rd],
+                          g_PpcContext.Gpr[24], g_PpcContext.Cr);
+                }
+            }
+        }
+        if (Hooked) {
+            Status = EFI_SUCCESS;
+        } else {
+            Status = PpcExecuteInstruction(Instr, Current, &Next);
+        }
         Executed++;
         if (Current == 0x40B126CC || Current == 0x40B107FC || Current == 0x40B10098) {
             Print(L"  PROBE@0x%08x r1=0x%08x r3=0x%08x [r1+648]=0x%08x [0x648]=0x%08x [0xA648]=0x%08x [0xAFE4]=0x%04x [r1+5A0]=0x%08x [r1+5A4]=0x%08x [r1-964]=0x%08x [r1-20]=0x%08x\n",
@@ -4037,6 +4304,19 @@ PpcRunGuest (
                   CpuRead32(g_PpcContext.Gpr[1] + 0x5A4),
                   CpuRead32(g_PpcContext.Gpr[1] - 0x964),
                   CpuRead32(g_PpcContext.Gpr[1] - 0x20));
+        }
+        if (EcbProbed == 0 && Current == 0x40B10834) {
+            UINT32 R3 = g_PpcContext.Gpr[3];
+            EcbProbed = 1;
+            Print(L"  ECB@0x%08x r1=0x%08x r3=0x%08x r8=0x%08x r11=0x%08x r12=0x%08x "
+                  L"[r3+78]=0x%08x [r3+84]=0x%08x [r3+A4]=0x%08x [r3+AC]=0x%08x "
+                  L"[r1+654]=0x%08x [r1+658]=0x%08x\n",
+                  Current, g_PpcContext.Gpr[1], R3, g_PpcContext.Gpr[8],
+                  g_PpcContext.Gpr[11], g_PpcContext.Gpr[12],
+                  CpuRead32(R3 + 0x78), CpuRead32(R3 + 0x84),
+                  CpuRead32(R3 + 0xA4), CpuRead32(R3 + 0xAC),
+                  CpuRead32(g_PpcContext.Gpr[1] + 0x654),
+                  CpuRead32(g_PpcContext.Gpr[1] + 0x658));
         }
         // The NK boot tail's `blrl` at 0x40B126F0 calls
         // KDP.LA_EmulatorKernelTrapTable ([r1+0x648]) = 0x6806E8C0
@@ -4061,11 +4341,188 @@ PpcRunGuest (
                   L"LA_ECB[r1+654]=0x%08x NanoKernelCallTable[0][r1+5F0]=0x%08x\n",
                   CpuRead32(K + 0x648), CpuRead32(K + 0x658),
                   CpuRead32(K + 0x654), CpuRead32(K + 0x5F0));
-            Print(L"  BOOTTAIL CallTable[1]=0x%08x [2]=0x%08x [3]=0x%08x [4]=0x%08x "
-                  L"trapinstr=0x%08x\n",
+            Print(L"  BOOTTAIL KDP.ECB[r1+65C]=0x%08x flags[r1+660]=0x%08x CallTable[1]=0x%08x "
+                  L"[2]=0x%08x [3]=0x%08x [4]=0x%08x\n",
+                  CpuRead32(K + 0x65C), CpuRead32(K + 0x660),
                   CpuRead32(K + 0x5F4), CpuRead32(K + 0x5F8),
-                  CpuRead32(K + 0x5FC), CpuRead32(K + 0x600),
-                  CpuRead32(0x6806E8C0));
+                  CpuRead32(K + 0x5FC), CpuRead32(K + 0x600));
+            Print(L"  BOOTTAIL trap-table word[0]=0x%08x word[1]=0x%08x "
+                  L"XLM.SIG=0x%08x XLM.KDP=0x%08x XLM.IRQNEST=0x%08x\n",
+                  CpuRead32(PPC_EMULATOR_TRAP_TABLE),
+                  CpuRead32(PPC_EMULATOR_TRAP_TABLE + 4),
+                  CpuRead32(PPC_XLM_SIGNATURE_OFFSET),
+                  CpuRead32(PPC_XLM_KERNEL_DATA_OFFSET),
+                  CpuRead32(PPC_XLM_IRQ_NEST_OFFSET));
+        }
+        // The boot tail's `blrl` lands here: the patched trap table entry
+        // (b 0x36f900). Dump the handoff state once at emulator start.
+        if (EmulStartProbed == 0 && Current == 0x40B6F900) {
+            UINT32 K = g_PpcContext.Gpr[1];
+            EmulStartProbed = 1;
+            Print(L"  EMUSTART@0x%08x r1=0x%08x r3=0x%08x r6=0x%08x r7=0x%08x "
+                  L"r8=0x%08x r10=0x%08x r11=0x%08x r12=0x%08x LR=0x%08x MSR=0x%08x\n",
+                  Current, K, g_PpcContext.Gpr[3], g_PpcContext.Gpr[6],
+                  g_PpcContext.Gpr[7], g_PpcContext.Gpr[8], g_PpcContext.Gpr[10],
+                  g_PpcContext.Gpr[11], g_PpcContext.Gpr[12],
+                  g_PpcContext.Lr, g_PpcContext.Msr);
+            Print(L"  EMUSTART KDP.CallTable[0][r1+5F0]=0x%08x ECB[r1+65C]=0x%08x "
+                  L"flags[r1+660]=0x%08x XLM.RUNMODE=0x%08x\n",
+                  CpuRead32(K + 0x5F0), CpuRead32(K + 0x65C),
+                  CpuRead32(K + 0x660), CpuRead32(PPC_XLM_RUN_MODE_OFFSET));
+            Print(L"  EMUSTART runtime mem@calltable[0] (0x%08x): %08x %08x %08x %08x\n",
+                  CpuRead32(K + 0x5F0), CpuRead32(CpuRead32(K + 0x5F0)),
+                  CpuRead32(CpuRead32(K + 0x5F0) + 4),
+                  CpuRead32(CpuRead32(K + 0x5F0) + 8),
+                  CpuRead32(CpuRead32(K + 0x5F0) + 0xC));
+            Print(L"  EMUSTART emulstart w[26]@0x40b6f968=0x%08x w[20]@0x40b6f950=0x%08x "
+                  L"entry[0]@0x40b6f700=0x%08x entry[1]=0x%08x helper[0]@0x40b6f7c0=0x%08x\n",
+                  CpuRead32(0x40B6F968), CpuRead32(0x40B6F950),
+                  CpuRead32(0x40B6F700), CpuRead32(0x40B6F704),
+                  CpuRead32(0x40B6F7C0));
+        }
+        // The injected 68K DR-emulator entry (RomWriteEmulatorEntryRoutine).
+        if (InjectedEntryProbed == 0 && Current == 0x40B6F700) {
+            InjectedEntryProbed = 1;
+            Print(L"  INJENTRY@0x40b6f700 r1=0x%08x r8=0x%08x r24=0x%08x r27=0x%08x "
+                  L"r29=0x%08x r30=0x%08x r31=0x%08x LR=0x%08x\n",
+                  g_PpcContext.Gpr[1], g_PpcContext.Gpr[8],
+                  g_PpcContext.Gpr[24], g_PpcContext.Gpr[27],
+                  g_PpcContext.Gpr[29], g_PpcContext.Gpr[30],
+                  g_PpcContext.Gpr[31], g_PpcContext.Lr);
+        }
+        // First step into the ROM data region where the failed boot walks.
+        if (WalkProbed == 0 && Current >= 0x40AFC000 && Current < 0x40B00000) {
+            WalkProbed = 1;
+            Print(L"  WALK@0x%08x r1=0x%08x r8=0x%08x r23=0x%08x r24=0x%08x r25=0x%08x "
+                  L"r27=0x%08x r28=0x%08x r29=0x%08x r30=0x%08x r31=0x%08x "
+                  L"LR=0x%08x CR=0x%08x SRR0=0x%08x MSR=0x%08x CTR=0x%08x\n",
+                  Current, g_PpcContext.Gpr[1], g_PpcContext.Gpr[8],
+                  g_PpcContext.Gpr[23], g_PpcContext.Gpr[24], g_PpcContext.Gpr[25],
+                  g_PpcContext.Gpr[27], g_PpcContext.Gpr[28], g_PpcContext.Gpr[29],
+                  g_PpcContext.Gpr[30], g_PpcContext.Gpr[31],
+                  g_PpcContext.Lr, g_PpcContext.Cr, g_PpcContext.Srr0,
+                  g_PpcContext.Msr, g_PpcContext.Ctr);
+            Print(L"  WALK prev w[0x%08x-4]=0x%08x w[+4]=0x%08x [r24]=0x%08x "
+                  L"[0x4080002a]=0x%04x [0x4080002c]=0x%04x [0xb814]=0x%08x "
+                  L"[0xb074]=0x%08x\n",
+                  Current, CpuRead32(Current - 4), CpuRead32(Current + 4),
+                  CpuRead32(g_PpcContext.Gpr[24]),
+                  CpuRead16(0x4080002A), CpuRead16(0x4080002C),
+                  CpuRead32(0xB814), CpuRead32(0xB074));
+        }
+        // Arrival at the NK call-table[0] target after the emulator-start
+        // routine's blr. Dump the runtime code once to see whether the NK
+        // installed its own glue here (the ROM file has zeros in this region).
+        if (EmulWindowProbed == 0 && Current >= 0x40B6E800 && Current < 0x40B6FF00) {
+            EmulWindowProbed = 1;
+            Print(L"  EMULWIN@0x%08x r1=0x%08x r3=0x%08x r4=0x%08x LR=0x%08x MSR=0x%08x\n",
+                  Current, g_PpcContext.Gpr[1], g_PpcContext.Gpr[3],
+                  g_PpcContext.Gpr[4], g_PpcContext.Lr, g_PpcContext.Msr);
+            Print(L"  EMULWIN w[0x%08x]=0x%08x w[0x%08x]=0x%08x w[0x%08x]=0x%08x\n",
+                  Current, CpuRead32(Current), Current + 4, CpuRead32(Current + 4),
+                  Current + 8, CpuRead32(Current + 8));
+        }
+        if (CallTblProbed == 0 && Current == 0x40B13BF8) {
+            UINT32 A;
+            CallTblProbed = 1;
+            Print(L"  CALLTBL@0x%08x (blr from emulator start) r1=0x%08x r10=0x%08x "
+                  L"r11=0x%08x LR=0x%08x MSR=0x%08x\n",
+                  Current, g_PpcContext.Gpr[1], g_PpcContext.Gpr[10],
+                  g_PpcContext.Gpr[11], g_PpcContext.Lr, g_PpcContext.Msr);
+            for (A = Current; A < Current + 64; A += 16) {
+                Print(L"  CALLTBL[0x%08x] %08x %08x %08x %08x\n",
+                      A, CpuRead32(A), CpuRead32(A + 4),
+                      CpuRead32(A + 8), CpuRead32(A + 0xC));
+            }
+        }
+        // The NK syscall site at the tail of the task/event loop: r0 carries
+        // the syscall number, r3/r4 the args, and the handler's rfi must
+        // return to sc+4 (0x40B24FDC) so the `cmpwi r3,0` result check runs.
+        if (Current == 0x40B24FD8 && ScSiteCount < 4) {
+            ScSiteCount++;
+            Print(L"  SCSITE[%u] r0=0x%08x r3=0x%08x r4=0x%08x r31=0x%08x "
+                  L"LR=0x%08x SRR0=0x%08x MSR=0x%08x DEC=0x%08x TBL=0x%08x TBU=0x%08x\n",
+                  ScSiteCount, g_PpcContext.Gpr[0], g_PpcContext.Gpr[3],
+                  g_PpcContext.Gpr[4], g_PpcContext.Gpr[31],
+                  g_PpcContext.Lr, g_PpcContext.Srr0, g_PpcContext.Msr,
+                  g_PpcContext.Spr[22], g_PpcContext.TimeBaseL,
+                  g_PpcContext.TimeBaseH);
+        }
+        if (ScSiteCount >= 1 && Current == 0x40B24FDC) {
+            Print(L"  SCSEVRET r3=0x%08x r0=0x%08x r31=0x%08x LR=0x%08x\n",
+                  g_PpcContext.Gpr[3], g_PpcContext.Gpr[0],
+                  g_PpcContext.Gpr[31], g_PpcContext.Lr);
+        }
+        // NK syscall dispatch: r15 = syscall number (restored from
+        // [ECB+0x104]), table base loaded via `lis r16,imm; ori r16,r16,imm`
+        // at 0x40B1AEF4/0x40B1AEF8 -- the NK relocates these (patches the
+        // `lis` high half), so read the live table base from the instructions.
+        if (SyscallDispatchProbed < 8 && Current == 0x40B1AED0) {
+            UINT32 Lis = CpuRead32(0x40B1AEF4);
+            UINT32 Ori = CpuRead32(0x40B1AEF8);
+            UINT32 Base = ((Lis & 0xFFFF) << 16) | (Ori & 0xFFFF);
+            UINT32 N = g_PpcContext.Gpr[15];
+            UINT32 Entry = CpuRead32(Base + (N & 0xFF) * 4);
+            SyscallDispatchProbed++;
+            Print(L"  SYSDISP[%u] n=0x%x (r15) lis=0x%08x ori=0x%08x "
+                  L"tblbase=0x%08x entry=0x%08x target=0x%08x r3=0x%08x r4=0x%08x r14=0x%08x\n",
+                  SyscallDispatchProbed, N, Lis, Ori, Base, Entry,
+                  Base + (N & 0xFF) * 4 + Entry,
+                  g_PpcContext.Gpr[3], g_PpcContext.Gpr[4], g_PpcContext.Gpr[14]);
+            Print(L"  SYSDISP tbl[0..20]=");
+            for (N = 0; N < 20; N++) {
+                Print(L"%08x ", CpuRead32(Base + N * 4));
+            }
+            Print(L"\n");
+            Print(L"  SYSDISP KDP-0x338=[0x9CC8]=0x%08x [r22+0x38]=0x%08x "
+                  L"[r22+0x44]=0x%08x KDP+0x65C=0x%08x KDP+0x5F0=0x%08x "
+                  L"[r22+0x4C]=0x%08x\n",
+                  CpuRead32(0x9CC8), CpuRead32(CpuRead32(0x9CC8) + 0x38),
+                  CpuRead32(CpuRead32(0x9CC8) + 0x44),
+                  CpuRead32(0xA65C), CpuRead32(0xA5F0),
+                  CpuRead32(CpuRead32(0x9CC8) + 0x4C));
+        }
+        if (EmulTrapProbed == 0 && Current == PPC_EMULATOR_TRAP_TABLE) {
+            EmulTrapProbed = 1;
+            Print(L"  EMUTRAP@0x%08x (patched: b 0x36f900) r1=0x%08x r4=0x%08x "
+                  L"LR=0x%08x MSR=0x%08x\n",
+                  Current, g_PpcContext.Gpr[1], g_PpcContext.Gpr[4],
+                  g_PpcContext.Lr, g_PpcContext.Msr);
+            // The nanokernel zeroed low memory during its boot, wiping the XLM
+            // globals PpcPatchNewWorldRom wrote. Restore them at the exact
+            // moment of the 68K handoff: the emulator-start routine reads
+            // XLM_IRQ_NEST [0x2818] and XLM_KERNEL_DATA [0x2804] as its first
+            // instructions (after this instruction has already executed).
+            CpuWrite32(PPC_XLM_SIGNATURE_OFFSET,   0x42616168);  // 'Baah'
+            CpuWrite32(PPC_XLM_KERNEL_DATA_OFFSET, 0x0000A000);  // NK KDP
+            CpuWrite32(PPC_XLM_TOC_OFFSET,         0x00000000);
+            CpuWrite32(PPC_XLM_SHEEP_OBJ_OFFSET,   0x00000000);
+            CpuWrite32(PPC_XLM_RUN_MODE_OFFSET,    0x00000000);  // MODE_68K
+            CpuWrite32(PPC_XLM_68K_R25_OFFSET,     0x00000000);
+            CpuWrite32(PPC_XLM_IRQ_NEST_OFFSET,    0x00000000);
+            CpuWrite32(PPC_XLM_PVR_OFFSET,         0x00000000);
+            CpuWrite32(PPC_XLM_BUS_CLOCK_OFFSET,   50000000);
+            Print(L"  EMUTRAP XLM restored: [2800]=0x%08x [2804]=0x%08x "
+                  L"[2818]=0x%08x\n",
+                  CpuRead32(PPC_XLM_SIGNATURE_OFFSET),
+                  CpuRead32(PPC_XLM_KERNEL_DATA_OFFSET),
+                  CpuRead32(PPC_XLM_IRQ_NEST_OFFSET));
+            // Seed the 68K DR-emulator context: the emulator-start routine
+            // saves the interrupted 68K context to [ECB+0x13C..] and reads
+            // KDP.ECB; the injected entry routine and the DR emulator read
+            // ed.v[0x74]/[0x78] (opcode table / emulator base) and call the
+            // ed.v[0x814] dispatch helper. ECB+0x1CC holds the interrupt
+            // pending bits (& 7 == 7 per the state machine).
+            CpuWrite32(0x0000A634, 0x0000B000);  // KDP.PA_EmulatorData
+            CpuWrite32(0x0000A65C, 0x0000B100);  // KDP.ECB
+            CpuWrite32(0x0000B074, 0x40B80000);  // ed.v[0x74] opcode table
+            CpuWrite32(0x0000B078, 0x40B60000);  // ed.v[0x78] emulator base
+            CpuWrite32(0x0000B814, 0x40B6F7C0);  // ed.v[0x814] dispatch helper
+            CpuWrite32(0x0000B2CC, 0x00000007);  // ECB+0x1CC interrupt pending
+            Print(L"  EMUTRAP DR context seeded: [A634]=0x%08x [A65C]=0x%08x "
+                  L"[B074]=0x%08x [B078]=0x%08x [B814]=0x%08x [B2CC]=0x%08x\n",
+                  CpuRead32(0xA634), CpuRead32(0xA65C), CpuRead32(0xB074),
+                  CpuRead32(0xB078), CpuRead32(0xB814), CpuRead32(0xB2CC));
         }
         if (StoreProbed == 0 && (Current == 0x40B11B64 || Current == 0x40B11B48)) {
             UINT32 P = g_PpcContext.Gpr[1];
@@ -4287,12 +4744,52 @@ PpcRunGuest (
         TailR8[TailStart] = g_PpcContext.Gpr[8];
         TailR17[TailStart] = g_PpcContext.Gpr[17];
         TailLr[TailStart] = g_PpcContext.Lr;
+    TailR24[TailStart] = g_PpcContext.Gpr[24];
+    TailR27[TailStart] = g_PpcContext.Gpr[27];
+    TailR7[TailStart] = g_PpcContext.Gpr[7];
+    TailR5[TailStart] = g_PpcContext.Gpr[5];
+    TailR15[TailStart] = g_PpcContext.Gpr[15];
+    TailR16[TailStart] = g_PpcContext.Gpr[16];
+    TailCr[TailStart] = g_PpcContext.Cr;
         TailStart = (TailStart + 1) % 4096;
         if (TailCount < 4096) TailCount++;
+        if (TailProbed == 0 && (Current == 0x40B6CA68 || Current == 0x40B6CA78 || Current == 0x40B6CA84 || Current == 0x40B6CA88)) {
+            TailProbed = 1;
+            Print(L"  MOVE-SR-TAIL PC=0x%08x r3=0x%08x r24=0x%08x r27=0x%08x r25=0x%08x r28=0x%08x r31=0x%08x CR=0x%08x CR0=%x CR2=%x CR5=%x CR7=%x\n",
+                  Current, g_PpcContext.Gpr[3], g_PpcContext.Gpr[24], g_PpcContext.Gpr[27],
+                  g_PpcContext.Gpr[25], g_PpcContext.Gpr[28], g_PpcContext.Gpr[31],
+                  g_PpcContext.Cr, (g_PpcContext.Cr >> 28) & 0xF, (g_PpcContext.Cr >> 20) & 0xF,
+                  (g_PpcContext.Cr >> 8) & 0xF, g_PpcContext.Cr & 0xF);
+            Print(L"  ED dump: [0x20]=0x%08x [0x3E]=0x%08x [0xB072C]=0x%08x [0xB80C]=0x%08x [0xB818]=0x%08x [0xB074]=0x%08x [0xB078]=0x%08x [0xB814]=0x%08x [0xB2CC]=0x%08x\n",
+                  CpuRead32(0x20), CpuRead32(0x3E), CpuRead32(0xB72C), CpuRead32(0xB80C),
+                  CpuRead32(0xB818), CpuRead32(0xB074), CpuRead32(0xB078), CpuRead32(0xB814),
+                  CpuRead32(0xB2CC));
+        }
         if ((Executed % 250000) == 0) {
-            Print(L"  PROGRESS[%d] PC=0x%08x LR=0x%08x r1=0x%08x r8=0x%08x r28=0x%08x SPRG4=0x%08x\n",
+            Print(L"  PROGRESS[%d] PC=0x%08x LR=0x%08x r1=0x%08x r8=0x%08x r28=0x%08x SPRG4=0x%08x "
+                  L"MSR=0x%08x DEC=0x%08x TBL=0x%08x NEG=%u\n",
                   Executed, Current, g_PpcContext.Lr, g_PpcContext.Gpr[1],
-                  g_PpcContext.Gpr[8], g_PpcContext.Gpr[28], g_PpcContext.Spr[272]);
+                  g_PpcContext.Gpr[8], g_PpcContext.Gpr[28], g_PpcContext.Spr[272],
+                  g_PpcContext.Msr, g_PpcContext.Spr[22], g_PpcContext.TimeBaseL,
+                  g_PpcContext.DecrementerNegative);
+        }
+        if (SchedProbes < 4 && Current == 0x40B22F18) {
+            UINT32 K = g_PpcContext.Gpr[1];
+            UINT32 Ecc = CpuRead32(K + 0x658);
+            UINT32 Cur = CpuRead32(K - 0x254);
+            SchedProbes++;
+            Print(L"  SCHED[%u] PC=0x%08x r8=0x%08x r9=0x%08x TBL=0x%08x DEC=0x%08x NEG=%u\n",
+                  SchedProbes, Current, g_PpcContext.Gpr[8], g_PpcContext.Gpr[9],
+                  g_PpcContext.TimeBaseL, g_PpcContext.Spr[22],
+                  g_PpcContext.DecrementerNegative);
+            Print(L"  SCHED   KDP-0x309(flg)=%u KDP-0x2E8/4(dead)=0x%08x:0x%08x "
+                  L"curTask=0x%08x st16=0x%02x\n",
+                  PpcReadGuestByte(K - 0x309), CpuRead32(K - 0x2E8), CpuRead32(K - 0x2E4),
+                  Cur, (Cur ? PpcReadGuestByte(Cur + 0x16) : 0));
+            Print(L"  SCHED   ECB=0x%08x ECB+CC=0x%08x KDP+5A0=0x%08x KDP+F2C=0x%08x "
+                  L"KDP+E8C=0x%08x\n",
+                  Ecc, CpuRead32(Ecc + 0xCC), CpuRead32(K + 0x5A0),
+                  CpuRead32(K + 0xF2C), CpuRead32(K + 0xE8C));
         }
         if (PcsDumped == 0 && (Current == 0x40B2751C || Current == 0x40B27530 || Current == 0x40B27540)) {
             UINT32 Ewa = g_PpcContext.Spr[272];
@@ -4490,9 +4987,11 @@ PpcRunGuest (
                 for (I = 0; I < TailCount; I++) {
                     UINTN Idx = (TailStart + TailCount - 1 - I) % 4096;
                     PpcDecodeInstruction(TailInst[Idx], Mn, sizeof(Mn));
-                    Print(L"  TRACE[-%d] PC=0x%08x 0x%08x %s -> 0x%08x r28=0x%08x r8=0x%08x LR=0x%08x\n",
+                    Print(L"  TRACE[-%d] PC=0x%08x 0x%08x %s -> 0x%08x r24=0x%08x r27=0x%08x r7=0x%08x r5=0x%08x r15=0x%08x r16=0x%08x CR=0x%08x r28=0x%08x LR=0x%08x\n",
                           (UINTN)I + 1, TailPc[Idx], TailInst[Idx], Mn, TailNext[Idx],
-                          TailR28[Idx], TailR8[Idx], TailLr[Idx]);
+                          TailR24[Idx], TailR27[Idx], TailR7[Idx], TailR5[Idx],
+                          TailR15[Idx], TailR16[Idx], TailCr[Idx],
+                          TailR28[Idx], TailLr[Idx]);
                 }
                 {
                     CHAR16 StopMn[16];
@@ -4585,6 +5084,27 @@ PpcRunGuest (
                 return Status;
             }
             continue;
+        }
+
+        // Advance the guest timebase (TBL/TBU) and decrementer (DEC) "tick"
+        // by PPC_TIMEBASE_SCALE per instruction, and request the decrementer
+        // interrupt when DEC is negative with interrupts enabled (NanoKernel
+        // scheduler tick). The scale approximates the NK's assumed timebase
+        // rate (XLM BUS_CLOCK = 50 MHz) for the interpreter's instruction
+        // throughput, and keeps DEC and the timebase consistent with each
+        // other. The interrupt is only raised once the NK has armed DEC via
+        // mtspr: an unarmed (reset) DEC must not fire a spurious tick.
+        g_PpcContext.TimeBaseL += PPC_TIMEBASE_SCALE;
+        if (g_PpcContext.TimeBaseL < PPC_TIMEBASE_SCALE) {
+            g_PpcContext.TimeBaseH++;
+        }
+        g_PpcContext.Spr[SPR_DEC] -= PPC_TIMEBASE_SCALE;
+        if (g_PpcContext.Spr[SPR_DEC] & 0x80000000) {
+            g_PpcContext.DecrementerNegative = 1;
+        }
+        if (g_PpcContext.DecrementerWritten && g_PpcContext.DecrementerNegative &&
+            (g_PpcContext.Msr & PPC_MSR_EE) && g_PpcContext.ExceptionPending == 0) {
+            g_PpcContext.ExceptionPending = PPC_EXCEPTION_DECREMENTER;
         }
 
         g_PpcContext.Pc = Next;
@@ -4757,6 +5277,8 @@ PpcDecodeInstruction (
         case XO_SRW:       Name = L"srw";   break;
         case XO_SRAW:      Name = L"sraw";  break;
         case XO_SRAWI:     Name = L"srawi"; break;
+        case XO_EXTSH:     Name = L"extsh"; break;
+        case XO_EXTSB:     Name = L"extsb"; break;
         case XO_CNTLZW:    Name = L"cntlzw";break;
         case XO_MULLW:     Name = L"mullw"; break;
         case XO_MULHW:     Name = L"mulhw"; break;
