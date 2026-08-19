@@ -7,6 +7,7 @@ UINT32 _fltused = 0;
 // Include all our module headers
 #include "cpu/interpreter.h"
 #include "cpu/translation.h"
+#include "cpu/m68k.h"
 #include "memory/manager.h"
 #include "hardware/abstraction.h"
 #include "boot/bootloader.h"
@@ -134,6 +135,16 @@ efi_main (
   Status = PpcRunSelfTest();
   if (EFI_ERROR(Status)) {
     Print(L"PowerPC CPU self-test FAILED: %r\n", Status);
+    return Status;
+  }
+
+  // Initialize the 68K interpreter
+  M68kInitialize();
+
+  // Run the 68K CPU self-test suite
+  Status = M68kRunSelfTest();
+  if (EFI_ERROR(Status)) {
+    Print(L"68K CPU self-test FAILED: %r\n", Status);
     return Status;
   }
   

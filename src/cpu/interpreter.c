@@ -1,5 +1,6 @@
 #include "interpreter.h"
 #include "translation.h"
+#include "m68k.h"
 #include "boot/bootloader.h"
 #include <efi.h>
 #include <efilib.h>
@@ -4210,6 +4211,17 @@ PpcRunGuest (
         // functions are emulated here in C and the context is handed back to
         // the ROM's common dispatch (0x40B67C60).
         UINT32 Hooked = 0;
+        // ---- Native 68K dispatch-loop hook ----
+        // When the PPC DR-emulator enters its common dispatch at 0x40B67C60,
+        // intercept and execute the 68K instruction natively via the C
+        // interpreter, completely replacing the PPC-based opcode table.
+        if (Current == 0x40B67C60) {
+            Status = M68kExecuteFromPPC ();
+            g_PpcContext.Gpr[27] = 0;
+            g_PpcContext.Gpr[29] = 0x40B80000;
+            Next = 0x40B67C60;
+            Hooked = 1;
+        }
         if (Current == 0x40B6CA84 && Instr == 0x4E800421) {
             // Tail's `bctrl` (software fn ed.v[0x80C]). 68K MOVE #<imm>,SR
             // (0x46FC) routes here via entry[0x46FC] -> 0x40B6C570 bnsl cr2
