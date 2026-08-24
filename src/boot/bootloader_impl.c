@@ -1476,6 +1476,53 @@ PpcInstallSystemRom (
                                     FALSE);
         Print(L"ROM alias installed: %d bytes at guest 0xFFC00000 (%r)\n",
               (UINT64)Size, AliasStatus);
+
+        // SheepShaver-equivalent boot-structure patches
+        // (rom_patches.cpp: patch_nanokernel_boot):
+        //  - Copy the last 1 MB of ROM (PPC emulator + tables) to a
+        //    writable bank right after the image, then point
+        //    LA_EmulatorCode / LA_DispatchTable there. The DR emulator's
+        //    opcode/dispatch tables MUST live in modifiable RAM; the
+        //    Apple flow has the nanokernel copy them to 0x68060000 /
+        //    0x68080000, which nothing in our environment performs --
+        //    leaving those tables zeroed and every handler lookup
+        //    returning 0 (observed as an endless resolver(d0=0) loop in
+        //    the TRAP $A247 patch-scanner).
+        //  - Force Physical RAM base to 0 (NewWorld ROM ships -1).
+        //  - Point the 68k reset vector at ROMBase+0x2a.
+        {
+            UINTN BankPages = 0x00100000 / EFI_PAGE_SIZE;
+            EFI_PHYSICAL_ADDRESS BankBase = 0;
+            EFI_STATUS BankStatus =
+                BS->AllocatePages(AllocateAnyPages, EfiBootServicesData,
+                                  BankPages, &BankBase);
+            if (!EFI_ERROR(BankStatus)) {
+                UINT8* Bank = (UINT8*)(UINTN)BankBase;
+                ZeroMem(Bank, 0x00100000);
+                CopyMem(Bank, (UINT8*)Buffer + (Size - 0x00100000u),
+                        0x00100000);
+                BankStatus = PpcAddGuestMemoryRegion(
+                    Bank, GuestBase + Size, 0x00100000u, FALSE);
+                if (!EFI_ERROR(BankStatus)) {
+                    // Boot structure at ROM+0x30d000 (big-endian image):
+                    // store byte-swapped values.
+                    UINT32* Boot = (UINT32*)((UINT8*)Buffer + 0x30D000u);
+                    Boot[0x09C >> 2] = __builtin_bswap32(0x68FFE000u); // LA_InfoRecord (keep Apple KData)
+                    Boot[0x0A0 >> 2] = __builtin_bswap32(0x68FFE000u); // LA_KernelData
+                    Boot[0x0A4 >> 2] = __builtin_bswap32(0x68FFF000u); // LA_EmulatorData
+                    Boot[0x0A8 >> 2] = __builtin_bswap32(GuestBase + Size + 0x80000u); // LA_DispatchTable -> writable bank
+                    Boot[0x0AC >> 2] = __builtin_bswap32(GuestBase + Size + 0x60000u); // LA_EmulatorCode  -> writable bank
+                    Boot[0x360 >> 2] = 0;                              // PhysRAMBase = 0
+                    Boot[0xFD8 >> 2] = __builtin_bswap32(0x40800000u + 0x2Au); // reset vec
+                    Print(L"EMU bank installed: guest 0x%08x, "
+                          L"LA_EmulatorCode/Dispatch -> bank\n",
+                          (UINT32)(GuestBase + Size));
+                } else {
+                    BS->FreePages(BankBase, BankPages);
+                    Print(L"EMU bank map failed: %r\n", BankStatus);
+                }
+            }
+        }
     }
 
     if (RomAddress != NULL) { *RomAddress = GuestBase; }

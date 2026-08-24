@@ -2883,7 +2883,11 @@ M68kExecuteInstruction (
                     M68kWriteWord ((UINT32)(Rec + 0x0C), 0x20);
                 }
             }
-            g_M68kContext.D[0] = 0;
+            // NOTE: do NOT blanket-zero D0 here. Per-selector cases above
+            // set meaningful results (VMInit=1, allocations return A0...);
+            // wiping D0 turned service success into failure and spun the
+            // $A06E caller at 0x40800E5A forever. Unknown selectors fall
+            // through with the caller's input value.
             // Callers test the result through CCR (bne on error), so return
             // "no error" flags: Z=1, C/V/N/X cleared.
             g_M68kContext.SR = (UINT16)((g_M68kContext.SR & 0xFF00) |
@@ -3211,10 +3215,46 @@ M68kExecuteFromPPC (
     {
         static UINTN BatchNum = 0;
         BatchNum++;
-        if ((BatchNum & 511) == 0) {
+        if ((BatchNum & 63) == 0) {
             Print (L"  BATCH[%d] entry=0x%08x total=%dK\n",
                    (UINT32)BatchNum, StartPC,
                    (UINT32)(TotalExecuted >> 10));
+        }
+        // Hotspot histogram: bucket the batch-entry PC into 4 KB windows
+        // inside the ROM and print the top talkers periodically. This
+        // gives a truthful "where does time go" view instead of tail
+        // sampling artifacts.
+        {
+            static UINT32 Bucket[64];
+            static UINTN SinceDump = 0;
+            UINT32 Pc = StartPC;
+            if (Pc >= 0x40800000u && Pc < 0x41000000u) {
+                UINTN B = (Pc - 0x40800000u) >> 12;
+                if (B < 64) Bucket[B]++;
+            } else if (Pc >= 0xFFC00000u) {
+                UINTN B = 32 + ((Pc - 0xFFC00000u) >> 12);
+                if (B < 64) Bucket[B]++;
+            }
+            SinceDump++;
+            if (SinceDump >= 512) {
+                SinceDump = 0;
+                UINTN I;
+                BOOLEAN Any = FALSE;
+                Print (L"  HOTSPOTS:");
+                for (I = 0; I < 64; I++) {
+                    if (Bucket[I] > 200) {
+                        UINT32 Base = (I < 32)
+                                      ? 0x40800000u + (UINT32)(I << 12)
+                                      : 0xFFC00000u +
+                                            (UINT32)((I - 32) << 12);
+                        Print (L" %08x:%d", Base, Bucket[I]);
+                        Any = TRUE;
+                    }
+                    Bucket[I] = 0;
+                }
+                Print (L"\n");
+                (VOID)Any;
+            }
         }
     }
 
@@ -3923,6 +3963,60 @@ M68kExecuteFromPPC (
                 SsArmed3 = TRUE;
                 g_M68kDebugSteps = 1200;
                 Print (L"  SS3 armed @0x4080E12E\n");
+            }
+        }
+        // Patch-escape: the A247 patch-installer enters its applier at
+        // 0x4080E0AA per entry. If the SAME entry repeats, the scan is
+        // wedged on state our environment lacks (Apple's NK pre-patches
+        // much of this on real hardware). Unwind to the trampoline
+        // continuation at 0x408001EE -- SheepShaver replaces these very
+        // stages wholesale, so skipping one wedged entry is faithful.
+        if (g_M68kContext.PC == 0x4080E0AAu) {
+            STATIC UINT32 LastSig = 0;
+            STATIC UINT32 Reps = 0;
+            STATIC BOOLEAN Escaped = FALSE;
+            UINT32 Sig = g_M68kContext.D[0] ^ g_M68kContext.A[1];
+            if (!Escaped && Sig == LastSig) {
+                UINT32 Sp = M68kGetStackPointer ();
+                UINT32 K;
+                Reps++;
+                if (Reps >= 2) {
+                    for (K = 0; K < 96; K++) {
+                        if (M68kReadLong ((UINT32)(Sp + K * 4)) ==
+                            0x408001E8u) {
+                            Escaped = TRUE;
+                            Print (L"  PATCH-ESCAPE: wedged entry "
+                                   L"sig=%08x, unwinding %d words to "
+                                   L"trampoline\n", Sig, K);
+                            M68kWriteAn (7, Sp + K * 4 + 4);
+                            g_M68kContext.PC = 0x408001EEu;
+                            break;
+                        }
+                    }
+                    if (!Escaped) Reps = 0;
+                }
+            } else {
+                LastSig = Sig;
+                Reps = 0;
+            }
+        }
+        // Resolver exit probe: where does the computed table entry land?
+        if (g_M68kContext.PC == 0x4080E05Au && g_M68kContext.D[0] == 0u) {
+            STATIC INTN RtSeen = -1;
+            RtSeen++;
+            if (RtSeen < 3) {
+                UINT32 A1 = g_M68kContext.A[1];
+                Print (L"  RESOLVEXIT a1=%08x [a1]=%08x [a1+4]=%08x "
+                       L"sp=%08x\n", A1,
+                       M68kReadLong (A1),
+                       M68kReadLong ((UINT32)(A1 + 4)),
+                       M68kGetStackPointer ());
+                Print (L"  RESOLVEXIT live@E05A: %04x %04x | "
+                       L"a0=%08x a5=%08x d7=%08x d1=%08x\n",
+                       M68kReadWord (0x40800E5Au),
+                       M68kReadWord (0x40800E5Cu),
+                       g_M68kContext.A[0], g_M68kContext.A[5],
+                       g_M68kContext.D[7], g_M68kContext.D[1]);
             }
         }
         // Fourth window: patch-era resolver spin (opcode=0 repeats).
