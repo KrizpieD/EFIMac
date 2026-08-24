@@ -617,12 +617,7 @@ efi_main (
         BootStatus = PpcInstallSystemRom(PPC_SYSTEM_FOLDER_ROM_PATH, &RomAddress, &RomSize);
       }
       if (EFI_ERROR(BootStatus) && BootStatus != EFI_ALREADY_STARTED) {
-        if (BootStatus == EFI_NOT_FOUND) {
-          Print(L"Mac OS ROM file not found, installing demo ROM\n");
-        } else {
-          Print(L"System ROM install failed (%r), installing demo ROM\n", BootStatus);
-        }
-        BootStatus = PpcInstallDemoRom(&RomAddress, &RomSize);
+        Print(L"System ROM install failed (%r)\n", BootStatus);
       }
     }
     Print(L"System ROM: %s (guest 0x%x, %d bytes)\n",
@@ -781,7 +776,7 @@ efi_main (
           g_PpcContext.Pc = PPC_RESET_VECTOR;
           Print(L"\n--- Executing system ROM from reset vector ---\n");
         }
-        RunStatus = PpcRunGuest(PPC_GUEST_STEP_BUDGET, TRUE, &Executed);
+        RunStatus = PpcRunGuest(0, TRUE, &Executed);
         Print(L"Guest execution stopped after %d instructions at PC=0x%08x: %r\n",
               Executed, g_PpcContext.Pc, RunStatus);
       }

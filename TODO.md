@@ -296,6 +296,28 @@ be backed in guest memory with emulated behavior.
 
 ### Phase E: Boot Sequence Integration
 
+#### E.0 DR-emulator service-call convention (M4 — current blocker)
+The New World ROM's 68K boot code invokes emulator services by branching
+into a mirror region at `0x305xxxxx` (e.g. `bvc.l` with displacement
+`0xEFD000xx` from ROM code at `0x4080ABxx` lands at `0x3050ABEx`). On real
+hardware that address range holds the DR emulator's dispatch tables and
+service stubs; we have no mapping there.
+
+- [x] Detect service calls: `M68kIsDrEmulatorAddress()` — ranges
+  `[0x30000000,0x40000000)` and `[0x40B60000,0x40C00000)`.
+- [x] Immediate-return semantics for `Bcc.L` into the mirror region
+  (`M68kExecuteBranch`): resume at the instruction after the branch.
+  (Earlier redirect-to-A6 approach ping-ponged forever between glue blocks.)
+- [ ] Identify each call site's expected service and result: register
+  arguments (D1 held 0x68 in early samples), expected D0 return values,
+  stack effects. Catalog call sites from trace68k.log + PC ring dumps.
+- [ ] Implement minimal service stubs so init loops that poll for results
+  terminate (memory manager sizing, hardware probe results).
+- [ ] Handle computed dispatches through the mirror region: the glue at
+  `0x408A8D7C-90` builds a handler pointer (`move.l a6,d0; lea base,A1;
+  movea.l 0(a0),a2; jmp (a2)`) — if the table it reads is uninitialized,
+  seed or intercept so `jmp (a2)` lands somewhere valid.
+
 #### E.1 Continuous 68K execution loop
 - [ ] Replace the per-instruction PPC hook with a dedicated 68K execution
   mode: when the NK hands off to the DR emulator, enter `M68kExecuteBlock()`

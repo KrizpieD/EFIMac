@@ -261,7 +261,7 @@ PPC_CPU_CONTEXT g_PpcContext = {0};
 // a 50 MHz timebase (XLM BUS_CLOCK); the interpreter runs ~1M instr/s, so 50
 // ticks per instruction approximates the real rate while keeping DEC and the
 // timebase mutually consistent.
-#define PPC_TIMEBASE_SCALE  50
+#define PPC_TIMEBASE_SCALE  4
 
 // ---------------------------------------------------------------------------
 // Memory access (default: identity-mapped, big-endian guest memory)
@@ -541,7 +541,41 @@ PpcCopyGuestMemory (
 static UINT32 CpuRead16 (UINT32 A) { return ((UINT32)g_ReadByte(A) << 8) | g_ReadByte(A + 1); }
 static UINT32 CpuRead32 (UINT32 A) { return (CpuRead16(A) << 16) | CpuRead16(A + 2); }
 static VOID   CpuWrite16(UINT32 A, UINT32 V) { g_WriteByte(A, (UINT8)(V >> 8)); g_WriteByte(A + 1, (UINT8)V); }
-static VOID   CpuWrite32(UINT32 A, UINT32 V) { CpuWrite16(A, V >> 16); CpuWrite16(A + 2, V); }
+static VOID   CpuWrite32(UINT32 A, UINT32 V)
+{
+    // NanoKernel guard-fill (poison) stores: the emulated handoff marks the
+    // low pages holding the live 68K vector table, KDP, emulator-data area,
+    // PSA and 68K stack as free pool, so the guest allocator scrubs them
+    // with fill patterns mid-execution. Dropping exactly these two pattern
+    // words below 64K preserves the guest's own data; freed-block bodies
+    // keep stale bytes, which the allocator treats as scratch anyway.
+    if ((V == 0x68F168F1u || V == 0xD1E2D1E2u) && A < 0x10000u) {
+        STATIC UINTN PpcSprayHits = 0;
+        if (PpcSprayHits < 400) {
+            PpcSprayHits++;
+            Print(L"PPC SPRAYWATCH val=0x%08x -> 0x%08x @PC=0x%08x r10=0x%08x r15=0x%08x\n",
+                  V, A, g_PpcContext.Pc,
+                  g_PpcContext.Gpr[10], g_PpcContext.Gpr[15]);
+        }
+        return;
+    }
+    // Watch writes into the KDP PMDT pointer array (KDP+0x78..KDP+0xFF8).
+    // Legitimate writers: the one-shot PMDTINJECT probe and early init that
+    // seeds slot pointers. Anything else scribbling here corrupts chunk
+    // tables mid-walk, so log writer PC + value + old contents.
+    if (A >= 0xA078u && A < 0xB000u) {
+        STATIC UINTN KdpWriteHits = 0;
+        if (KdpWriteHits < 40 && g_PpcContext.Pc != 0x40B1F418u &&
+            g_PpcContext.Pc != 0x40B1F41Cu && g_PpcContext.Pc != 0x40B1F420u) {
+            KdpWriteHits++;
+            Print(L"  KDPWATCH [%08x] <- %08x (old %08x) @PC=0x%08x r1=%08x r27=%08x\n",
+                  A, V, CpuRead32(A),
+                  g_PpcContext.Pc, g_PpcContext.Gpr[1], g_PpcContext.Gpr[27]);
+        }
+    }
+    CpuWrite16(A, V >> 16);
+    CpuWrite16(A + 2, V);
+}
 
 // Byte-reversed access (for lwbrx/stwbrx etc.)
 static UINT32 CpuRead32Rev (UINT32 A)
@@ -566,6 +600,9 @@ static VOID CpuWrite16Rev (UINT32 A, UINT32 V)
 // ---------------------------------------------------------------------------
 // Condition Register / XER helpers
 // ---------------------------------------------------------------------------
+static UINT32 EeMtmsrProbed = 0;
+static UINT32 EeRfiProbed = 0;
+
 VOID
 PpcSetCrField (
     IN UINT32 Field,
@@ -2987,6 +3024,12 @@ PpcExecuteInstruction (
             }
             g_PpcContext.Msr = g_PpcContext.Srr1;
             Next = g_PpcContext.Srr0;
+            if ((g_PpcContext.Msr & PPC_MSR_EE) && EeRfiProbed < 6) {
+                EeRfiProbed++;
+                Print(L"  EE-RFI @0x%08x -> PC=0x%08x MSR=0x%08x DEC=0x%08x NEG=%u\n",
+                      CurrentAddress, Next, g_PpcContext.Msr,
+                      g_PpcContext.Spr[22], g_PpcContext.DecrementerNegative);
+            }
             if ((g_PpcContext.Msr & PPC_MSR_EE) && g_PpcContext.DecrementerNegative &&
                 g_PpcContext.DecrementerWritten &&
                 g_PpcContext.ExceptionPending == 0) {
@@ -3000,6 +3043,28 @@ PpcExecuteInstruction (
         case XO19_BCCTR:  // bctr / bctrl / bcctr / bcctrl
             {
                 UINT32 Target = g_PpcContext.Ctr;
+                if (PpcBranchTaken(BO(w), BI(w)) && Target < 0x10000u) {
+                    // 68K emulator dispatch tables live at ED-relative offsets
+                    // (r31 = EmulatorData). A near-zero CTR here means the
+                    // opcode's handler slot was never initialized.
+                    STATIC UINTN BcctrZeroHits = 0;
+                    UINT32 Ed = g_PpcContext.Gpr[31];
+                    if (BcctrZeroHits < 4) {
+                        BcctrZeroHits++;
+                        Print(L"  BCCTRWILD PC=0x%08x CTR=0x%08x r24(68Kpc)=0x%08x "
+                              L"r3=%08x r4=%08x r25=%08x r27=%08x r28=%08x r29=%08x r31=%08x\n",
+                              CurrentAddress, Target, g_PpcContext.Gpr[24],
+                              g_PpcContext.Gpr[3], g_PpcContext.Gpr[4],
+                              g_PpcContext.Gpr[25], g_PpcContext.Gpr[27],
+                              g_PpcContext.Gpr[28], g_PpcContext.Gpr[29], Ed);
+                        Print(L"  BCCTRWILD [ED+808]=%08x [80C]=%08x [810]=%08x [814]=%08x "
+                              L"[818]=%08x [81C]=%08x w@68Kpc=%04x\n",
+                              CpuRead32(Ed + 0x808), CpuRead32(Ed + 0x80C),
+                              CpuRead32(Ed + 0x810), CpuRead32(Ed + 0x814),
+                              CpuRead32(Ed + 0x818), CpuRead32(Ed + 0x81C),
+                              (CpuRead16(g_PpcContext.Gpr[24]) << 0));
+                    }
+                }
                 if (LK(w)) {
                     g_PpcContext.Lr = CurrentAddress + 4;
                 }
@@ -3498,6 +3563,13 @@ PpcExecuteInstruction (
                 break;
 
             case XO_MTMSR:  // mtmsr
+                if ((g_PpcContext.Gpr[RS(w)] & PPC_MSR_EE) &&
+                    !(g_PpcContext.Msr & PPC_MSR_EE) && EeMtmsrProbed < 6) {
+                    EeMtmsrProbed++;
+                    Print(L"  EE-ON mtmsr @0x%08x r%d=0x%08x (old MSR=0x%08x)\n",
+                          CurrentAddress, RS(w), g_PpcContext.Gpr[RS(w)],
+                          g_PpcContext.Msr);
+                }
                 g_PpcContext.Msr = g_PpcContext.Gpr[RS(w)];
                 if ((g_PpcContext.Msr & PPC_MSR_EE) && g_PpcContext.DecrementerNegative &&
                     g_PpcContext.DecrementerWritten &&
@@ -3839,7 +3911,7 @@ PpcExecuteInstruction (
                     case SPR_CTR:  Value = g_PpcContext.Ctr; break;
                     case SPR_SRR0: Value = g_PpcContext.Srr0; break;
                     case SPR_SRR1: Value = g_PpcContext.Srr1; break;
-                    case SPR_PVR:  Value = 0x00010000; break;   // fabricated PVR
+                    case SPR_PVR:  Value = 0x00390000; break;   // PowerPC 7455 (G4)
                     case SPR_TBL:  Value = g_PpcContext.TimeBaseL; break;
                     case SPR_TBU:  Value = g_PpcContext.TimeBaseH; break;
                     default:       Value = g_PpcContext.Spr[SprNum]; break;
@@ -3855,8 +3927,13 @@ PpcExecuteInstruction (
             case XO_TLBIA:  // tlbia (no-op)
                 break;
 
-            case XO_MFTB:  // mftb
-                g_PpcContext.Gpr[RT(w)] = g_PpcContext.TimeBaseL;
+            case XO_MFTB:  // mftb / mftbu (TBR field: 268=TBL, 269=TBU)
+                {
+                    UINT32 Tbr = RA(w) | (RB(w) << 5);
+                    g_PpcContext.Gpr[RT(w)] = (Tbr == SPR_TBU)
+                        ? g_PpcContext.TimeBaseH
+                        : g_PpcContext.TimeBaseL;
+                }
                 break;
 
             case XO_LHAUX:  // lhaux
@@ -4143,6 +4220,7 @@ PpcRunGuest (
 {
     UINTN Executed = 0;
     UINTN TailStart = 0;
+UINTN TbProbe = 0;
     UINTN TailCount = 0;
     static UINT32 TailPc[4096];
     static UINT32 TailInst[4096];
@@ -4168,6 +4246,11 @@ PpcRunGuest (
     static UINT32 SccPollTraced = 0;
     static UINT32 HelperStep = 0;
     static UINT32 TermEntries = 0;
+    static UINT32 DbgJumpDumps = 0;
+    static UINT32 AreaNewLogs = 0;
+    static UINT32 AreaLookupLogs = 0;
+    static UINT32 WalkTabDumps = 0;
+    static UINT32 EmitLogs = 0;
     static UINT32 AutoResumed = 0;
     static UINT32 PmdWalked = 0;
     static UINT32 PmdEntry = 0;
@@ -4187,6 +4270,17 @@ PpcRunGuest (
     static UINT32 EmulWindowProbed = 0;
     static UINT32 InjectedEntryProbed = 0;
     static UINT32 WalkProbed = 0;
+    static UINT32 EeRetProbed = 0;
+    static UINT32 PutsProbed = 0;
+    static CHAR16 PutsBuf[512];
+    static UINT32 HandoffChainProbed = 0;
+    static UINT32 IrqRetProbed = 0;
+    static UINT32 DecArgProbed = 0;
+    static UINT32 SchedEntryProbed = 0;
+    static UINT32 TqProbe = 0;
+    static UINT32 TmProbe = 0;
+    static UINT32 CbProbe = 0;
+    static UINT32 FreqProbe = 0;
 
     if (ExecutedCount == NULL) {
         return EFI_INVALID_PARAMETER;
@@ -4194,7 +4288,8 @@ PpcRunGuest (
 
     g_PpcContext.ExceptionPending = 0;
 
-    while (Executed < MaxInstructions) {
+    // MaxInstructions == 0 means run indefinitely until error or halt.
+    while (MaxInstructions == 0 || Executed < MaxInstructions) {
         UINT32 Instr;
         UINT32 Current;
         UINT32 Next;
@@ -4216,6 +4311,29 @@ PpcRunGuest (
         // intercept and execute the 68K instruction natively via the C
         // interpreter, completely replacing the PPC-based opcode table.
         if (Current == 0x40B67C60) {
+            // On real hardware the PPC nanokernel preempts emulated 68K
+            // code asynchronously (decrementer tick). Without this, any 68K
+            // "wait for interrupt" park loop spins forever because the C
+            // interpreter never checks the PPC interrupt state mid-batch.
+            // Flag it here and let the normal end-of-iteration tick logic /
+            // loop-top delivery run, with SRR0 = Next = the dispatch entry
+            // we will resume from.
+            if (g_PpcContext.DecrementerWritten &&
+                g_PpcContext.DecrementerNegative &&
+                (g_PpcContext.Msr & PPC_MSR_EE) &&
+                g_PpcContext.ExceptionPending == 0) {
+                g_PpcContext.ExceptionPending = PPC_EXCEPTION_DECREMENTER;
+                // Wake a 68K STOP #imm park: the interrupt will be serviced
+                // at the PPC level, then the 68K batch resumes afterwards.
+                g_M68kContext.Stopped = FALSE;
+                {
+                    static UINTN WakeCount = 0;
+                    WakeCount++;
+                    if ((WakeCount & 1023) == 1) {
+                        Print(L"  68K WAKE [#%d] DEC pending\n", (UINT32)WakeCount);
+                    }
+                }
+            }
             Status = M68kExecuteFromPPC ();
             g_PpcContext.Gpr[27] = 0;
             g_PpcContext.Gpr[29] = 0x40B80000;
@@ -4306,6 +4424,9 @@ PpcRunGuest (
             Status = PpcExecuteInstruction(Instr, Current, &Next);
         }
         Executed++;
+        if ((Executed & 0xFFFF) == 0) {
+            Print(L"  HBPPC[%d] PC=0x%08x H=%u\n", (UINT32)Executed, Current, Hooked);
+        }
         if (Current == 0x40B126CC || Current == 0x40B107FC || Current == 0x40B10098) {
             Print(L"  PROBE@0x%08x r1=0x%08x r3=0x%08x [r1+648]=0x%08x [0x648]=0x%08x [0xA648]=0x%08x [0xAFE4]=0x%04x [r1+5A0]=0x%08x [r1+5A4]=0x%08x [r1-964]=0x%08x [r1-20]=0x%08x\n",
                   Current, g_PpcContext.Gpr[1], g_PpcContext.Gpr[3],
@@ -4512,8 +4633,8 @@ PpcRunGuest (
             CpuWrite32(PPC_XLM_RUN_MODE_OFFSET,    0x00000000);  // MODE_68K
             CpuWrite32(PPC_XLM_68K_R25_OFFSET,     0x00000000);
             CpuWrite32(PPC_XLM_IRQ_NEST_OFFSET,    0x00000000);
-            CpuWrite32(PPC_XLM_PVR_OFFSET,         0x00000000);
-            CpuWrite32(PPC_XLM_BUS_CLOCK_OFFSET,   50000000);
+            CpuWrite32(PPC_XLM_PVR_OFFSET,         0x00390000);  // PowerPC 7455 (G4)
+            CpuWrite32(PPC_XLM_BUS_CLOCK_OFFSET,   100000000);  // 100 MHz bus clock
             Print(L"  EMUTRAP XLM restored: [2800]=0x%08x [2804]=0x%08x "
                   L"[2818]=0x%08x\n",
                   CpuRead32(PPC_XLM_SIGNATURE_OFFSET),
@@ -4530,11 +4651,14 @@ PpcRunGuest (
             CpuWrite32(0x0000B074, 0x40B80000);  // ed.v[0x74] opcode table
             CpuWrite32(0x0000B078, 0x40B60000);  // ed.v[0x78] emulator base
             CpuWrite32(0x0000B814, 0x40B6F7C0);  // ed.v[0x814] dispatch helper
+            CpuWrite32(0x0000B818, 0x40B6F7D0);  // ed.v[0x818] class helper
             CpuWrite32(0x0000B2CC, 0x00000007);  // ECB+0x1CC interrupt pending
             Print(L"  EMUTRAP DR context seeded: [A634]=0x%08x [A65C]=0x%08x "
-                  L"[B074]=0x%08x [B078]=0x%08x [B814]=0x%08x [B2CC]=0x%08x\n",
+                  L"[B074]=0x%08x [B078]=0x%08x [B814]=0x%08x [B818]=0x%08x "
+                  L"[B2CC]=0x%08x\n",
                   CpuRead32(0xA634), CpuRead32(0xA65C), CpuRead32(0xB074),
-                  CpuRead32(0xB078), CpuRead32(0xB814), CpuRead32(0xB2CC));
+                  CpuRead32(0xB078), CpuRead32(0xB814), CpuRead32(0xB818),
+                  CpuRead32(0xB2CC));
         }
         if (StoreProbed == 0 && (Current == 0x40B11B64 || Current == 0x40B11B48)) {
             UINT32 P = g_PpcContext.Gpr[1];
@@ -4633,9 +4757,13 @@ PpcRunGuest (
             // chunk 0 table: r25 was already loaded from [r1+0x78] (original
             // pointer array); rewrite it explicitly for self-consistency.
             CpuWrite32(R1 + 0x78, Base);
-            // chunks 1..15: point at the terminator-only entry (no areas).
+            // chunks 1..15: point at the dedicated empty-chunk terminator
+            // entry written below. NOTE: never store past Base+31 here --
+            // the pointer array lives at KDP+0x80 (Base+0x7E onwards), so
+            // filling "entries 3..63" used to overwrite the array itself,
+            // turning slot k=1 into 0x04000000 and derailing the walk.
             for (K = 1; K < 16; K++) {
-                CpuWrite32(R1 + 0x80 + 8 * K, Base + 16);
+                CpuWrite32(R1 + 0x80 + 8 * K, Base + 24);
             }
             // entry 0 [0xFFF7,9] already holds the top-of-block-0 reservation.
             // entry 1: RAM [0, 0xFFF7000).
@@ -4646,13 +4774,10 @@ PpcRunGuest (
             CpuWrite16(Base + 16, 0x0000);
             CpuWrite16(Base + 18, 0xFFFF);
             CpuWrite32(Base + 20, 0x00000400);
-            // entries 3..63: unreachable (chunk advances at entry 2), but keep
-            // them as terminators so a stray entry can never walk an area.
-            for (K = 24; K < 64 * 8; K += 8) {
-                CpuWrite16(Base + K, 0x0000);
-                CpuWrite16(Base + K + 2, 0xFFFF);
-                CpuWrite32(Base + K + 4, 0x00000400);
-            }
+            // entry 3 (Base+24): shared terminator for the empty chunks 1..15.
+            CpuWrite16(Base + 24, 0x0000);
+            CpuWrite16(Base + 26, 0xFFFF);
+            CpuWrite32(Base + 28, 0x00000400);
             Print(L"  PMDTINJECT base=0x%08x chunk0=[0xFFF7,9]+[0,0xFFF6]+TERM chunks1..15=TERM\n",
                   Base);
         }
@@ -4777,13 +4902,122 @@ PpcRunGuest (
                   CpuRead32(0xB818), CpuRead32(0xB074), CpuRead32(0xB078), CpuRead32(0xB814),
                   CpuRead32(0xB2CC));
         }
+        if (PutsProbed < 4000 && Current == 0x40B26444) {
+            UINT8 Ch = (UINT8)(g_PpcContext.Gpr[29] & 0xFF);
+            if (PutsProbed < sizeof(PutsBuf) - 1) {
+                PutsBuf[PutsProbed % sizeof(PutsBuf)] =
+                    (Ch >= 0x20 && Ch < 0x7F) ? (CHAR16)Ch : L'.';
+            }
+            PutsProbed++;
+            if ((PutsProbed & 127) == 0) {
+                UINTN B;
+                UINTN Start = (PutsProbed >= 128) ? PutsProbed - 128 : 0;
+                Print(L"  PUTS[%d]: ", PutsProbed);
+                for (B = Start; B < PutsProbed; B++) {
+                    Print(L"%c", PutsBuf[B % sizeof(PutsBuf)]);
+                }
+                Print(L"\n");
+            }
+        }
+        if (HandoffChainProbed < 12 && (Current == 0x40B126F0 || Current == 0x40B6E8C0 ||
+                                        Current == 0x40B6F900 || Current == 0x40B6F700)) {
+            HandoffChainProbed++;
+            Print(L"  HCHAIN[%d] PC=0x%08x r3=0x%08x r4=0x%08x r10=0x%08x LR=0x%08x CTR=0x%08x MSR=0x%08x\n",
+                  HandoffChainProbed, Current, g_PpcContext.Gpr[3], g_PpcContext.Gpr[4],
+                  g_PpcContext.Gpr[10], g_PpcContext.Lr, g_PpcContext.Ctr,
+                  g_PpcContext.Msr);
+        }
+        if (IrqRetProbed < 20 &&
+            (Current == 0x40B13B50 || Current == 0x40B13BA0 || Current == 0x40B13BA4)) {
+            IrqRetProbed++;
+            Print(L"  IRQRET[%d] PC=0x%08x exec=%d CR=0x%08x r8=0x%08x r9=0x%08x LR=0x%08x\n",
+                  IrqRetProbed, Current, Executed, g_PpcContext.Cr,
+                  g_PpcContext.Gpr[8], g_PpcContext.Gpr[9], g_PpcContext.Lr);
+        }
+        if (DecArgProbed < 8 && Current == 0x40B230E4) {
+            DecArgProbed++;
+            Print(L"  DECARG[%d] exec=%d arg=0x%08x_%08x now=0x%08x_%08x TB=0x%08x_%08x LR=0x%08x\n",
+                  DecArgProbed, Executed, g_PpcContext.Gpr[8], g_PpcContext.Gpr[9],
+                  g_PpcContext.Gpr[16], g_PpcContext.Gpr[17],
+                  g_PpcContext.TimeBaseH, g_PpcContext.TimeBaseL,
+                  g_PpcContext.Lr);
+        }
+        if (SchedEntryProbed < 10 && Executed > 1000 &&
+            (Current == 0x40B242A8 || Current == 0x40B12CB0)) {
+            UINT32 Kdp = g_PpcContext.Spr[272];
+            SchedEntryProbed++;
+            Print(L"  SCH2[%d] PC=0x%08x exec=%d r7=0x%08x KDP-0x10=0x%08x curTask=0x%08x\n",
+                  SchedEntryProbed, Current, Executed, g_PpcContext.Gpr[7],
+                  CpuRead32(Kdp - 0x10),
+                  CpuRead32(Kdp - 0x14));
+        }
+        if (TqProbe < 12 && Executed > 100000 &&
+            (Current == 0x40B24A98 || Current == 0x40B1322C || Current == 0x40B13254 ||
+             Current == 0x40B1327C || Current == 0x40B132A0)) {
+            TqProbe++;
+            Print(L"  TQ[%d] PC=0x%08x exec=%d r3=0x%08x LR=0x%08x\n",
+                  TqProbe, Current, Executed, g_PpcContext.Gpr[3], g_PpcContext.Lr);
+        }
+        if (TmProbe < 14 && Executed > 114000 && Current == 0x40B22F60) {
+            UINT32 Head = g_PpcContext.Gpr[30];
+            TmProbe++;
+            Print(L"  TM[%d] exec=%d now=%08x:%08x dl=%08x:%08x head=0x%08x t14=%02x t16=%02x t17=%02x\n",
+                  TmProbe, Executed, g_PpcContext.Gpr[8], g_PpcContext.Gpr[9],
+                  g_PpcContext.Gpr[16], g_PpcContext.Gpr[17], Head,
+                  g_ReadByte(Head + 0x14), g_ReadByte(Head + 0x16),
+                  g_ReadByte(Head + 0x17));
+        }
+        if (CbProbe < 6 && Executed > 114000 && Current == 0x40B22FC8) {
+            UINT32 Head = g_PpcContext.Gpr[30];
+            CbProbe++;
+            Print(L"  CB[%d] exec=%d head=0x%08x cbLR=0x%08x dl=%08x:%08x\n",
+                  CbProbe, Executed, Head, g_PpcContext.Lr,
+                  CpuRead32(Head + 0x38), CpuRead32(Head + 0x3c));
+        }
+        if (FreqProbe < 6 && Executed > 1000 &&
+            (Current == 0x40B25DDC || Current == 0x40B26FEC || Current == 0x40B1C1D4)) {
+            FreqProbe++;
+            Print(L"  FREQ[%d] PC=0x%08x exec=%d r22=0x%08x r23=0x%08x r24=0x%08x r26=0x%08x\n",
+                  FreqProbe, Current, Executed, g_PpcContext.Gpr[22],
+                  g_PpcContext.Gpr[23], g_PpcContext.Gpr[24],
+                  g_PpcContext.Gpr[26]);
+        }
+        if (Current == 0x40B235DC && CpuRead32(0xAF2C) == 0) {
+            // Serial-poll timer period [KDP+0xF2C]: nothing in the ROM ever
+            // initializes it and RAM starts zeroed, so the poll deadline
+            // never advances and the timer service livelocks. Seed a sane
+            // interval (800K TB ticks -> 400K per rearm). KDP is fixed at
+            // 0xA000. Idempotent: re-seeds if something zeroes it again.
+            CpuWrite32(0xAF2C, 0x000C3500);
+            Print(L"  seeded KDP+0xF2C=0xC3500 (serial poll interval)\n");
+        }
+        if (EeRetProbed < 4 && (Current == 0x40B13BE0 || Current == 0x40B13BF8)) {
+            EeRetProbed++;
+            Print(L"  EE-RET path @0x%08x r11=0x%08x SRR0=0x%08x SRR1=0x%08x MSR=0x%08x\n",
+                  Current, g_PpcContext.Gpr[11], g_PpcContext.Srr0,
+                  g_PpcContext.Srr1, g_PpcContext.Msr);
+        }
+        if (TbProbe < 3 && Current == 0x40B23768) {
+            TbProbe++;
+            Print(L"  TBPROBE[%d] @cmpw r8=0x%08x r9=0x%08x r16=0x%08x CR=0x%08x CR0=%x TBH=0x%08x\n",
+                  TbProbe, g_PpcContext.Gpr[8], g_PpcContext.Gpr[9],
+                  g_PpcContext.Gpr[16], g_PpcContext.Cr,
+                  (g_PpcContext.Cr >> 28) & 0xF, g_PpcContext.TimeBaseH);
+        }
         if ((Executed % 250000) == 0) {
+            UINTN T, Idx;
             Print(L"  PROGRESS[%d] PC=0x%08x LR=0x%08x r1=0x%08x r8=0x%08x r28=0x%08x SPRG4=0x%08x "
                   L"MSR=0x%08x DEC=0x%08x TBL=0x%08x NEG=%u\n",
                   Executed, Current, g_PpcContext.Lr, g_PpcContext.Gpr[1],
                   g_PpcContext.Gpr[8], g_PpcContext.Gpr[28], g_PpcContext.Spr[272],
                   g_PpcContext.Msr, g_PpcContext.Spr[22], g_PpcContext.TimeBaseL,
                   g_PpcContext.DecrementerNegative);
+            Print(L"  TRAIL:");
+            for (T = 0; T < 24 && T < TailCount; T++) {
+                Idx = (TailStart + 4096 - 1 - T) % 4096;
+                Print(L" %08x:%08x", TailPc[Idx], TailInst[Idx]);
+            }
+            Print(L"\n");
         }
         if (SchedProbes < 4 && Current == 0x40B22F18) {
             UINT32 K = g_PpcContext.Gpr[1];
@@ -4952,6 +5186,77 @@ PpcRunGuest (
                   g_PpcContext.Gpr[1], g_PpcContext.Gpr[8], g_PpcContext.Gpr[9],
                   g_PpcContext.Gpr[31], Kdp, Ewa);
         }
+        // Debugger-jump trampoline (0x40B1F380: b 0x40B272E0). Both allocator
+        // failure checks converge here with live descriptors:
+        //   site A 0x40B1F618 bltl after subf. r16,[r24+24]-[r31+24]
+        //   site B 0x40B1F67C blel after saved-[r24+28]
+        // Dump both descriptor structs so we can see which field trips.
+        if (DbgJumpDumps < 12 && Current == 0x40B1F380u) {
+            UINT32 R24 = g_PpcContext.Gpr[24];
+            UINT32 R31 = g_PpcContext.Gpr[31];
+            DbgJumpDumps++;
+            Print(L"  DBGJUMP[%d] LR=0x%08x r15=%08x r16=%08x r17=%08x r8=%08x\n",
+                  DbgJumpDumps, g_PpcContext.Lr,
+                  g_PpcContext.Gpr[15], g_PpcContext.Gpr[16],
+                  g_PpcContext.Gpr[17], g_PpcContext.Gpr[8]);
+            Print(L"    r24=0x%08x:", R24);
+            {
+                UINTN I;
+                for (I = 0; I < 16; I++) {
+                    Print(L" %08x", CpuRead32(R24 + (UINT32)(I * 4)));
+                }
+            }
+            Print(L"\n    r31=0x%08x:", R31);
+            {
+                UINTN I;
+                for (I = 0; I < 16; I++) {
+                    Print(L" %08x", CpuRead32(R31 + (UINT32)(I * 4)));
+                }
+            }
+            Print(L"\n");
+        }
+        // Physical-map walker diagnostics:
+        //  AREANEW: a fresh AREA gets its start stored (0x40B1F598).
+        //  AREALOOK: overlap lookup result vs the new area (0x40B1F5FC).
+        if (AreaNewLogs < 24 && Current == 0x40B1F598u) {
+            AreaNewLogs++;
+            Print(L"  AREANEW[%d] area=0x%08x start=%08x size=%08x LR=0x%08x r26=%08x\n",
+                  AreaNewLogs, g_PpcContext.Gpr[31], g_PpcContext.Gpr[15],
+                  g_PpcContext.Gpr[16], g_PpcContext.Lr, g_PpcContext.Gpr[26]);
+        }
+        if (AreaLookupLogs < 24 && Current == 0x40B1F5FCu) {
+            UINT32 A31 = g_PpcContext.Gpr[31];
+            UINT32 A24 = g_PpcContext.Gpr[24];
+            AreaLookupLogs++;
+            Print(L"  AREALOOK[%d] new=0x%08x [%new+24]=%08x found=0x%08x [%fnd+24]=%08x [%fnd+28]=%08x\n",
+                  AreaLookupLogs, A31, CpuRead32(A31 + 0x24),
+                  A24, CpuRead32(A24 + 0x24), CpuRead32(A24 + 0x28));
+        }
+        // Dump the raw stack range-table the walker consumes (r27 = r1+0x78,
+        // entries are 8 bytes starting at r27+8).
+        if (WalkTabDumps < 3 && Current == 0x40B1F40Cu) {
+            UINTN I;
+            WalkTabDumps++;
+            Print(L"  WALKTAB[%d] r26=%08x r27=%08x table:\n",
+                  WalkTabDumps, g_PpcContext.Gpr[26], g_PpcContext.Gpr[27]);
+            for (I = 0; I < 56; I++) {
+                UINT32 Slot = g_PpcContext.Gpr[27] + 8 + (UINT32)(I * 8);
+                Print(L"    +%03x: %04x %04x %08x\n",
+                      (UINTN)(I * 8),
+                      (CpuRead32(Slot) >> 16) & 0xFFFF,
+                      CpuRead32(Slot) & 0xFFFF,
+                      CpuRead32(Slot + 4));
+                if ((I & 7) == 7) {
+                    // keep lines grouped
+                }
+            }
+        }
+        // Caller emit loop: r21 = phys cursor, r22 = pages remaining.
+        if (EmitLogs < 40 && Current == 0x40B12400u) {
+            EmitLogs++;
+            Print(L"  EMIT[%d] addr=%08x rem=%08x\n",
+                  EmitLogs, g_PpcContext.Gpr[21], g_PpcContext.Gpr[22]);
+        }
         // Auto-answer the nanodebugger wait loop: when the guest is spinning
         // (PC=0x40B2751C) with an empty SCC Rx FIFO, queue the same
         // 'g' CR 'g' CR sequence the host pre-queues for the first entry so the
@@ -5075,6 +5380,20 @@ PpcRunGuest (
 
         if (g_PpcContext.ExceptionPending != 0) {
             UINT32 Pending = g_PpcContext.ExceptionPending;
+            if (Pending == PPC_EXCEPTION_DECREMENTER && g_M68kContext.Stopped) {
+                // A real DEC tick just got delivered: this is the NK
+                // scheduler heartbeat. Wake a parked 68K context so its
+                // park loop gets the interrupt it is waiting for.
+                g_M68kContext.Stopped = FALSE;
+                {
+                    static UINTN WakeCount = 0;
+                    WakeCount++;
+                    if ((WakeCount & 1023) == 1) {
+                        Print(L"  68K WAKE [#%d] DEC delivered @PC=0x%08x\n",
+                              (UINT32)WakeCount, Current);
+                    }
+                }
+            }
             if (Pending == PPC_EXCEPTION_TRAP && TrapProbed == 0) {
                 TrapProbed = 1;
                 Print(L"  TRAPDIS@PC=0x%08x Next=0x%08x r1=0x%08x r3=0x%08x r31=0x%08x "
@@ -5089,8 +5408,22 @@ PpcRunGuest (
                       g_PpcContext.Spr[276],
                       CpuRead32(0x700), CpuRead32(0x708), CpuRead32(0x7F0));
             }
-            g_PpcContext.ExceptionPending = 0;
-            Status = PpcHandleException(Pending, Current);
+    // Clear stale pending from any previous batch. Async DEC exceptions
+    // raised at loop bottom are intentionally consumed here rather than
+    // delivered: once the NK arms DEC early-boot, bottom-raised pendings
+    // would otherwise storm the vector handler every iteration and wedge
+    // boot inside the early scheduler. The 68K STOP-wake is handled at
+    // actual delivery time (see PPC_EXCEPTION_DECREMENTER case below).
+    g_PpcContext.ExceptionPending = 0;
+            // Asynchronous exceptions (decrementer) are taken at an
+            // instruction boundary: SRR0 must be the next instruction to
+            // execute, not the just-executed one. Re-executing the rfi/mtmsr
+            // that enabled EE would re-trigger the interrupt forever and the
+            // interrupted boot-tail handoff would never resume.
+            Status = PpcHandleException(Pending,
+                                        Pending == PPC_EXCEPTION_DECREMENTER
+                                            ? Next
+                                            : Current);
             if (EFI_ERROR(Status)) {
                 *ExecutedCount = Executed;
                 return Status;
@@ -5101,11 +5434,12 @@ PpcRunGuest (
         // Advance the guest timebase (TBL/TBU) and decrementer (DEC) "tick"
         // by PPC_TIMEBASE_SCALE per instruction, and request the decrementer
         // interrupt when DEC is negative with interrupts enabled (NanoKernel
-        // scheduler tick). The scale approximates the NK's assumed timebase
-        // rate (XLM BUS_CLOCK = 50 MHz) for the interpreter's instruction
-        // throughput, and keeps DEC and the timebase consistent with each
-        // other. The interrupt is only raised once the NK has armed DEC via
-        // mtspr: an unarmed (reset) DEC must not fire a spurious tick.
+        // scheduler tick). The scale approximates a real 603e's timebase rate
+        // relative to instruction throughput (~16 MHz TB vs ~50-100 MIPS);
+        // larger scales make short timer intervals expire before their
+        // servicing code can run, which livelocks the NK scheduler. The
+        // interrupt is only raised once the NK has armed DEC via mtspr: an
+        // unarmed (reset) DEC must not fire a spurious tick.
         g_PpcContext.TimeBaseL += PPC_TIMEBASE_SCALE;
         if (g_PpcContext.TimeBaseL < PPC_TIMEBASE_SCALE) {
             g_PpcContext.TimeBaseH++;

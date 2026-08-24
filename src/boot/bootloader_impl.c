@@ -1129,13 +1129,15 @@ STATIC VOID
 BootLzssDecode (
     IN const UINT8* Src,
     IN UINTN        Size,
-    OUT UINT8*      Dest
+    OUT UINT8*      Dest,
+    IN UINTN        DestSize
     )
 {
     UINT8* Dict = g_LzssDict;
     INTN  RunMask = 0;
     INTN  Remaining = (INTN)Size;
     UINTN DictIdx = 0xFEE;
+    UINTN Written = 0;
 
     SetMem(Dict, sizeof(g_LzssDict), 0);
     while (Remaining >= 0) {
@@ -1148,7 +1150,7 @@ BootLzssDecode (
             if (--Remaining < 0) break;
             UINT8 C = *Src++;
             Dict[DictIdx & 0xFFF] = C;
-            *Dest++ = C;
+            if (Written < DestSize) { Dest[Written] = C; Written++; }
             DictIdx = (DictIdx + 1) & 0xFFF;
         } else {
             // Copy run from the 4 KB dictionary
@@ -1161,7 +1163,7 @@ BootLzssDecode (
             while (N--) {
                 UINT8 C = Dict[Start & 0xFFF];
                 Dict[DictIdx & 0xFFF] = C;
-                *Dest++ = C;
+                if (Written < DestSize) { Dest[Written] = C; Written++; }
                 Start = (Start + 1) & 0xFFF;
                 DictIdx = (DictIdx + 1) & 0xFFF;
             }
@@ -1176,7 +1178,8 @@ STATIC EFI_STATUS
 BootDecodeParcels (
     IN const UINT8* Parcels,
     IN UINTN        ParcelsSize,
-    OUT UINT8*      Dest
+    OUT UINT8*      Dest,
+    IN UINTN        DestSize
     )
 {
     UINT32 Offset = 0x14;
@@ -1210,7 +1213,8 @@ BootDecodeParcels (
                 return EFI_LOAD_ERROR;
             }
             LzssSize = Next - (UINT32)(ParcelBase + LzssOffset);
-            BootLzssDecode(Parcels + ParcelBase + LzssOffset, LzssSize, Dest);
+            BootLzssDecode(Parcels + ParcelBase + LzssOffset, LzssSize, Dest,
+                           DestSize);
             return EFI_SUCCESS;
         }
 
@@ -1279,7 +1283,8 @@ BootDecodeChrpRom (
     Rom = (UINT8*)(UINTN)Base;
     ZeroMem(Rom, (PPC_ROM_MAX_SIZE + 0x10000));
 
-    Status = BootDecodeParcels(Buffer + ParcelsOffset, ParcelsSize, Rom);
+    Status = BootDecodeParcels(Buffer + ParcelsOffset, ParcelsSize, Rom,
+                               (PPC_ROM_MAX_SIZE + 0x10000));
     if (EFI_ERROR(Status)) {
         BS->FreePages(Base, Pages);
         Print(L"Failed to decode New World ROM parcels: %r\n", Status);
@@ -1461,6 +1466,18 @@ PpcInstallSystemRom (
     g_BootContext.RomSize = Size;
     g_BootContext.RomHostBuffer = Buffer;
 
+    // Classic Mac ROM top-of-space alias: a 4 MB image appears at
+    // 0xFFC00000..0xFFFFFFFF on real hardware. New World dispatch tables
+    // hold 0xFFC4xxxx pointers that must resolve here. Same host buffer
+    // => both views stay consistent.
+    if (g_BootContext.RomType == PPC_ROM_TYPE_NEW_WORLD && Size == 0x00400000u) {
+        EFI_STATUS AliasStatus =
+            PpcAddGuestMemoryRegion(Buffer, 0xFFC00000u, (UINT32)Size,
+                                    FALSE);
+        Print(L"ROM alias installed: %d bytes at guest 0xFFC00000 (%r)\n",
+              (UINT64)Size, AliasStatus);
+    }
+
     if (RomAddress != NULL) { *RomAddress = GuestBase; }
     if (RomSize != NULL) { *RomSize = Size; }
 
@@ -1595,6 +1612,31 @@ PpcInstallLowMemory (
 
     Print(L"Low-memory region installed: %d bytes at guest 0x%x\n",
           (UINT64)PPC_LOW_MEM_SIZE, PPC_LOW_MEM_GUEST_BASE);
+
+    // NK private-stack hole: on real hardware main RAM starts at guest
+    // 0x0, so the nanokernel's private stack at ~0x7Exxxx-0x7FFFFF is
+    // ordinary RAM. Our map relocates main RAM to 0x10000000, leaving
+    // that window unmapped -- link/pushes there silently vanish and the
+    // first rts pops zeros. Back it with dedicated pages.
+    {
+        UINTN HolePages = 0x00200000 / EFI_PAGE_SIZE;   /* 2 MB */
+        EFI_PHYSICAL_ADDRESS HoleBase = 0;
+        Status = BS->AllocatePages(AllocateAnyPages, EfiBootServicesData,
+                                   HolePages, &HoleBase);
+        if (!EFI_ERROR(Status)) {
+            ZeroMem((VOID*)(UINTN)HoleBase, 0x00200000);
+            Status = PpcAddGuestMemoryRegion((VOID*)(UINTN)HoleBase,
+                                             0x00600000u,
+                                             0x00200000u,
+                                             FALSE);
+            if (EFI_ERROR(Status)) {
+                BS->FreePages(HoleBase, HolePages);
+                Print(L"NK-stack region map failed: %r\n", Status);
+            } else {
+                Print(L"NK-stack region installed: 2097152 bytes at guest 0x600000\n");
+            }
+        }
+    }
 
     return EFI_SUCCESS;
 }
@@ -1789,29 +1831,29 @@ RomWriteEmulStartRoutine (
 
 // Install the injected 68K DR-emulator entry (SheepShaver's execute_68k
 // contract) at ROM + 0x36f700. It builds the full 68K context -- d0..d7 =
-// r8..r15, a0..a6 = r16..r22, a7 = r1 = 0x2600, r23 = 0, r24 = 68K PC
-// (0x4080002a), r25 = SR MSB (0x27), r26 = 0, r28 = 0 (VBR), r29 = opcode
-// table (0x40b80000), r30 = emulator base (0x40b60000), r31 = KDP + 0x1000,
-// XER = 0, cr1 = 0 (the glue's `bgtctr cr1` must not fire), cr2 = SO -- then
-// performs the first dispatch exactly like SheepShaver's loop: fetch the
-// opcode at [r24] (unsigned), index the opcode table (rlwimi), prefetch the
-// next word with lhau (r24 = PC + 2), and bctr straight into the dispatch
-// entry. The DR loop at 0x40b66080 is NOT used: its double-lhau leaves r24 =
-// PC + 4, which breaks PC-relative handlers (e.g. jmp 0x4efa computes
-// extension-word address + displacement and would land two bytes past).
+// r8..r15, a0..a6 = r16..r22, a7 = r1 = 0x2600, r23 = 0, r24 = 68K PC - 2
+// (0x40800028: the ROM's own loop pre-fetches +2), r25 = SR MSB (0x27),
+// r26 = 0, r28 = 0 (VBR), r29 = opcode table (0x40b80000), r30 = emulator
+// base (0x40b60000), r31 = KDP + 0x1000, XER = 0 -- then jumps into the
+// ROM's own DR-loop body at 0x40b66080. Handlers depend on invariants only
+// that loop establishes (r24 pre-advanced past the opcode, r27 = prefetched
+// next word, LR = current dispatch entry, cr1/cr2 fields steering the
+// shared tail's bgtctr/bgelr three-way jump), so the first dispatch must go
+// through the ROM's own fetch/rlwimi/mtlr/bgelr sequence rather than a
+// hand-rolled bctr.
 STATIC VOID
 RomWriteEmulatorEntryRoutine (
     IN UINT8*  Rom,
     IN UINT32  Offset
     )
 {
-    static const UINT32 Words[37] = {
+    static const UINT32 Words[32] = {
         0x7c3f0b78,  // mr r31,r1
         0x3bff1000,  // addi r31,r31,0x1000     r31 = KDP + 0x1000 = ed
         0x3fa040b8,  // lis r29,0x40b8          r29 = opcode dispatch table
         0x3fc040b6,  // lis r30,0x40b6          r30 = emulator base
-        0x3f004080,  // lis r24,0x4080          r24 = 68K PC
-        0x6318002a,  // ori r24,r24,0x2a        = 0x4080002a
+        0x3f004080,  // lis r24,0x4080          r24 = 68K PC - 2
+        0x63180028,  // ori r24,r24,0x28        = 0x40800028
         0x38000000,  // li r0,0
         0x7c0103a6,  // mtxer r0                XER = 0
         0x60102600,  // ori r1,r0,0x2600        a7 = 0x2600
@@ -1835,18 +1877,24 @@ RomWriteEmulatorEntryRoutine (
         0x3b400000,  // li r26,0
         0x3b800000,  // li r28,0              VBR = 0
         0x3ce00200,  // lis r7,0x0200
-        0x7ce04120,  // mtcrf 0x04,r7         cr2 = SO (SheepShaver entry)
+        0x7ce04120,  // mtcrf 0x04,r7         dispatch cond field (LT clear)
         0x38e00000,  // li r7,0
-        0x7ce02120,  // mtcrf 0x02,r7         cr1 = 0 (glue bgtctr guard)
-        0xa3780000,  // lhz r27,0(r24)        r27 = opcode (unsigned)
-        0x537d1b78,  // rlwimi r29,r27,3,0xd,0x1c  r29 = table + opcode*8
-        0xaf780002,  // lhau r27,2(r24)       r27 = next word, r24 = PC + 2
-        0x7fa903a6,  // mtctr r29
-        0x4e800420   // bctr                  -> 0x40ba77d0 (jmp dispatch)
+        0x7ce02120   // mtcrf 0x02,r7         cr1 = 0 (shared-tail guard)
     };
     UINT32 I;
     for (I = 0; I < sizeof(Words) / sizeof(Words[0]); I++) {
         RomPatchWriteWord32(Rom, Offset + I * 4, Words[I]);
+    }
+    {
+        // Final branch to the ROM's own DR-loop body. Offset is a ROM file
+        // offset; the guest runs the ROM copy at 0x40800000.
+        UINT32 Pc = 0x40800000u + Offset +
+                    (UINT32)(sizeof(Words) / sizeof(Words[0])) * 4;
+        INT32 Delta = (INT32)(0x40B66080u - (Pc + 4));
+        RomPatchWriteWord32(
+            Rom,
+            Offset + sizeof(Words) / sizeof(Words[0]) * 4,
+            0x48000000u | ((UINT32)Delta & 0x03FFFFFFu));
     }
 }
 
@@ -1864,6 +1912,36 @@ RomWriteEmulatorDispatchHelper (
     static const UINT32 Words[3] = {
         0x3c000060,  // lis r0,0x0060         cr2.GT|EQ
         0x7c004120,  // mtcrf 0x04,r0         cr2 = GE
+        0x4e800420   // bctr
+    };
+    UINT32 I;
+    for (I = 0; I < sizeof(Words) / sizeof(Words[0]); I++) {
+        RomPatchWriteWord32(Rom, Offset + I * 4, Words[I]);
+    }
+}
+
+// Install the ed.v[0x818] opcode-class helper at ROM + 0x36f7d0. The DR
+// emulator's shared dispatch tail enters it with two different calling
+// conventions: the lhz-class site (0x40b6c530 -> 0x40b6ca44/0x40b6ca48 bctr,
+// or 0x40b6c534 bsoctrl) tail-jumps via CTR with the handler address already
+// built in r29 -- continue to it; the rlwinm-class site (0x40b6c63c ->
+// 0x40b6c648 bctrl) calls it as a function and afterwards merges r5 into r29
+// (rlwimi r29,r5,3), so a plain blr -- leaving r5 as the next ext word loaded
+// at 0x40b6c644 -- reproduces the threaded flow exactly.
+STATIC VOID
+RomWriteEmulatorClassHelper (
+    IN UINT8*  Rom,
+    IN UINT32  Offset
+    )
+{
+    static const UINT32 Words[8] = {
+        0x7d2042a6,  // mflr r9
+        0x3d4040b6,  // lis r10,0x40b6
+        0x614ac64c,  // ori r10,r10,0xc64c    LR == bctrl return site?
+        0x7c095000,  // cmpw r9,r10
+        0x40820008,  // bne +8
+        0x4e800020,  // blr                   call: return, keep r5
+        0x7fa903a6,  // mtctr r29             jump: go to handler in r29
         0x4e800420   // bctr
     };
     UINT32 I;
@@ -1911,6 +1989,24 @@ PpcPatchNewWorldRom (
                         RomBase + PPC_NEW_WORLD_ROM_LA_EMULCODE_BASE - PPC_NEW_WORLD_ROM_GUEST_BASE);
     RomPatchWriteWord32(Rom, Struct + 0x360, 0x00000000); // physical RAM base
     RomPatchWriteWord32(Rom, Struct + 0xFD8, RomBase + 0x2A); // 68K reset vector
+
+    // 68K boot HWInfo gate. On real hardware the Open Firmware trampoline
+    // builds the IRP's HWInfo record and signs it with 'Hnfo' before the
+    // nanokernel runs (powermac-rom InfoRecords.a: NKHWInfo.Signature at
+    // IRP+0xF70). The 68K startup validates it at guest 0x4080AFBE
+    // (cmpli.l #'Hnfo',D0 after a DR-emulator service call); when the
+    // compare fails, bne.s diverts to an info-table scan that ends parked
+    // in an idle loop at 0x4080ABE6 because no signed record exists.
+    // We have no trampoline, so turn the failure branch into a NOP: flow
+    // then always reaches cmp.w d0,d0 at 0x4080AFD6 which forces Z=1
+    // ("HWInfo present") and continues through the healthy path.
+    // NOTE: an earlier patch here rewrote 0xAFC4 `bne.s +0x0E` as `60 00`,
+    // intending a NOP. On the 68K, a branch displacement byte of 0x00 is an
+    // ESCAPE meaning "16-bit displacement follows", so `60 00` became
+    // bra.w +$3030 into the middle of a data table at 0x4080DFF6 whose
+    // trailing RTS popped a null return address. The 'HnoF' info block is
+    // now fabricated at point-of-use (see m68k.c), so the original gate
+    // logic works and the patch must NOT be applied.
 
     // Locate the `twui r31,0..2` kernel-trap table (SheepShaver's
     // find_rom_data range; verified at ROM + 0x36e8c0 in the standard image).
@@ -1960,10 +2056,11 @@ PpcPatchNewWorldRom (
     RomWriteEmulStartRoutine(Rom, 0x36FC00, 0x814105FC, 0x4E800020);
     RomWriteEmulStartRoutine(Rom, 0x36FD00, 0x81410604, 0x4E800020);
 
-    // The 68K DR-emulator entry + ed.v[0x814] dispatch helper (free NOP region
-    // at ROM + 0x36f700..0x36f8fc).
+    // The 68K DR-emulator entry + ed.v[0x814]/ed.v[0x818] dispatch helpers
+    // (free NOP region at ROM + 0x36f700..0x36f8fc).
     RomWriteEmulatorEntryRoutine(Rom, 0x36F700);
     RomWriteEmulatorDispatchHelper(Rom, 0x36F7C0);
+    RomWriteEmulatorClassHelper(Rom, 0x36F7D0);
 
     // The ROM's control-flow dispatch glue bakes `rlwimi r29,r24,0x14,0xb,0xb`
     // (0x531DA2D6) into every branch/jmp path: it copies the low bit of the
@@ -2014,8 +2111,15 @@ PpcPatchNewWorldRom (
     BootWriteWord32(PPC_XLM_RUN_MODE_OFFSET,    0x00000000);       // MODE_68K
     BootWriteWord32(PPC_XLM_68K_R25_OFFSET,     0x00000000);
     BootWriteWord32(PPC_XLM_IRQ_NEST_OFFSET,    0x00000000);
-    BootWriteWord32(PPC_XLM_PVR_OFFSET,         0x00000000);
-    BootWriteWord32(PPC_XLM_BUS_CLOCK_OFFSET,   50000000);
+    BootWriteWord32(PPC_XLM_PVR_OFFSET,         0x00390000);       // PowerPC 7455 (G4)
+    BootWriteWord32(PPC_XLM_BUS_CLOCK_OFFSET,   100000000);      // 100 MHz bus clock
+
+    // NK context-save signature: the ROM's task-context save routine at
+    // 0x40804640 movem's all registers to the 0xC30 block and gates on a
+    // magic longword at 0xDB0 before proceeding; without it the boot parks
+    // in the bra-self deadloop at 0x408047AE. Nothing in the paths we run
+    // writes it, so seed the same magic the ROM data table carries.
+    BootWriteWord32(0x00000DB0, 0x5A932BC7);
 
     Print(L"68K emulator patched: LA_EmulatorCode 0x%08x LA_DispatchTable 0x%08x "
           L"trap table at ROM+0x%x -> emulator start 0x%08x\n",
