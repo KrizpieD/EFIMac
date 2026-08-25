@@ -703,15 +703,31 @@ efi_main (
             // caller[0x6B4]/[0x6B8] (copied to [r1+0x6B4]/[r1+0x6B8]). They are
             // 0 in the degenerate build -> zero virtual memory -> the PMDT gets
             // no RAM descriptors and the walk panics on duplicate [0,0xFFF].
-            // Seed the page count for 256 MB of RAM (0x10000 pages @ 4 KB).
-            PpcWriteGuestByte(B + 0x6B4 + 0, 0x00);
-            PpcWriteGuestByte(B + 0x6B4 + 1, 0x00);
-            PpcWriteGuestByte(B + 0x6B4 + 2, 0x01);
-            PpcWriteGuestByte(B + 0x6B4 + 3, 0x00);
-            PpcWriteGuestByte(B + 0x6B8 + 0, 0x00);
-            PpcWriteGuestByte(B + 0x6B8 + 1, 0x00);
-            PpcWriteGuestByte(B + 0x6B8 + 2, 0x01);
-            PpcWriteGuestByte(B + 0x6B8 + 3, 0x00);
+            // PHASE A.2: seed the page count from the ACTUAL guest RAM size
+            // (4 KB pages) so the NK's PMDT builder describes exactly the
+            // memory this guest map provides.
+            {
+              VOID*  HostBase  = NULL;
+              UINT64 GuestBase = 0;
+              UINT64 GuestSize = 0;
+              UINT32 RamPages  = 0;
+              if (EFI_ERROR(PpcGetGuestMemoryRegion(&HostBase, &GuestBase,
+                                                    &GuestSize))) {
+                GuestSize = 0x10000000;   // 256 MB fallback
+              }
+              RamPages = (UINT32)(GuestSize >> 12);
+              PpcWriteGuestByte(B + 0x6B4 + 0, (UINT8)(RamPages >> 24));
+              PpcWriteGuestByte(B + 0x6B4 + 1, (UINT8)(RamPages >> 16));
+              PpcWriteGuestByte(B + 0x6B4 + 2, (UINT8)(RamPages >> 8));
+              PpcWriteGuestByte(B + 0x6B4 + 3, (UINT8)(RamPages));
+              PpcWriteGuestByte(B + 0x6B8 + 0, (UINT8)(RamPages >> 24));
+              PpcWriteGuestByte(B + 0x6B8 + 1, (UINT8)(RamPages >> 16));
+              PpcWriteGuestByte(B + 0x6B8 + 2, (UINT8)(RamPages >> 8));
+              PpcWriteGuestByte(B + 0x6B8 + 3, (UINT8)(RamPages));
+              Print(L"  Seeded VMMaxVirtualPages/VMLogicalPages = %d pages "
+                    L"(%d MB) at caller[0x6B4]/[0x6B8]\n",
+                    RamPages, (UINT32)(GuestSize >> 20));
+            }
           }
           Print(L"  Seeded SPRG4 caller structure at 0x30000: version [0x30FE4]=0x0101\n");
           Print(L"\n--- Executing system ROM from nanokernel boot entry (0x%08x) ---\n",
@@ -758,20 +774,34 @@ efi_main (
             PpcWriteGuestByte(0x30000 + 0x648 + 3, (UINT8)(ReturnTarget));
             Print(L"  Seeded NK emulator-entry slot [0x30648] = 0x%08x "
                   L"(emulator kernel trap table)\n", ReturnTarget);
-            // NOTE: do NOT pre-queue a nanodebugger "go" ('g' CR) here. The NK
-            // polls the SCC during normal boot and drops into the nanodebugger
-            // on any character, so an early 'g' derails boot. The interpreter's
-            // AUTORESUME probe feeds 'g' only when the guest is actually idling
-            // at the nanodebugger prompt (PC=0x40B2751C).
-          }
-          // The NK entry tests MSR bit 0x10 (rlwinm r0,r0,0,0x1b,0x1b at
-          // 0x40B10014) and takes the cold/BAT path (beql 0x40B104A8) when
-          // the bit is clear. PpcPrepareSystemForBoot left MSR = ME|RI
-          // (0x1002), so bit 0x10 is clear. With it set, the fall-through
-          // rfis to r3+0x40 and executes "crset cr5eq" (0x40B10040), so
-          // CR5.EQ=1 at the 0x40B123A4 gate and the free-list walk is
-          // skipped. PPC_MSR_DR is the emulator's label for bit 0x10.
-          g_PpcContext.Msr = PPC_MSR_ME | PPC_MSR_RI | PPC_MSR_DR;
+          // NOTE: do NOT pre-queue a nanodebugger "go" ('g' CR) here. The NK
+          // polls the SCC during normal boot and drops into the nanodebugger
+          // on any character, so an early 'g' derails boot. The interpreter's
+          // AUTORESUME probe feeds 'g' only when the guest is actually idling
+          // at the nanodebugger prompt (PC=0x40B2751C).
+        }
+        // PHASE A: nanokernel boot-path selection.
+        //
+        // MSR bit 0x10 (PPC_MSR_DR label) selects the NK entry mode:
+        //   clear -> cold/BAT path (beql 0x40B104A8): full hardware init --
+        //   SR/BAT/SDR setup, page-table clear, PMDT build, RAM sizing
+        //   through BAT-mapped probes. SheepShaver neutralizes this entire
+        //   stage by rewriting the boot entry (patch_nanokernel_boot), but
+        //   its entry-pattern set does not match this 9.2.2 ROM revision:
+        //   the unpatched remainder deadlocks in the RAM sizer at
+        //   0x40B10BC8 (blrl into BAT-mapped scratch, second SDR1 reader
+        //   at 0x40B10A90). Verified empirically 2026-08: 11 of 13
+        //   SheepShaver stage patterns match and are patched below in
+        //   PpcPatchNewWorldRom, but without the entry rewrite the cold
+        //   path cannot complete on flat memory.
+        //   set    -> warm fall-through (rfi to r3+0x40, crset cr5eq):
+        //   skips the hardware-init stages entirely -- the SheepShaver
+        //   end-state -- and proceeds through the free-list-skipped init
+        //   to the 68K emulator handoff. Combined with the Phase A
+        //   environment fixes (contiguous RAM bank at 0, SCC device,
+        //   gated PMDT injection, merge-guard harmonization) this is the
+        //   path that completes initialization cleanly.
+        g_PpcContext.Msr = PPC_MSR_ME | PPC_MSR_RI | PPC_MSR_DR;
         } else {
           g_PpcContext.Pc = PPC_RESET_VECTOR;
           Print(L"\n--- Executing system ROM from reset vector ---\n");

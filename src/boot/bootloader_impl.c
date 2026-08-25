@@ -1619,9 +1619,17 @@ PpcInstallLowMemory (
     OUT UINT64* LowMemSize
     )
 {
-    // Classic Mac OS low-memory globals live at physical address 0. Guest RAM
-    // is mapped at guest 0x10000000, so low memory is a dedicated read/write
-    // region below the kernel base.
+    // PHASE A: contiguous boot RAM bank at guest physical 0.
+    //
+    // Classic Mac OS firmware maps system RAM contiguously from physical
+    // address 0, and the nanokernel places its boot workspace, kernel data,
+    // EWA, stacks and lock structures there (observed live: SPRG4 workspace
+    // relocated to 0x37E000, recursive-spinlock header at 0xAE000). The old
+    // map backed only [0,256 KB) plus a hand-carved stack hole at
+    // [0x600000,0x800000), leaving every NK structure above 256 KB reading
+    // as zero-filled void -- the direct cause of the cold-boot spinlock.
+    // Back the whole window with one writable region instead; low-memory
+    // globals are simply its first bytes.
     UINTN Pages;
     EFI_PHYSICAL_ADDRESS Base = 0;
     EFI_STATUS Status;
@@ -1632,58 +1640,34 @@ PpcInstallLowMemory (
         return EFI_ALREADY_STARTED;
     }
 
-    Pages = PPC_LOW_MEM_SIZE / EFI_PAGE_SIZE;
+    Pages = PPC_BOOT_RAM_BANK_SIZE / EFI_PAGE_SIZE;
     Status = BS->AllocatePages(AllocateAnyPages, EfiBootServicesData, Pages, &Base);
     if (EFI_ERROR(Status)) {
-        Print(L"Failed to allocate low-memory pages: %r\n", Status);
+        Print(L"Failed to allocate boot RAM bank pages: %r\n", Status);
         return Status;
     }
-    ZeroMem((VOID*)(UINTN)Base, PPC_LOW_MEM_SIZE);
+    ZeroMem((VOID*)(UINTN)Base, PPC_BOOT_RAM_BANK_SIZE);
 
     Status = PpcAddGuestMemoryRegion((VOID*)(UINTN)Base,
-                                     PPC_LOW_MEM_GUEST_BASE,
-                                     PPC_LOW_MEM_SIZE,
+                                     PPC_BOOT_RAM_BANK_GUEST_BASE,
+                                     PPC_BOOT_RAM_BANK_SIZE,
                                      FALSE);
     if (EFI_ERROR(Status)) {
         BS->FreePages(Base, Pages);
-        Print(L"Failed to map low memory into guest memory: %r\n", Status);
+        Print(L"Failed to map boot RAM bank into guest memory: %r\n", Status);
         return Status;
     }
 
     g_BootContext.LowMemoryInstalled = TRUE;
-    g_BootContext.LowMemoryAddress = PPC_LOW_MEM_GUEST_BASE;
-    g_BootContext.LowMemorySize = PPC_LOW_MEM_SIZE;
+    g_BootContext.LowMemoryAddress = PPC_BOOT_RAM_BANK_GUEST_BASE;
+    g_BootContext.LowMemorySize = PPC_BOOT_RAM_BANK_SIZE;
 
-    if (LowMemAddress != NULL) { *LowMemAddress = PPC_LOW_MEM_GUEST_BASE; }
-    if (LowMemSize != NULL) { *LowMemSize = PPC_LOW_MEM_SIZE; }
+    if (LowMemAddress != NULL) { *LowMemAddress = PPC_BOOT_RAM_BANK_GUEST_BASE; }
+    if (LowMemSize != NULL) { *LowMemSize = PPC_BOOT_RAM_BANK_SIZE; }
 
-    Print(L"Low-memory region installed: %d bytes at guest 0x%x\n",
-          (UINT64)PPC_LOW_MEM_SIZE, PPC_LOW_MEM_GUEST_BASE);
-
-    // NK private-stack hole: on real hardware main RAM starts at guest
-    // 0x0, so the nanokernel's private stack at ~0x7Exxxx-0x7FFFFF is
-    // ordinary RAM. Our map relocates main RAM to 0x10000000, leaving
-    // that window unmapped -- link/pushes there silently vanish and the
-    // first rts pops zeros. Back it with dedicated pages.
-    {
-        UINTN HolePages = 0x00200000 / EFI_PAGE_SIZE;   /* 2 MB */
-        EFI_PHYSICAL_ADDRESS HoleBase = 0;
-        Status = BS->AllocatePages(AllocateAnyPages, EfiBootServicesData,
-                                   HolePages, &HoleBase);
-        if (!EFI_ERROR(Status)) {
-            ZeroMem((VOID*)(UINTN)HoleBase, 0x00200000);
-            Status = PpcAddGuestMemoryRegion((VOID*)(UINTN)HoleBase,
-                                             0x00600000u,
-                                             0x00200000u,
-                                             FALSE);
-            if (EFI_ERROR(Status)) {
-                BS->FreePages(HoleBase, HolePages);
-                Print(L"NK-stack region map failed: %r\n", Status);
-            } else {
-                Print(L"NK-stack region installed: 2097152 bytes at guest 0x600000\n");
-            }
-        }
-    }
+    Print(L"Boot RAM bank installed: %d MB at guest 0x%x (contiguous, "
+          L"covers NK workspace/stacks/locks)\n",
+          (UINT32)(PPC_BOOT_RAM_BANK_SIZE >> 20), PPC_BOOT_RAM_BANK_GUEST_BASE);
 
     return EFI_SUCCESS;
 }
@@ -1997,6 +1981,54 @@ RomWriteEmulatorClassHelper (
     }
 }
 
+// PHASE A.5: KernelData hardware-field provisioning.
+//
+// The nanokernel owns the KernelData page (LA_KernelData = 0x68FFE000) and
+// initializes nearly all of it during its own boot; the emulator's job is
+// only the hardware-dependent inputs the ROM cannot discover by itself.
+// Those are delivered through two channels that already exist:
+//   - ConfigInfo physical RAM base (boot struct + 0x360 = 0, patched above);
+//   - XLM PVR / bus-clock globals (0x281C / 0x2820), SheepShaver's
+//     sanctioned channel for emulator-provided CPU identity.
+// Any further field-fill must be evidence-based: blind writes into this
+// page corrupt live nanokernel data structures. The interpreter's KDPROF
+// profiler records every load the NK performs from the page during boot
+// and dumps the consumed offsets at the 68K handoff; seeds for those
+// offsets belong here once identified. This function validates the page
+// is reachable and snapshots its initial contents so the profile output
+// can be compared against the pre-boot state.
+STATIC VOID
+BootSeedKernelDataHardware (
+    VOID
+    )
+{
+    UINT8 B0 = PpcReadGuestByte(0x68FFE000);
+    UINT8 B1 = PpcReadGuestByte(0x68FFE001);
+    UINT8 B2 = PpcReadGuestByte(0x68FFE002);
+    UINT8 B3 = PpcReadGuestByte(0x68FFE003);
+    if ((B0 | B1 | B2 | B3) == 0 && PpcReadGuestByte(0x68FFEFF0) == 0 &&
+        PpcReadGuestByte(0x68FFEFF1) == 0 &&
+        PpcReadGuestByte(0x68FFEFF2) == 0 &&
+        PpcReadGuestByte(0x68FFEFF3) == 0) {
+        // Both ends of the page read as zero. That is the expected fresh
+        // state (the page lives in the zeroed NK system area), but confirm
+        // the region is writable so later runtime seeds will stick.
+        BootWriteWord32(0x68FFEFF4, 0xA5A5A5A5);
+        if (PpcReadGuestByte(0x68FFEFF4) != 0xA5 ||
+            PpcReadGuestByte(0x68FFEFF5) != 0xA5 ||
+            PpcReadGuestByte(0x68FFEFF6) != 0xA5 ||
+            PpcReadGuestByte(0x68FFEFF7) != 0xA5) {
+            Print(L"KernelData page NOT writable: A.5 runtime seeds will fail\n");
+            return;
+        }
+        BootWriteWord32(0x68FFEFF4, 0);
+    }
+    Print(L"KernelData page OK (LA_KernelData 0x68FFE000, head %02x%02x%02x%02x). "
+          L"PVR/bus-clock delivered via XLM [281C]/[2820]; "
+          L"field-fill awaits KDPROF offsets\n",
+          B0, B1, B2, B3);
+}
+
 // SheepShaver-faithful activation of the New World ROM's built-in 68K DR
 // emulator. The ROM's ConfigInfo (ROM + 0x30d000) bakes LA_EmulatorCode =
 // 0x68060000 / LA_DispatchTable = 0x68080000 (logical RAM addresses the real
@@ -2006,6 +2038,192 @@ RomWriteEmulatorClassHelper (
 // 0x36e8c0) is then rewritten into absolute branches to the emulator-entry
 // routines, and the EMUL_OP dispatch markers are installed in the opcode
 // table. Must run after PpcInstallLowMemory (writes XLM globals at 0x2800).
+
+// ---------------------------------------------------------------------------
+// PHASE A (SheepShaver-faithful nanokernel cold-boot neutralization).
+//
+// With MSR[DR] clear (A.1) the NK runs its real cold path: SR/BAT/SDR setup,
+// page-table clear, PMDT ("RAM descriptor") build, BAT/SR loads, performance-
+// monitor SPR probes and PVR-dependent CPU tables. The interpreter has no
+// MMU, so every hardware-initialization stage is neutralized exactly the way
+// SheepShaver's patch_nanokernel_boot() does: pattern-matched sites in the
+// 0x310000..0x320000 NK image are NOPed or redirected to emulator-provided
+// values (XLM). Pattern addresses below were verified against the Mac OS
+// 9.2.2 "Mac OS ROM" image; a missed match logs a warning and leaves that
+// stage intact rather than aborting the whole patch set.
+//
+// Returns the number of patches applied.
+// ---------------------------------------------------------------------------
+#define POWERPC_NOP  0x60000000u
+#define POWERPC_BLR  0x4E800020u
+
+// Peek a big-endian word from the host-side ROM image without modifying it.
+STATIC UINT32
+RomPeekWord32 (
+    IN UINT8* Rom,
+    IN UINT32 Offset
+    )
+{
+    return ((UINT32)Rom[Offset] << 24) |
+           ((UINT32)Rom[Offset + 1] << 16) |
+           ((UINT32)Rom[Offset + 2] << 8) |
+           (UINT32)Rom[Offset + 3];
+}
+
+// Find a byte pattern inside [Lo, Hi) of the flat ROM image; 0 if absent.
+STATIC UINT32
+RomFindBytes (
+    IN UINT8*       Rom,
+    IN const UINT8* Pat,
+    IN UINTN        Len,
+    IN UINT32       Lo,
+    IN UINT32       Hi
+    )
+{
+    UINT32 Off;
+    for (Off = Lo; Off + Len <= Hi; Off++) {
+        if (CompareMem(Rom + Off, Pat, Len) == 0) {
+            return Off;
+        }
+    }
+    return 0;
+}
+
+STATIC UINTN
+BootPatchNkBootSequence (
+    IN UINT8* Rom
+    )
+{
+    UINTN Applied = 0;
+    UINT32 Base;
+    static const UINT8 PatPvr1[]  = {0x7d,0x9f,0x42,0xa6};
+    static const UINT8 PatSprg3[] = {0x39,0x21,0x03,0x60,0x7d,0x33,0x43,0xa6,
+                                     0x39,0x01,0x04,0x20};
+    static const UINT8 PatPvr2[]  = {0x7e,0xff,0x42,0xa6,0x56,0xf7,0x84,0x3e};
+    static const UINT8 PatPvr4[]  = {0x7d,0x3f,0x42,0xa6,0x55,0x29,0x84,0x3e};
+    static const UINT8 PatSdr1[]  = {0x7d,0x19,0x02,0xa6,0x55,0x16,0x81,0xde};
+    static const UINT8 PatPgtb[]  = {0x36,0xd6,0xff,0xfc,0x7e,0xe8,0xb1,0x2e,
+                                     0x41,0x81,0xff,0xf8};
+    static const UINT8 PatPmdt[]  = {0x97,0xfd,0x00,0x04,0x3b,0xff,0x10,0x00,
+                                     0x4b,0xff,0xff,0xdc};
+    static const UINT8 PatSrl2[]  = {0x83,0xa1,0x05,0xe8,0x57,0x7c,0x3e,0x78,
+                                     0x7f,0xbd,0xe0,0x2e};
+    static const UINT8 PatPmck[]  = {0x7e,0x58,0xeb,0xa6,0x7e,0x53,0x90,0xf8,
+                                     0x7e,0x78,0xea,0xa6};
+
+    // Don't read PVR (#1): mfspr r12,PVR -> lwz r12,XLM_PVR.
+    Base = RomFindBytes(Rom, PatPvr1, sizeof(PatPvr1), 0x3103B0, 0x3108B0);
+    if (Base != 0) {
+        RomPatchWriteWord32(Rom, Base, 0x81800000u | PPC_XLM_PVR_OFFSET);
+        Applied++;
+        Print(L"  NKPATCH pvr1 @0x%x -> lwz r12,XLM_PVR\n", Base);
+    } else {
+        Print(L"  NKPATCH pvr1: pattern NOT found\n");
+    }
+
+    // Don't set SPRG3 (second site): NOP the mtsprg.
+    Base = RomFindBytes(Rom, PatSprg3, sizeof(PatSprg3), 0x310000, 0x314000);
+    if (Base != 0) {
+        RomPatchWriteWord32(Rom, Base + 4, POWERPC_NOP);
+        Applied++;
+        Print(L"  NKPATCH sprg3-2nd @0x%x\n", Base + 4);
+    } else {
+        Print(L"  NKPATCH sprg3-2nd: pattern NOT found\n");
+    }
+
+    // Don't read PVR (#2): up to two occurrences; mfspr r23,PVR ->
+    // lwz r23,XLM_PVR (the following rlwinm only masks version bits).
+    Base = RomFindBytes(Rom, PatPvr2, sizeof(PatPvr2), 0x310000, 0x320000);
+    while (Base != 0) {
+        RomPatchWriteWord32(Rom, Base, 0x82E00000u | PPC_XLM_PVR_OFFSET);
+        Applied++;
+        Print(L"  NKPATCH pvr2 @0x%x\n", Base);
+        Base = RomFindBytes(Rom, PatPvr2, sizeof(PatPvr2), Base + 4, 0x320000);
+    }
+
+    // Don't read PVR (#4): mfspr r9,PVR -> lwz r9,XLM_PVR.
+    Base = RomFindBytes(Rom, PatPvr4, sizeof(PatPvr4), 0x310000, 0x320000);
+    if (Base != 0) {
+        RomPatchWriteWord32(Rom, Base, 0x81200000u | PPC_XLM_PVR_OFFSET);
+        Applied++;
+        Print(L"  NKPATCH pvr4 @0x%x\n", Base);
+    }
+
+    // Don't read SDR1: replace the pair with fixed page-table base/size
+    // values (lis r8,0xdead / lis r22,0x001f / nop).
+    Base = RomFindBytes(Rom, PatSdr1, sizeof(PatSdr1), 0x310000, 0x320000);
+    if (Base != 0) {
+        RomPatchWriteWord32(Rom, Base + 0, 0x3D00DEAD);
+        RomPatchWriteWord32(Rom, Base + 4, 0x3EC0001F);
+        RomPatchWriteWord32(Rom, Base + 8, POWERPC_NOP);
+        Applied++;
+        Print(L"  NKPATCH sdr1 @0x%x\n", Base);
+    } else {
+        Print(L"  NKPATCH sdr1: pattern NOT found\n");
+    }
+
+    // Don't clear page table / don't tlbie: NOP both.
+    Base = RomFindBytes(Rom, PatPgtb, sizeof(PatPgtb), 0x310000, 0x320000);
+    if (Base != 0) {
+        RomPatchWriteWord32(Rom, Base + 4, POWERPC_NOP);
+        RomPatchWriteWord32(Rom, Base + 12, POWERPC_NOP);
+        Applied++;
+        Print(L"  NKPATCH pgtb-clear/tlbie @0x%x(+4,+12)\n", Base);
+    } else {
+        Print(L"  NKPATCH pgtb-clear: pattern NOT found\n");
+    }
+
+    // PHASE A.2: don't create the RAM descriptor table (the NK's PMDT
+    // builder). It would describe physical memory this guest map cannot
+    // back; skipping it leaves the table empty so the interpreter's gated
+    // PMDTINJECT provides a correct one instead.
+    Base = RomFindBytes(Rom, PatPmdt, sizeof(PatPmdt), 0x310000, 0x320000);
+    if (Base != 0) {
+        RomPatchWriteWord32(Rom, Base, POWERPC_NOP);
+        Applied++;
+        Print(L"  NKPATCH desc-create(PMDT builder) @0x%x\n", Base);
+    } else {
+        Print(L"  NKPATCH desc-create: pattern NOT found\n");
+    }
+
+    // Don't mess with SRs: make the second SR-load helper return at once.
+    Base = RomFindBytes(Rom, PatSrl2, sizeof(PatSrl2), 0x310000, 0x320000);
+    if (Base != 0) {
+        RomPatchWriteWord32(Rom, Base, POWERPC_BLR);
+        Applied++;
+        Print(L"  NKPATCH sr-load2 -> blr @0x%x\n", Base);
+    } else {
+        Print(L"  NKPATCH sr-load2: pattern NOT found\n");
+    }
+
+    // Don't check performance monitor: NOP every mtspr/mfspr pair for the
+    // PM SPRs (952 mmcr0 .. 959 sda) inside the probe block.
+    Base = RomFindBytes(Rom, PatPmck, sizeof(PatPmck), 0x310000, 0x320000);
+    if (Base != 0) {
+        static const UINT32 SprList[8] = {952,953,954,955,956,957,958,959};
+        UINTN K;
+        for (K = 0; K < 8; K++) {
+            UINT32 Spr = SprList[K];
+            UINT32 Mt = 0x7E4003A6u | ((Spr & 0x1F) << 16) | ((Spr & 0x3E0) << 6);
+            UINT32 Mf = 0x7E6002A6u | ((Spr & 0x1F) << 16) | ((Spr & 0x3E0) << 6);
+            UINTN Of;
+            for (Of = 0; Of < 64; Of++) {
+                if (RomPeekWord32(Rom, Base + (UINT32)Of * 4) == Mt &&
+                    RomPeekWord32(Rom, Base + (UINT32)Of * 4 + 8) == Mf) {
+                    RomPatchWriteWord32(Rom, Base + (UINT32)Of * 4,     POWERPC_NOP);
+                    RomPatchWriteWord32(Rom, Base + (UINT32)Of * 4 + 8, POWERPC_NOP);
+                }
+            }
+        }
+        Applied++;
+        Print(L"  NKPATCH perf-monitor SPR pairs @0x%x\n", Base);
+    } else {
+        Print(L"  NKPATCH perf-monitor: pattern NOT found\n");
+    }
+
+    return Applied;
+}
+
 STATIC EFI_STATUS
 PpcPatchNewWorldRom (
     VOID
@@ -2158,7 +2376,7 @@ PpcPatchNewWorldRom (
     BootWriteWord32(PPC_XLM_RUN_MODE_OFFSET,    0x00000000);       // MODE_68K
     BootWriteWord32(PPC_XLM_68K_R25_OFFSET,     0x00000000);
     BootWriteWord32(PPC_XLM_IRQ_NEST_OFFSET,    0x00000000);
-    BootWriteWord32(PPC_XLM_PVR_OFFSET,         0x00390000);       // PowerPC 7455 (G4)
+    BootWriteWord32(PPC_XLM_PVR_OFFSET,         0x000C0000);       // PowerPC 7400 (G4)
     BootWriteWord32(PPC_XLM_BUS_CLOCK_OFFSET,   100000000);      // 100 MHz bus clock
 
     // NK context-save signature: the ROM's task-context save routine at
@@ -2167,6 +2385,17 @@ PpcPatchNewWorldRom (
     // in the bra-self deadloop at 0x408047AE. Nothing in the paths we run
     // writes it, so seed the same magic the ROM data table carries.
     BootWriteWord32(0x00000DB0, 0x5A932BC7);
+
+    // PHASE A: neutralize the NK cold-boot hardware init (SR/BAT/SDR, page
+    // table clear, PMDT builder, perf-monitor probes; PVR reads answered
+    // from XLM) so initialization completes cleanly with flat memory.
+    {
+        UINTN NkPatched = BootPatchNkBootSequence(Rom);
+        Print(L"NK boot sequence patched: %u sites\n", (UINT32)NkPatched);
+    }
+
+    // PHASE A.5: validate the KernelData page and snapshot its state.
+    BootSeedKernelDataHardware();
 
     Print(L"68K emulator patched: LA_EmulatorCode 0x%08x LA_DispatchTable 0x%08x "
           L"trap table at ROM+0x%x -> emulator start 0x%08x\n",
@@ -2320,13 +2549,25 @@ PpcRunBootSelfTest (
         }
     }
 
-    // ROM is read-only to guest stores (applies to demo and real ROMs).
+    // ROM window access enforcement. Old World and demo images are mapped
+    // read-only, so guest stores must be rejected. The New World window is
+    // deliberately writable -- the nanokernel builds its HTAB, kernel data
+    // page, EWA and IRP inside it (see PpcLoadSystemRom) -- so the test
+    // instead verifies the write lands and is restored.
     {
         UINT8 B0 = PpcReadGuestByte(RomBase + 0);
         PpcWriteGuestByte(RomBase + 0, (UINT8)(B0 ^ 0xFF));
-        BootSelfTestCheck(
-            PpcReadGuestByte(RomBase + 0) == B0,
-            L"ROM rejects guest writes (read-only)");
+        BOOLEAN Changed = PpcReadGuestByte(RomBase + 0) == (UINT8)(B0 ^ 0xFF);
+        PpcWriteGuestByte(RomBase + 0, B0);
+        if (g_BootContext.RomType == PPC_ROM_TYPE_NEW_WORLD) {
+            BootSelfTestCheck(
+                Changed && PpcReadGuestByte(RomBase + 0) == B0,
+                L"New World ROM window writable + restorable (HTAB/KDP backing)");
+        } else {
+            BootSelfTestCheck(
+                !Changed,
+                L"ROM rejects guest writes (read-only)");
+        }
     }
 
     // Cross-region execution (demo ROM only): run the reset-vector program in

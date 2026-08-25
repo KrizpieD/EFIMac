@@ -103,6 +103,14 @@ enum {
 #define PPC_LOW_MEM_GUEST_BASE  0x00000000  // Low-memory globals
 #define PPC_LOW_MEM_SIZE        0x00040000  // 256 KB (covers the nanokernel's fixed stack/context at 0xA000-0x1A000)
 
+// PHASE A: contiguous boot RAM bank at guest physical 0. Classic PPC Macs
+// map system RAM from physical 0; the nanokernel places its boot workspace,
+// kernel data page, EWA, private stacks (~0x7Exxxx) and spinlock structures
+// there. One bank backs the whole window instead of the former 256 KB
+// low-memory region plus a hand-carved stack hole at [0x600000,0x800000).
+#define PPC_BOOT_RAM_BANK_GUEST_BASE  0x00000000
+#define PPC_BOOT_RAM_BANK_SIZE        0x01000000  // 16 MB
+
 // Classic Mac OS PPC kernel/system area. The nanokernel hard-codes its kernel
 // stack/heap in the 0x68F0xxxx range (e.g. addis/ori 0x68F168F1 at the boot
 // entry and in the first-task setup), which is the standard 0x68000000 system

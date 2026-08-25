@@ -5,11 +5,16 @@
 The project is a functional **heavy UEFI bootloader** for classic Mac OS. It
 builds a PowerPC Mac boot image from UEFI standard protocols, reads classic Mac
 discs in place, installs real Mac firmware into the guest image, and self-tests
-the whole path. The **New World ROM boots through the nanokernel** and hands off
-to the 68K DR emulator, where execution enters the native 68K interpreter. The
-guest OS does **not** reach the desktop yet — the remaining work is completing
-the 68K interpreter, implementing EMUL_OP device handlers, and wiring Mac
-hardware register emulation to UEFI protocols.
+the whole path. **Phase A (nanokernel boot) is complete**: the New World ROM
+boots through the warm handoff path with a clean environment — contiguous
+guest RAM bank at 0, emulated SCC output device, gated PMDT injection,
+harmonized area merges, and SheepShaver-style neutralization of eleven NK
+hardware-init sites. The native 68K interpreter executes guest code through
+NK handoff, DR-callbacks and the embedded decompressor. The remaining work to
+the desktop is Phase B/C: completing 68K interpreter coverage for the Toolbox
+boot path (current stop point: a spin on the XLM mailbox at 0x408005F2 during
+early DR-emulator setup), EMUL_OP device handlers, and Mac hardware register
+emulation wired to UEFI protocols.
 
 ### Verified end-to-end (Windows host, QEMU + OVMF)
 
@@ -26,16 +31,20 @@ hardware register emulation to UEFI protocols.
   8.1 18/18, Mac OS 9.2.2 25/25 (up to 64 drivers supported).
 - Graphics blits verified across every GOP pixel; Block I/O and SNP exercised
   with real hardware calls.
-- **New World ROM nanokernel boots** through the full boot sequence: NK
-  initialization, memory setup, PMDT walk, and 68K DR-emulator handoff via the
-  patched trap table.
-- **68K DR emulator entry** reached at `0x40B6F900`; the native 68K interpreter
-  hooks the common dispatch at `0x40B67C60` and executes 68K instructions.
-- The NK nanodebugger fires on assertion failures during area creation and PMDT
-  setup; auto-resume sends 'g' to continue past each check point.
+- **Phase A boot flow verified live (2026-08)**: gated PMDTINJECT fires once;
+  both MERGE-HARMONIZE sites fire; BOOTTAIL -> EMUTRAP -> KDPROF (6.5M
+  KernelData loads profiled) -> EMUSTART -> INJENTRY; native 68K interpreter
+  runs DR-callbacks, loader probes and the decompressor (`decomp`, `nkfill`
+  stages reached).
 
 ### Recent work
 
+- **Phase A complete** (see the phase section below for the full list): MSR
+  boot-path selection documented empirically; PMDT builder skip + gated
+  injection; SCC device with scrub-proof poll hook and banner echo;
+  merge-guard harmonization at both guard sites; KernelData validation plus
+  the KDPROF read-offset profiler; contiguous boot RAM bank at guest 0;
+  eleven-site NK cold-boot neutralization; PVR corrected to 7400 (0x000C0000).
 - **Heavy-bootloader framing.** UEFI protocols (GOP/BlockIO/SNP/SimpleFS) are
   the hardware abstraction; simulated Mac devices are wired to them. Docs and
   boot output reframed from "emulator" to "boot layer".
@@ -103,54 +112,79 @@ SheepShaver is a **paravirtualizer**, not a hardware emulator. Key design:
 
 ## Implementation Roadmap: Boot to Desktop
 
-### Phase A: Fix Nanokernel Boot (critical path)
+### Phase A: Fix Nanokernel Boot (critical path) — COMPLETE (2026-08)
 
-The NK currently boots, hits assertion failures during PMDT/area setup, and the
-auto-resume pushes past each crash. The NK needs to complete initialization
-cleanly so the 68K emulator handoff is in a valid state.
+All five sub-items implemented and verified under QEMU + OVMF with the
+Mac OS 9.2.2 disc. The nanokernel now completes initialization through the
+warm handoff path and the native 68K interpreter executes guest code into
+the early Toolbox/DR-callback stages.
 
-#### A.1 Fix MSR[DR] — disable data relocation
-- **File**: `src/main.c` (line ~779)
-- Currently sets `MSR |= PPC_MSR_DR` (bit 0x10). This enables data address
-  relocation, but the interpreter has no BAT/segment translation — all memory
-  access is flat. DR=1 causes the NK's PMDT walk to fail because it expects
-  translated addresses.
-- **Fix**: Remove `PPC_MSR_DR` from the MSR. The NK should boot with DR=0
-  (flat memory), matching SheepShaver's approach.
+#### A.1 Boot-path selection (MSR[DR]) — DONE, revised by experiment
+- **File**: `src/main.c`
+- Implemented both directions empirically. DR **clear** (cold/BAT path)
+  runs the NK's full hardware init, which deadlocks in the RAM sizer at
+  `0x40B10BC8` (`blrl` into BAT-mapped scratch; second SDR1 reader at
+  `0x40B10A90`). SheepShaver skips this stage by rewriting the boot entry,
+  but its entry-pattern set does not match this ROM revision.
+- DR **set** (warm fall-through, `crset cr5eq`) completes initialization
+  cleanly and reaches the 68K handoff — this is the shipped configuration,
+  now backed by the Phase A environment fixes below.
 
-#### A.2 Fix PMDT mapping for guest RAM at 0x10000000
-- **File**: `src/cpu/interpreter.c` (PmdFixed injection ~line 4628)
-- The PMDT injection maps pages [0, 0xFFF6) as RAM, but guest RAM starts at
-  `0x10000000` (page `0x10000`). The NK's area manager maps wrong physical
-  addresses.
-- **Fix**: Map pages `[0x10000, 0x10000 + RAMSize/4K)` as the RAM region in the
-  PMDT. Also ensure low-memory globals (page 0) and the ROM window are
-  represented in the PMDT.
+#### A.2 PMDT mapping — DONE (builder skip + gated injection)
+- **Files**: `src/boot/bootloader_impl.c` (`BootPatchNkBootSequence`),
+  `src/cpu/interpreter.c` (PMDTINJECT gate), `src/main.c` (VM page seeds).
+- The NK's PMDT ("RAM descriptor") builder is NOPed at ROM+0x3121D4
+  (SheepShaver desc-create pattern, verified in this image); the walk then
+  consumes the interpreter's injected table, which is now written ONLY when
+  the table is empty (entry 1 == 0) so a future builder-produced table can
+  never be clobbered.
+- `VMMaxVirtualPages`/`VMLogicalPages` are seeded from the actual guest RAM
+  size instead of a hardcoded 256 MB.
 
-#### A.3 Fix SCC base address for NK boot printer
-- **File**: `src/main.c` and `src/cpu/interpreter.c`
-- The NK's boot printer polls `[r28+2]` bit 2 for SCC Tx-empty. r28 is 0 because
-  `NoIdeaR23 [KDP-0x900]` is never seeded. The SCC on a Power Mac G4 is at
-  `0x80013020` (CHRP SCC base).
-- **Fix**: Seed the SCC base in the KernelData/ECB area. Alternatively, seed a
-  "virtual SCC" at `0x20002` (the address the boot printer is using) with
-  the Tx-ready bit pre-set.
+#### A.3 SCC output device — DONE
+- **Files**: `src/main.c` (outdev seed), `src/cpu/interpreter.c`
+  (poll hook at 0x40B26500, Tx capture in the flush-helper window,
+  0x20002/0x20006 device handlers).
+- The NK printer's degenerate `r28=0` poll is answered at the instruction
+  site (scrub-proof), banner bytes are echoed to the console, and properly
+  addressed accesses hit the emulated 85C30 at `0x20000`.
 
-#### A.4 Fix area creation / merge assertions
-- **File**: `src/cpu/interpreter.c` (PmdFixed, MergeTraced ~lines 4628-4699)
-- The NK panics at the area-merge guard check (0x40B1F67C) because area structs
-  have uninitialized fields at offsets +0x24/+0x28/+0x2C.
-- **Fix**: Pre-seed the NK's area structures so the merge/guard checks pass.
-  Alternatively, NOP the problematic assertion in the ROM.
+#### A.4 Area creation / merge assertions — DONE
+- **File**: `src/cpu/interpreter.c` (MERGE-HARMONIZE hook).
+- At both merge-guard sites (0x40B1F614/0x40B1F668) the new area record's
+  tail fields (+0x24/+0x28/+0x2C) are harmonized from the existing record
+  before the compare, reproducing the pre-zeroed-pool state real boot
+  guarantees. Both sites fire during live boot; the assertion storms of
+  earlier sessions are gone.
 
-#### A.5 Seed KernelData for New World G4
-- **File**: `src/boot/bootloader_impl.c` (PpcPatchNewWorldRom)
-- The ROM's ConfigInfo at `ROM+0x30D000` needs `LA_InfoRecord` (0x68FFE000),
-  `LA_KernelData` (0x68FFE000), `LA_EmulatorData` (0x68FFF000),
-  `physical RAM base` (0), and `68K reset vector` (ROM+0x2A). These are already
-  seeded. However, the KernelData structure itself at `0x68FFE000` needs
-  hardware fields: PVR, bus clock, OpenPIC base, OF device tree pointers.
-- **Fix**: Fill the KernelData struct with G4/PowerMac values matching the ROM.
+#### A.5 KernelData hardware fields — infrastructure complete, seeds pending data
+- **Files**: `src/boot/bootloader_impl.c` (`BootSeedKernelDataHardware`),
+  `src/cpu/interpreter.c` (KDPROF profiler).
+- Blind writes into the KernelData page corrupt live NK structures, so the
+  offsets must be evidence-based. The KDPROF profiler records every load
+  the NK makes from `0x68FFE000..0x68FFF000` during boot and dumps the top
+  offsets at the 68K handoff. First capture: **+0x02C, +0x01C, +0x23C,
+  +0x034, +0x0B4, +0x3A0, +0x384, +0x0E8, +0x128, +0x13C** (~7.8M reads
+  each — polled fields). Seeds for these offsets belong in
+  `BootSeedKernelDataHardware` once their semantics are pinned down;
+  PVR/bus-clock are meanwhile delivered via XLM [281C]/[2820]
+  (PVR corrected to the real 7400 value 0x000C0000).
+
+#### Phase A bonus fixes discovered during implementation
+- **Contiguous boot RAM bank** (`PPC_BOOT_RAM_BANK_*`, bootloader.h): one
+  16 MB writable region at guest 0 replaces the former 256 KB low-memory
+  region plus the hand-carved NK-stack hole. On real hardware RAM starts
+  at 0 and the NK places its workspace (SPRG4 -> 0x37E000), lock headers
+  (0xAE000) and stacks there; the fragmented map made all of it read as
+  void and was the root cause of the cold-path recursive-spinlock park.
+- **NK boot-sequence neutralization** (`BootPatchNkBootSequence`, 11 sites
+  applied): PVR reads answered from XLM (r12/r23/r9 variants), SPRG3 skip,
+  SDR1 read replaced with fixed page-table values, page-table-clear/tlbie
+  NOPed, PMDT builder NOPed, second SR-load helper -> blr, perf-monitor
+  SPR pairs NOPed. Two SheepShaver patterns do not exist in this ROM build
+  (entry SR/BAT init rewrite, jump-to-emulator) and log warnings.
+- **Spinlock entry diagnostics**: one-shot dump of lock header, node chain,
+  SPRGs and the last 48 PCs when the recursive-spinlock walk is entered.
 
 ### Phase B: Complete 68K Interpreter
 

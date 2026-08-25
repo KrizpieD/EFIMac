@@ -289,6 +289,99 @@ typedef struct {
 // contains an address wins.
 static PPC_GUEST_REGION g_GuestRegions[PPC_MAX_GUEST_REGIONS];
 static UINTN g_OutDevChars = 0;
+
+// ---------------------------------------------------------------------------
+// PHASE A.5: KernelData hardware-field discovery profiler.
+//
+// The nanokernel owns the KernelData page (LA_KernelData = 0x68FFE000) and
+// initializes most of it itself during boot; what the emulator must supply
+// are the hardware-dependent fields the ROM expects the bootloader/Open
+// Firmware layer to have filled. Blind writes here would corrupt live NK
+// data, so this profiler records every load whose effective address lands
+// inside the page while the NK boots. The bucket histogram dumped at the
+// 68K handoff identifies exactly which offsets are consumed (and therefore
+// which fields a future seed must provide), turning A.5 into a data-driven
+// task instead of guesswork.
+// ---------------------------------------------------------------------------
+#define PPC_KERNELDATA_BASE   0x68FFE000u
+#define PPC_KERNELDATA_WORDS  1024          // whole 4 KB page, word granular
+static BOOLEAN g_KdProfileEnabled = FALSE;
+static UINT32  g_KdProfileLoads   = 0;
+static UINT32  g_KdBucket[PPC_KERNELDATA_WORDS];
+
+// Record a load from the KernelData page (called on lwz/lhz/lbz).
+static VOID
+PpcKdProfileLoad (
+    IN UINT32 Ea
+    )
+{
+    if (!g_KdProfileEnabled) {
+        return;
+    }
+    if (Ea >= PPC_KERNELDATA_BASE &&
+        Ea < PPC_KERNELDATA_BASE + PPC_KERNELDATA_WORDS * 4 &&
+        g_KdProfileLoads < 8000000u) {
+        g_KdBucket[(Ea - PPC_KERNELDATA_BASE) >> 2]++;
+        g_KdProfileLoads++;
+        if (g_KdProfileLoads >= 4000000u) {
+            g_KdProfileEnabled = FALSE;   // bounded sampling window
+        }
+    }
+}
+
+// Dump the top KernelData read-offsets and stop profiling.
+static VOID
+PpcKdProfileDump (
+    VOID
+    )
+{
+    UINTN B, K;
+    UINTN Best;
+    if (g_KdProfileLoads == 0) {
+        Print(L"  KDPROF: no KernelData loads captured\n");
+        g_KdProfileEnabled = FALSE;
+        return;
+    }
+    Print(L"  KDPROF: %d loads into 0x68FFE000.., top offsets:\n",
+          g_KdProfileLoads);
+    for (K = 0; K < 16; K++) {
+        Best = PPC_KERNELDATA_WORDS;
+        for (B = 0; B < PPC_KERNELDATA_WORDS; B++) {
+            if (g_KdBucket[B] != 0 &&
+                (Best == PPC_KERNELDATA_WORDS ||
+                 g_KdBucket[B] > g_KdBucket[Best])) {
+                Best = B;
+            }
+        }
+        if (Best == PPC_KERNELDATA_WORDS) {
+            break;
+        }
+        Print(L"    KD[+0x%03x] x%d\n", (UINT32)(Best * 4), g_KdBucket[Best]);
+        g_KdBucket[Best] = 0;
+    }
+    g_KdProfileEnabled = FALSE;
+}
+
+// TRUE when guest address Addr lies inside an installed writable region.
+// Used by the Phase A.4 merge-guard hook so a stale register pair can
+// never turn the harmonization into a wild write.
+static BOOLEAN
+PpcGuestAddrWritable (
+    IN UINT32 Addr
+    )
+{
+    UINTN I;
+    for (I = 0; I < PPC_MAX_GUEST_REGIONS; I++) {
+        if (g_GuestRegions[I].Active && !g_GuestRegions[I].ReadOnly &&
+            Addr >= g_GuestRegions[I].GuestBase &&
+            (UINT64)(Addr - g_GuestRegions[I].GuestBase) <
+                g_GuestRegions[I].Size) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 static BOOLEAN g_SccRxPending = FALSE;
 static UINT8 g_SccRxFifo[64];
 static UINTN g_SccRxFifoHead = 0;
@@ -3169,7 +3262,11 @@ PpcExecuteInstruction (
 
     // -------- Loads / stores --------
     case 32: // lwz
-        g_PpcContext.Gpr[RT(w)] = CpuRead32(EaD(w, RA(w)));
+        {
+            UINT32 Ea = EaD(w, RA(w));
+            PpcKdProfileLoad(Ea);
+            g_PpcContext.Gpr[RT(w)] = CpuRead32(Ea);
+        }
         break;
 
     case 33: // lwzu
@@ -3181,7 +3278,30 @@ PpcExecuteInstruction (
         break;
 
     case 34: // lbz
-        g_PpcContext.Gpr[RT(w)] = g_ReadByte(EaD(w, RA(w)));
+        {
+            UINT32 Ea = EaD(w, RA(w));
+            // PHASE A.3: the NK boot printer's Tx-empty poll (`lbz 2(r28)`
+            // at 0x40B26500) spins forever because NoIdeaR23 [KDP-0x900]
+            // is never seeded, so r28 = 0 and the poll reads low-memory
+            // byte 0x2 instead of the SCC status register at 0x20002.
+            // Force the ready answer at this one site: the banner flush
+            // proceeds and each character store is captured by the stb
+            // hook below, so NK boot output becomes visible on the host
+            // console exactly as it would on a real SCC.
+            if (CurrentAddress == 0x40B26500u) {
+                static UINTN SccPollHooks = 0;
+                SccPollHooks++;
+                if (SccPollHooks < 4 || (SccPollHooks & 0xFFFFF) == 1) {
+                    Print(L"  [SCC] poll-hook @0x40B26500 r28=0x%08x "
+                          L"(#%d) -> Tx-ready\n",
+                          g_PpcContext.Gpr[RA(w)], (UINT32)SccPollHooks);
+                }
+                g_PpcContext.Gpr[RT(w)] = 0x04;
+            } else {
+                PpcKdProfileLoad(Ea);
+                g_PpcContext.Gpr[RT(w)] = g_ReadByte(Ea);
+            }
+        }
         break;
 
     case 35: // lbzu
@@ -3205,7 +3325,29 @@ PpcExecuteInstruction (
         break;
 
     case 38: // stb
-        g_WriteByte(EaD(w, RA(w)), (UINT8)g_PpcContext.Gpr[RS(w)]);
+        {
+            UINT32 Ea = EaD(w, RA(w));
+            // PHASE A.3: capture the NK boot printer's output characters.
+            // With r28 = 0 the printer stores each banner byte to guest
+            // 0x6, which would trample low-memory globals; on real
+            // hardware this store goes to the SCC Tx register. Inside the
+            // flush-helper PC window, a low-addressed byte store IS the
+            // serial output: print it and swallow the store. Once r28 is
+            // properly seeded the effective address leaves the low page,
+            // the existing 0x20006 device handler takes over, and this
+            // hook goes quiet by itself.
+            if (CurrentAddress >= 0x40B264D8u && CurrentAddress <= 0x40B26560u &&
+                Ea < 0x100u) {
+                UINT8 Ch = (UINT8)g_PpcContext.Gpr[RS(w)];
+                if (Ch == 0x0D) {
+                    Print(L"\r\n");
+                } else if (Ch >= 0x20 && Ch <= 0x7E) {
+                    Print(L"%c", (UINTN)Ch);
+                }
+            } else {
+                g_WriteByte(Ea, (UINT8)g_PpcContext.Gpr[RS(w)]);
+            }
+        }
         break;
 
     case 39: // stbu
@@ -3217,7 +3359,11 @@ PpcExecuteInstruction (
         break;
 
     case 40: // lhz
-        g_PpcContext.Gpr[RT(w)] = CpuRead16(EaD(w, RA(w)));
+        {
+            UINT32 Ea = EaD(w, RA(w));
+            PpcKdProfileLoad(Ea);
+            g_PpcContext.Gpr[RT(w)] = CpuRead16(Ea);
+        }
         break;
 
     case 41: // lhzu
@@ -4288,6 +4434,10 @@ UINTN TbProbe = 0;
 
     g_PpcContext.ExceptionPending = 0;
 
+    // PHASE A.5: profile KernelData reads from the moment the guest starts;
+    // PpcKdProfileDump() reports the consumed offsets at the 68K handoff.
+    g_KdProfileEnabled = TRUE;
+
     // MaxInstructions == 0 means run indefinitely until error or halt.
     while (MaxInstructions == 0 || Executed < MaxInstructions) {
         UINT32 Instr;
@@ -4297,6 +4447,78 @@ UINTN TbProbe = 0;
 
         Instr = CpuRead32(g_PpcContext.Pc);
         Current = g_PpcContext.Pc;
+
+        // ---- PHASE A diagnostic: recursive-spinlock entry snapshot ----
+        // The NK cold path can park in its recursive-spinlock list walk
+        // (0x40B127A8) when a lock node references an owner that will never
+        // release. Dump the lock header, the first nodes and the last PCs
+        // once so the wait object and its caller can be identified.
+        if (Current == 0x40B127A8u) {
+            STATIC BOOLEAN SpinProbed = FALSE;
+            if (!SpinProbed && Executed != 0) {
+                UINT32 R22 = g_PpcContext.Gpr[22];
+                UINT32 R31 = g_PpcContext.Gpr[31];
+                UINTN K;
+                SpinProbed = TRUE;
+                Print(L"  SPINLOCK enter @0x40B127A8 r22=%08x r31=%08x "
+                      L"[r22-4]=%08x [r30-0xB30]=%08x SRR1=%08x LR=%08x\n",
+                      R22, R31,
+                      CpuRead32(R22 - 4),
+                      CpuRead32(CpuRead32(R22 - 4) - 0xB30),
+                      g_PpcContext.Srr1, g_PpcContext.Lr);
+                Print(L"  SPINLOCK node r31: next=%08x f4=%08x d8=%08x dC=%08x\n",
+                      CpuRead32(R31), CpuRead32(R31 + 4),
+                      CpuRead32(R31 + 8), CpuRead32(R31 + 0xC));
+                Print(L"  SPINLOCK sprg0-3: %08x %08x %08x %08x "
+                      L"r1=%08x r2=%08x r13=%08x\n",
+                      g_PpcContext.Spr[272], g_PpcContext.Spr[273],
+                      g_PpcContext.Spr[274], g_PpcContext.Spr[275],
+                      g_PpcContext.Gpr[1], g_PpcContext.Gpr[2],
+                      g_PpcContext.Gpr[13]);
+                Print(L"  SPINLOCK last %d PCs:", (UINTN)(TailCount < 48 ? TailCount : 48));
+                for (K = 0; K < 48 && K < TailCount; K++) {
+                    UINTN Idx = (TailStart + 4096 - 1 - K) % 4096;
+                    Print(L" %08x/%04x", TailPc[Idx],
+                          (UINT16)(TailInst[Idx] >> 16));
+                    if ((K & 7) == 7) Print(L"\n     ");
+                }
+                Print(L"\n");
+            }
+        }
+
+        // ---- PHASE A.4: area-merge guard harmonization ----
+        // The NK's area manager merges a newly created area into an
+        // existing one only when several tail fields (+0x24/+0x28/+0x2C)
+        // of the two area records compare equal. On real hardware the
+        // boot-time pool is pre-zeroed so the check passes; here those
+        // offsets still hold pool garbage, the compare fails and the NK
+        // panics into the nanodebugger. At both guard sites (the cmpl at
+        // 0x40B1F614 and its follow-up block at 0x40B1F668; r24 =
+        // existing area, r31 = new area), copy the existing record's
+        // fields over the new one before the compare runs -- the same
+        // state real boot guarantees. Pointer sanity is enforced so a
+        // stale register pair can never turn this into a wild write.
+        if (Current == 0x40B1F614u || Current == 0x40B1F668u) {
+            UINT32 Ex = g_PpcContext.Gpr[24];
+            UINT32 Nw2 = g_PpcContext.Gpr[31];
+            STATIC BOOLEAN MergeHarmonized = FALSE;
+            if ((Ex & 3) == 0 && (Nw2 & 3) == 0 &&
+                PpcGuestAddrWritable(Ex + 0x2C) &&
+                PpcGuestAddrWritable(Nw2 + 0x2C)) {
+                CpuWrite32(Nw2 + 0x24, CpuRead32(Ex + 0x24));
+                CpuWrite32(Nw2 + 0x28, CpuRead32(Ex + 0x28));
+                CpuWrite32(Nw2 + 0x2C, CpuRead32(Ex + 0x2C));
+                if (!MergeHarmonized) {
+                    MergeHarmonized = TRUE;
+                    Print(L"  A4 MERGE-HARMONIZE @0x%08x ex=0x%08x new=0x%08x "
+                          L"[+24]=%08x [+28]=%08x [+2C]=%08x\n",
+                          Current, Ex, Nw2,
+                          CpuRead32(Ex + 0x24), CpuRead32(Ex + 0x28),
+                          CpuRead32(Ex + 0x2C));
+                }
+            }
+        }
+
         // ---- 68K DR-emulator software-function hooks ----
         // The ROM dispatches certain 68K opcodes through "software function"
         // pointers stored in ed.v (offsets 0x800..0x834 of the emulator data
@@ -4621,6 +4843,10 @@ UINTN TbProbe = 0;
                   L"LR=0x%08x MSR=0x%08x\n",
                   Current, g_PpcContext.Gpr[1], g_PpcContext.Gpr[4],
                   g_PpcContext.Lr, g_PpcContext.Msr);
+            // PHASE A.5: report which KernelData fields the NK actually
+            // consumed during boot -- the seed list future hardware-field
+            // work must provide.
+            PpcKdProfileDump();
             // The nanokernel zeroed low memory during its boot, wiping the XLM
             // globals PpcPatchNewWorldRom wrote. Restore them at the exact
             // moment of the 68K handoff: the emulator-start routine reads
@@ -4633,7 +4859,7 @@ UINTN TbProbe = 0;
             CpuWrite32(PPC_XLM_RUN_MODE_OFFSET,    0x00000000);  // MODE_68K
             CpuWrite32(PPC_XLM_68K_R25_OFFSET,     0x00000000);
             CpuWrite32(PPC_XLM_IRQ_NEST_OFFSET,    0x00000000);
-            CpuWrite32(PPC_XLM_PVR_OFFSET,         0x00390000);  // PowerPC 7455 (G4)
+            CpuWrite32(PPC_XLM_PVR_OFFSET,         0x000C0000);  // PowerPC 7400 (G4)
             CpuWrite32(PPC_XLM_BUS_CLOCK_OFFSET,   100000000);  // 100 MHz bus clock
             Print(L"  EMUTRAP XLM restored: [2800]=0x%08x [2804]=0x%08x "
                   L"[2818]=0x%08x\n",
@@ -4741,19 +4967,24 @@ UINTN TbProbe = 0;
                       CpuRead32(R1 + 0x80 + 8 * K));
             }
         }
-        // PMDT RAM injection (one-shot): the DR=1 boot path skips the NK's PMDT
-        // builder, so the table only has the [0xFFF7,9] top-of-block-0
-        // reservation followed by 63 zero entries. The walk dispatches on
-        // flags&0xE00: 0 = area create, 0xC00 = special area, any other value
-        // with page=0 && count=0xFFFF = chunk terminator (r26 += 256MB).
-        // Rewrite chunk 0's table as reservation + [0,0xFFF6) RAM + a real
-        // terminator, and point chunks 1..15 at the terminator entry so each
-        // 256MB chunk walks cleanly and the walk ends when r26 wraps.
+        // PMDT RAM injection (one-shot, PHASE A.2): only for the degenerate
+        // warm-boot path where the NK's PMDT builder was skipped (MSR[DR]
+        // hack) and the table holds nothing beyond the top-of-block
+        // reservation. With Phase A.1 the NK boots cold and its own builder
+        // populates the table from the caller structure's VM page counts, so
+        // the walk must consume the BUILT table: the injection is skipped
+        // whenever entry 1 already describes real pages. The injected layout
+        // itself stays available as a fallback for warm-path experiments.
         if (PmdFixed == 0 && Current == 0x40B1F418) {
             UINT32 Base = g_PpcContext.Gpr[25];
             UINT32 R1  = g_PpcContext.Gpr[1];
             UINT32 K;
             PmdFixed = 1;
+            if (CpuRead16(Base + 8) != 0 || CpuRead16(Base + 10) != 0) {
+                Print(L"  PMDTINJECT skipped: builder-produced table at "
+                      L"0x%08x (entry1 page=0x%04x count=0x%04x)\n",
+                      Base, CpuRead16(Base + 8), CpuRead16(Base + 10));
+            } else {
             // chunk 0 table: r25 was already loaded from [r1+0x78] (original
             // pointer array); rewrite it explicitly for self-consistency.
             CpuWrite32(R1 + 0x78, Base);
@@ -4780,6 +5011,7 @@ UINTN TbProbe = 0;
             CpuWrite32(Base + 28, 0x00000400);
             Print(L"  PMDTINJECT base=0x%08x chunk0=[0xFFF7,9]+[0,0xFFF6]+TERM chunks1..15=TERM\n",
                   Base);
+            }
         }
         // PMDT table dump: 0x40B1F418 ('lwz r17, 4(r25)') is the top of the
         // per-chunk entry scan; r25 holds the current 8-byte entry base. Dump 64
