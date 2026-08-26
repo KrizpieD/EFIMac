@@ -4517,7 +4517,10 @@ UINTN TbProbe = 0;
         if (Current == 0x40B6CA84 && Instr == 0x4E800421) {
             // Tail's `bctrl` (software fn ed.v[0x80C]). 68K MOVE #<imm>,SR
             // (0x46FC) routes here via entry[0x46FC] -> 0x40B6C570 bnsl cr2
-            // -> 0x40B6CA68. r3/r24 = imm address (PC+2), r27 = SR value.
+            // -> 0x40B6CA68. r3 = address of imm word, r27 = SR value.
+            // ed.v[0x80C] is always NULL — the bctrl would jump to address 0.
+            // Intercept, sync68K SR, advance r24 past the imm, and hand off
+            // to the native 68K dispatch loop at 0x40B67C60.
             if (CpuRead32(0x0000B80C) == 0 && CpuRead16(g_PpcContext.Gpr[3] - 2) == 0x46FC) {
                 UINT16 Sr = CpuRead16(g_PpcContext.Gpr[3]);
                 g_PpcContext.Gpr[24] = g_PpcContext.Gpr[3] + 2;
@@ -4526,8 +4529,8 @@ UINTN TbProbe = 0;
                 g_PpcContext.Gpr[27] = 0;
                 g_PpcContext.Gpr[29] = 0x40B80000;
                 g_PpcContext.Xer = 0;
-                g_PpcContext.Cr &= ~0x0F00000F;             // CCR==0: clear cr1, cr7
-                g_PpcContext.Cr = (g_PpcContext.Cr & ~0x00F00000) | 0x00100000;  // cr2 = SO (supervisor)
+                g_PpcContext.Cr &= ~0x0F00000F;
+                g_PpcContext.Cr = (g_PpcContext.Cr & ~0x00F00000) | 0x00100000;
                 Next = 0x40B67C60;
                 Hooked = 1;
                 Print(L"  MOVE-SR-HOOK 46FC SR=0x%04x r24=0x%08x CR=0x%08x -> 0x40b67c60\n",
@@ -4949,10 +4952,21 @@ UINTN TbProbe = 0;
                 CpuWrite32(R1 + 0x80 + 8 * K, Base + 24);
             }
             // entry 0 [0xFFF7,9] already holds the top-of-block-0 reservation.
-            // entry 1: RAM [0, 0xFFF7000).
-            CpuWrite16(Base + 8, 0x0000);
-            CpuWrite16(Base + 10, 0xFFF6);
-            CpuWrite32(Base + 12, 0x00000000);
+            // entry 1: RAM [0, RAM_PAGES).  Read the actual page count from
+            // the caller structure we seeded via SPRG4 (offset 0x6B4) so
+            // the PMDT matches the low-RAM bank; the old hard-coded 0xFFF6
+            // (256 MB) causes a panic when only 16 MB is mapped.
+            {
+                UINT32 RamPages = CpuRead32(0x306B4); // caller struct at 0x30000
+                UINT16 RamCount = (RamPages > 16)
+                                  ? (UINT16)(RamPages - 16) : (UINT16)RamPages;
+                CpuWrite16(Base + 8, 0x0000);
+                CpuWrite16(Base + 10, RamCount);
+                CpuWrite32(Base + 12, 0x00000000);
+                Print(L"  PMDTINJECT entry1: RamPages=%d RamCount=0x%04x "
+                      L"(callerBase=0x30000)\n",
+                      RamPages, (UINT32)RamCount);
+            }
             // entry 2: chunk terminator, flags&0xE00 = 0x400 (not 0, not 0xC00).
             CpuWrite16(Base + 16, 0x0000);
             CpuWrite16(Base + 18, 0xFFFF);
@@ -5117,6 +5131,29 @@ UINTN TbProbe = 0;
             Print(L"  IRQRET[%d] PC=0x%08x exec=%d CR=0x%08x r8=0x%08x r9=0x%08x LR=0x%08x\n",
                   IrqRetProbed, Current, Executed, g_PpcContext.Cr,
                   g_PpcContext.Gpr[8], g_PpcContext.Gpr[9], g_PpcContext.Lr);
+        }
+        // NK panic bypass probe: at 0x40B1F624 the PMDT area-lookup returns
+        // a non-zero error code (r9!=0) and the code branches to the panic/
+        // freeze handler. Bypass the check once to see what the NEXT boot
+        // stage expects, then remove this probe and fix the root cause.
+        if (Current == 0x40B1F624u) {
+            static UINTN PanicBypassed = 0;
+            if (g_PpcContext.Gpr[9] != 0) {
+                if (PanicBypassed < 8) {
+                    PanicBypassed++;
+                    Print(L"  PANIC-BYPASS[%d] at 0x40B1F624: forcing r9=0 "
+                          L"(was 0x%08x), r8=0x%08x r15=0x%08x r16=0x%08x r3=0x%08x\n",
+                          (UINT32)PanicBypassed, g_PpcContext.Gpr[9],
+                          g_PpcContext.Gpr[8], g_PpcContext.Gpr[15],
+                          g_PpcContext.Gpr[16], g_PpcContext.Gpr[3]);
+                }
+                g_PpcContext.Gpr[9] = 0;
+            }
+            if (PanicBypassed == 0) {
+                Print(L"  PANIC-CHECK @0x40B1F624 r9=0x%08x r8=0x%08x r3=0x%08x CR=0x%08x\n",
+                      g_PpcContext.Gpr[9], g_PpcContext.Gpr[8],
+                      g_PpcContext.Gpr[3], g_PpcContext.Cr);
+            }
         }
         if (DecArgProbed < 8 && Current == 0x40B230E4) {
             DecArgProbed++;

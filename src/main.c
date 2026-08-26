@@ -703,19 +703,16 @@ efi_main (
             // caller[0x6B4]/[0x6B8] (copied to [r1+0x6B4]/[r1+0x6B8]). They are
             // 0 in the degenerate build -> zero virtual memory -> the PMDT gets
             // no RAM descriptors and the walk panics on duplicate [0,0xFFF].
-            // PHASE A.2: seed the page count from the ACTUAL guest RAM size
+            // PHASE A.2: seed the page count from the LOW-RAM bank size
             // (4 KB pages) so the NK's PMDT builder describes exactly the
-            // memory this guest map provides.
+            // contiguous physical memory at address 0. The main 256 MB RAM
+            // at 0x10000000 is handled separately by the DR emulator; if
+            // we tell the NK about 256 MB here, its PMDT area converter
+            // will try to map pages that don't physically exist and panic
+            // (NULL return from area lookup for unmapped pages).
             {
-              VOID*  HostBase  = NULL;
-              UINT64 GuestBase = 0;
-              UINT64 GuestSize = 0;
-              UINT32 RamPages  = 0;
-              if (EFI_ERROR(PpcGetGuestMemoryRegion(&HostBase, &GuestBase,
-                                                    &GuestSize))) {
-                GuestSize = 0x10000000;   // 256 MB fallback
-              }
-              RamPages = (UINT32)(GuestSize >> 12);
+              UINT32 LowRamPages = 0x1000000u / EFI_PAGE_SIZE; // 16 MB
+              UINT32 RamPages = LowRamPages;
               PpcWriteGuestByte(B + 0x6B4 + 0, (UINT8)(RamPages >> 24));
               PpcWriteGuestByte(B + 0x6B4 + 1, (UINT8)(RamPages >> 16));
               PpcWriteGuestByte(B + 0x6B4 + 2, (UINT8)(RamPages >> 8));
@@ -726,7 +723,7 @@ efi_main (
               PpcWriteGuestByte(B + 0x6B8 + 3, (UINT8)(RamPages));
               Print(L"  Seeded VMMaxVirtualPages/VMLogicalPages = %d pages "
                     L"(%d MB) at caller[0x6B4]/[0x6B8]\n",
-                    RamPages, (UINT32)(GuestSize >> 20));
+                    RamPages, (UINT32)(RamPages * EFI_PAGE_SIZE >> 20));
             }
           }
           Print(L"  Seeded SPRG4 caller structure at 0x30000: version [0x30FE4]=0x0101\n");

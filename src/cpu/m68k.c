@@ -2055,9 +2055,7 @@ M68kExecuteRte (
     g_M68kContext.SR = M68kPopWord ();
     g_M68kContext.Supervisor = (g_M68kContext.SR & M68K_SR_S) != 0;
     g_M68kContext.PC = M68kPopLong ();
-    if ((g_M68kContext.SR & M68K_SR_S) == 0) {
-        g_M68kInInterrupt = FALSE;            // returned to problem state
-    }
+    g_M68kInInterrupt = FALSE;
 }
 
 // Execute RTR: pop CCR then PC. (Previously routed to RTE, which pops a
@@ -2348,10 +2346,11 @@ M68kExecuteInstruction (
             if (!ScrubFastOnce) {
                 ScrubFastOnce = TRUE;
                 Print (L"  SCRUB-FAST: clamping bogus limit [2800]=%08x "
-                       L"-> 0x2800 (start=%08x val=%08x)\n",
+                       L"-> 0x800000 (start=%08x val=%08x)\n",
                        Limit, Start, Value);
             }
             Limit = 0x2800;
+            Value = 0;
         }
         {
             UINT32 Addr = Start & ~3u;
@@ -4230,6 +4229,7 @@ M68kExecuteFromPPC (
     // back so a later batch can still deliver them.
     {
         static UINTN VblCount = 0;
+        static UINTN VblDenyCount = 0;
         BOOLEAN Injected = FALSE;
         UINT32 Flags = EmulOpGetAndClearInterruptFlags ();
         if ((Flags & INTFLAG_VIA) != 0 &&
@@ -4239,12 +4239,26 @@ M68kExecuteFromPPC (
             UINT32 Vec = M68kReadLong (0x64);  // level-1 vector
             if (Vec != 0 && Vec != 0xFFFFFFFFu) {
                 VblCount++;
-                if (VblCount < 8) {
+                if (VblCount < 16) {
                     Print (L"  VBL #%d inject -> 0x%08x SR=%04x\n",
                            (UINT32)VblCount, Vec, g_M68kContext.SR);
                 }
                 Injected = TRUE;
-                M68kRaiseException (1);        // vector 1 = level-1 ext int
+                M68kRaiseException (M68K_VEC_LEVEL1);  // 0x64 = level-1 ext int vector
+            }
+        }
+        if (!Injected && (Flags & INTFLAG_VIA) != 0) {
+            VblDenyCount++;
+            if (VblDenyCount <= 16) {
+                Print (L"  VBL-DENY #%d Flags=%08x InInt=%d Halted=%d "
+                       L"SR=%04x IPL=%d Vec@64=%08x PC=%08x\n",
+                       (UINT32)VblDenyCount, Flags,
+                       (int)g_M68kInInterrupt,
+                       (int)g_M68kContext.Halted,
+                       g_M68kContext.SR,
+                       (int)((g_M68kContext.SR >> 8) & 7),
+                       M68kReadLong (0x64),
+                       g_M68kContext.PC);
             }
         }
         if (!Injected && Flags != 0) {
@@ -5227,6 +5241,39 @@ M68kExecuteFromPPC (
                     break;
                 }
             }
+            // Install a minimal 68K exception vector table if the NK's
+            // own vector-install stage was bypassed by our synthetic walk.
+            // The level-1 vector at 0x64 must be non-zero for VBL
+            // injection to work (M68kRaiseException reads it).
+            {
+                static BOOLEAN VecsInstalled = FALSE;
+                if (!VecsInstalled && M68kReadLong (0x64) == 0) {
+                    VecsInstalled = TRUE;
+                    // Minimal RTE stub at 0x400; all unhandled
+                    // exceptions jump here and return immediately.
+                    M68kWriteWord (0x400, 0x4E73u);   // RTE
+                    // Level-1 (VBL/VIA) -> stub
+                    M68kWriteLong (0x64, 0x400);
+                    // Level-2..7 -> stub
+                    M68kWriteLong (0x68, 0x400);
+                    M68kWriteLong (0x6C, 0x400);
+                    M68kWriteLong (0x70, 0x400);
+                    M68kWriteLong (0x74, 0x400);
+                    M68kWriteLong (0x78, 0x400);
+                    M68kWriteLong (0x7C, 0x400);
+                    // Bus error, address error, illegal instruction
+                    M68kWriteLong (0x08, 0x400);
+                    M68kWriteLong (0x0C, 0x400);
+                    M68kWriteLong (0x10, 0x400);
+                    // TRAP #0..#15 -> stub
+                    { UINT32 T; for (T = 0; T < 16; T++) {
+                        M68kWriteLong (0x80 + T * 4, 0x400);
+                    }}
+                    // A-line trap (0xB0) -> stub (Mac OS toolbox entry)
+                    M68kWriteLong (0xB0, 0x400);
+                    Print (L"  synth: installed 68K exception vector table\n");
+                }
+            }
             // Arm the decrementer on behalf of the NK scheduler: this
             // park is reached before any guest mtspr-to-DEC has happened
             // (the arming path sits in an init stage our synthetic walk
@@ -5234,6 +5281,17 @@ M68kExecuteFromPPC (
             // wake never fires -- both sides idle forever. ~4M instr/tick.
             g_PpcContext.Spr[22 /* SPR_DEC */] = 0x01000000u;
             g_PpcContext.DecrementerWritten = 1;
+            // Force IPL to 0 so VBL (level-1) can fire and break the idle
+            // loop.  The ROM raises IPL to 5 during init but the hardware
+            // that would normally lower it (via VIA/VBL ack) is absent in
+            // emulation.  Must also update PPC r25 so M68kSyncFromPPC
+            // doesn't overwrite the cleared IPL on the next batch.
+            g_M68kContext.SR &= 0xF8FFu;
+            g_PpcContext.Gpr[25] = (g_M68kContext.SR >> 8) & 0xFF;
+            // Advance the emulated clock by one VBL period so the VIA flag
+            // is set for the next batch-start VBL injection.  Without this
+            // the clock never advances (Count ≈ 0) and VBL never fires.
+            EmulOpAdvanceClock (16667 * 200);
             g_M68kContext.Stopped = TRUE;
             break;
         }

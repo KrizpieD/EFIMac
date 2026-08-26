@@ -68,9 +68,9 @@ extern M68K_CPU_CONTEXT g_M68kContext;
 #define M68K_SR_T1   0x8000  // Trace mode 1
 #define M68K_SR_T0   0x4000  // Trace mode 0
 #define M68K_SR_S    0x2000  // Supervisor (1) / User (0)
-#define M68K_SR_I2   0x1000  // Interrupt mask bit 2
-#define M68K_SR_I1   0x0800  // Interrupt mask bit 1
-#define M68K_SR_I0   0x0400  // Interrupt mask bit 0
+#define M68K_SR_I2   0x0400  // Interrupt mask bit 2 (bit 10)
+#define M68K_SR_I1   0x0200  // Interrupt mask bit 1 (bit 9)
+#define M68K_SR_I0   0x0100  // Interrupt mask bit 0 (bit 8)
 
 // ---------------------------------------------------------------------------
 // 68K exception vector numbers
