@@ -2669,33 +2669,23 @@ M68kExecuteInstruction (
     }
     // ---- END second scrub fast path -------------------------------------
 
-    // Dead table-JSR interceptor (MacOS-side init): at 0x4087CA86 the
-    // startup calls JSR (A0,A1.L*1-31) — another unseeded NK dispatch
-    // table. DISABLED after A/B test: skipping diverts flow into $FF-
-    // filled low RAM (ILLEGAL) which is WORSE than the deterministic
-    // ZERO-EXEC guard halt. Kept for reference.
-    if (FALSE && Opcode == 0x4EB0u && g_M68kContext.PC - 2 == 0x4087CA86u &&
+    // Dead table-JSR probe (MacOS-side init): at 0x4087CA86 the startup
+    // calls JSR (A0,A1.L*1-31) through an unseeded NK dispatch table.
+    // LOGGER-ONLY: sample the computed table address across boots to test
+    // determinism; if it stabilizes we can synthesize the entry's handler
+    // bytes at that fixed location during install instead of intercepting.
+    if (Opcode == 0x4EB0u && g_M68kContext.PC - 2 == 0x4087CA86u &&
         M68kFetchWord ((UINT32)(g_M68kContext.PC)) == 0x81E1u) {
-        UINT32 BaseVal = g_M68kContext.A[0];
-        INT32 IdxVal = (INT32)(INT16)(UINT16)g_M68kContext.A[1];
-        UINT32 TableAddr = BaseVal + (UINT32)IdxVal - 31u;
-        UINT32 Target = M68kReadLong (TableAddr);
-        BOOLEAN Plausible = ((Target & 1) == 0) &&
-                            (Target >= 0x40800000u &&
-                             (Target < 0x41000000u ||
-                              Target >= 0xFFC00000u));
-        if (!Plausible) {
-            static UINTN Ca86Skip = 0;
-            Ca86Skip++;
-            if (Ca86Skip <= 8 || (Ca86Skip & 0xFF) == 0) {
-                Print (L"  CA86-SKIP #%d: [%08x]=%08x -> nop call\n",
-                       (UINT32)Ca86Skip, TableAddr, Target);
-            }
-            M68kWriteAn (7, M68kGetStackPointer () + 4);  // undo JSR push
-            g_M68kContext.D[0] = 0;
-            g_M68kContext.SR = (UINT16)((g_M68kContext.SR & 0xFF00) |
-                                        M68K_CCR_Z);
-            return 12;                     // PC already past the JSR
+        STATIC UINTN Ca86Probe = 0;
+        if (Ca86Probe < 20) {
+            Ca86Probe++;
+            UINT32 BaseVal = g_M68kContext.A[0];
+            INT32 IdxVal = (INT32)(INT16)(UINT16)g_M68kContext.A[1];
+            UINT32 TableAddr = BaseVal + (UINT32)IdxVal - 31u;
+            UINT32 Target = M68kReadLong (TableAddr);
+            Print (L"  CA86-PROBE #%d: base=%08x idx=%08x tbl=%08x "
+                   L"-> %08x\n", (UINT32)Ca86Probe, BaseVal,
+                   (UINT32)IdxVal, TableAddr, Target);
         }
     }
 
@@ -3269,6 +3259,22 @@ M68kExecuteInstruction (
                             g_M68kContext.A[7] += (UINT32)(s * 4);
                         }
                         break;
+                    }
+                }
+                if (!Fixed) {
+                    // Downward scan: when an epilogue over-pops past the
+                    // real return into an argument slot, the genuine
+                    // caller's frame lies BELOW the current stack pointer.
+                    // Resume there without touching SP (the callee already
+                    // applied its own frame adjustment).
+                    for (UINT8 s = 2; s < 48; s++) {
+                        UINT32 V = M68kReadLong ((UINT32)(Sp - s * 4));
+                        if ((V & 1u) == 0u &&
+                            V >= 0x40800000u &&
+                            (V < 0x41000000u || V >= 0xFFC00000u)) {
+                            Fixed = V;
+                            break;
+                        }
                     }
                 }
                 static INTN BadRtsCount = -1;

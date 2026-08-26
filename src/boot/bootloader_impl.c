@@ -1490,11 +1490,26 @@ PpcInstallSystemRom (
             UINTN W;
             for (W = 0; W < 3; W++) {
                 // Read-only: stray frame allocations from broken-stack eras
-                // must not corrupt the shared ROM host buffer.
+                // must not corrupt the shared ROM buffer.
                 EFI_STATUS S2 = PpcAddGuestMemoryRegion(
                     Buffer, ExtraWindows[W], (UINT32)Size, TRUE);
                 Print(L"ROM alias window %08x (%r)\n", ExtraWindows[W], S2);
             }
+        }
+
+        // SEEDING: trampoline soft-landing page. NK continuation jumps
+        // land at 0x7F40xx (page-stable, offset-varies) when the builder
+        // stage never ran. Fill 0x7F4000-0x7FFFFF with RTS instructions:
+        // a wild entry unwinds up the stack one frame per pop until it
+        // reaches a genuine caller, keeping the boot alive instead of
+        // executing zeros into the guard halt.
+        {
+            UINT32 A;
+            for (A = 0x7F4000u; A + 1 < 0x800000u; A += 2) {
+                PpcWriteGuestByte(A,     0x4E);
+                PpcWriteGuestByte(A + 1, 0x75);
+            }
+            Print(L"  trampoline soft-landing: RTS sled @7F4000-7FFFFF\n");
         }
 
         // SheepShaver-equivalent boot-structure patches
