@@ -3,7 +3,7 @@
 #include <efilib.h>
 
 // Global memory manager context
-STATIC PPC_MEMORY_MANAGER_CONTEXT g_MemoryManager = {0};
+static PPC_MEMORY_MANAGER_CONTEXT g_MemoryManager = {0};
 
 EFI_STATUS
 PpcInitializeMemoryManager (

@@ -1,6 +1,7 @@
 #include "interpreter.h"
 #include "translation.h"
 #include "m68k.h"
+#include "emul_op.h"
 #include "boot/bootloader.h"
 #include <efi.h>
 #include <efilib.h>
@@ -275,7 +276,7 @@ PPC_CPU_CONTEXT g_PpcContext = {0};
 // PpcAddGuestMemoryRegion(). Addresses not covered by any region read as
 // zero and ignore writes.
 // ---------------------------------------------------------------------------
-#define PPC_MAX_GUEST_REGIONS 8
+#define PPC_MAX_GUEST_REGIONS 20
 
 typedef struct {
     VOID*   HostBase;   // Host virtual address backing the region
@@ -574,6 +575,17 @@ PpcWriteGuestByte (
     IN UINT8  Value
     )
 {
+    // Trampoline-region watch: who (if anyone) populates 0x7F0000-0x800000
+    // where the NK expects continuation stubs? Both CPU paths funnel here.
+    {
+        static UINTN TrampWatchHits = 0;
+        if (TrampWatchHits < 48 &&
+            Address >= 0x7F0000u && Address < 0x800000u) {
+            TrampWatchHits++;
+            Print(L"  TRAMP-W [%08x]<-%02x r1=%08x pc=%08x\n",
+                  Address, Value, g_PpcContext.Gpr[1], g_PpcContext.Pc);
+        }
+    }
     g_WriteByte(Address, Value);
 }
 
@@ -636,6 +648,18 @@ static UINT32 CpuRead32 (UINT32 A) { return (CpuRead16(A) << 16) | CpuRead16(A +
 static VOID   CpuWrite16(UINT32 A, UINT32 V) { g_WriteByte(A, (UINT8)(V >> 8)); g_WriteByte(A + 1, (UINT8)V); }
 static VOID   CpuWrite32(UINT32 A, UINT32 V)
 {
+    // Continuation-value watch (PPC side): stores of addresses inside the
+    // NK trampoline region — the 68K stack gets its bogus RTS target from
+    // here (DR-emulator context save/restore), bypassing all 68K watches.
+    {
+        static UINTN PpcTrampValHits = 0;
+        if (PpcTrampValHits < 24 &&
+            V >= 0x7F0000u && V < 0x800000u) {
+            PpcTrampValHits++;
+            Print(L"  PPC-TRAMP-VAL [%08x]<-%08x pc=%08x r1=%08x\n",
+                  A, V, g_PpcContext.Pc, g_PpcContext.Gpr[1]);
+        }
+    }
     // NanoKernel guard-fill (poison) stores: the emulated handoff marks the
     // low pages holding the live 68K vector table, KDP, emulator-data area,
     // PSA and 68K stack as free pool, so the guest allocator scrubs them
@@ -643,7 +667,7 @@ static VOID   CpuWrite32(UINT32 A, UINT32 V)
     // words below 64K preserves the guest's own data; freed-block bodies
     // keep stale bytes, which the allocator treats as scratch anyway.
     if ((V == 0x68F168F1u || V == 0xD1E2D1E2u) && A < 0x10000u) {
-        STATIC UINTN PpcSprayHits = 0;
+        static UINTN PpcSprayHits = 0;
         if (PpcSprayHits < 400) {
             PpcSprayHits++;
             Print(L"PPC SPRAYWATCH val=0x%08x -> 0x%08x @PC=0x%08x r10=0x%08x r15=0x%08x\n",
@@ -657,7 +681,7 @@ static VOID   CpuWrite32(UINT32 A, UINT32 V)
     // seeds slot pointers. Anything else scribbling here corrupts chunk
     // tables mid-walk, so log writer PC + value + old contents.
     if (A >= 0xA078u && A < 0xB000u) {
-        STATIC UINTN KdpWriteHits = 0;
+        static UINTN KdpWriteHits = 0;
         if (KdpWriteHits < 40 && g_PpcContext.Pc != 0x40B1F418u &&
             g_PpcContext.Pc != 0x40B1F41Cu && g_PpcContext.Pc != 0x40B1F420u) {
             KdpWriteHits++;
@@ -2786,82 +2810,8 @@ PpcExecuteFpXform (
 // emul_ppc mapping: d0..d7 = r8..r15, a0..a6 = r16..r22, a7 = r1.
 // ---------------------------------------------------------------------------
 
-static UINTN g_EmulOpProbed = 0;
 
-STATIC VOID
-PpcEmulOp (
-    IN UINT32 Selector
-    )
-{
-    UINT32* Gpr = g_PpcContext.Gpr;
-
-    if (g_EmulOpProbed == 0) {
-        g_EmulOpProbed = 1;
-        Print(L"  EMULOP[%u] first: a7=0x%08x a0=0x%08x d0=0x%08x d1=0x%08x "
-              L"LR=0x%08x PC=0x%08x\n",
-              Selector, Gpr[1], Gpr[16], Gpr[8], Gpr[9],
-              g_PpcContext.Lr, g_PpcContext.Pc);
-    }
-
-    switch (Selector) {
-    case PPC_OP_BREAK:                    // breakpoint
-        break;
-
-    case PPC_OP_INSTIME:                  // InsTime(TMTask*): enqueue timer
-        Gpr[8] = 0;                       // noErr
-        break;
-
-    case PPC_OP_RMVTIME:                  // RmvTime(TMTask*)
-        Gpr[8] = 0;
-        break;
-
-    case PPC_OP_PRIMETIME:                // PrimeTime(TMTask*, UInt32)
-        Gpr[8] = 0;
-        break;
-
-    case PPC_OP_MICROSECONDS: {           // Microseconds(UnsignedWide*)
-        UINT32 Ptr = Gpr[16];
-        CpuWrite32(Ptr, 0);
-        CpuWrite32(Ptr + 4, 0);
-        break;
-    }
-
-    case PPC_OP_IDLE_TIME:                // idle loop callback
-        Gpr[16] = CpuRead32(0x2b6);       // CurrentA5
-        break;
-
-    case PPC_OP_IDLE_TIME_2:
-        Gpr[8] = (UINT32)-2;
-        break;
-
-    case PPC_OP_DEBUG_STR: {              // DebugStr(PascalString* on stack)
-        UINT32 Ptr = CpuRead32(Gpr[1] + 4);
-        UINT8  Len = g_ReadByte(Ptr);
-        UINTN  I;
-        Print(L"  DebugStr: \"");
-        for (I = 0; I < Len && I < 255; I++) {
-            UINT8 C = g_ReadByte(Ptr + 1 + I);
-            if (C >= 0x20 && C <= 0x7E) {
-                Print(L"%c", (UINTN)C);
-            }
-        }
-        Print(L"\"\n");
-        break;
-    }
-
-    default:
-        // Unimplemented selector: report and fail the request gracefully so
-        // the boot code skips the device/service instead of hanging on a
-        // phantom success.
-        Print(L"  EMULOP[%u] not implemented: a7=0x%08x a0=0x%08x d0=0x%08x "
-              L"d1=0x%08x\n",
-              Selector, Gpr[1], Gpr[16], Gpr[8], Gpr[9]);
-        Gpr[8] = 0xFFFFFFF4;              // noMacSW
-        break;
-    }
-}
-
-STATIC VOID
+static VOID
 PpcEmulatorDispatchOp (
     IN UINT32 Marker
     )
@@ -2875,7 +2825,9 @@ PpcEmulatorDispatchOp (
         g_PpcContext.Srr1 = g_PpcContext.Msr;
         return;
     }
-    PpcEmulOp(Marker - 3);
+    // PHASE C: full SheepShaver-faithful device handlers live in
+    // src/cpu/emul_op.c; the DR marker n maps to selector n - 3.
+    EmulOpDispatch(Marker - 3);
 }
 
 // ---------------------------------------------------------------------------
@@ -3140,7 +3092,7 @@ PpcExecuteInstruction (
                     // 68K emulator dispatch tables live at ED-relative offsets
                     // (r31 = EmulatorData). A near-zero CTR here means the
                     // opcode's handler slot was never initialized.
-                    STATIC UINTN BcctrZeroHits = 0;
+                    static UINTN BcctrZeroHits = 0;
                     UINT32 Ed = g_PpcContext.Gpr[31];
                     if (BcctrZeroHits < 4) {
                         BcctrZeroHits++;
@@ -4454,7 +4406,7 @@ UINTN TbProbe = 0;
         // release. Dump the lock header, the first nodes and the last PCs
         // once so the wait object and its caller can be identified.
         if (Current == 0x40B127A8u) {
-            STATIC BOOLEAN SpinProbed = FALSE;
+            static BOOLEAN SpinProbed = FALSE;
             if (!SpinProbed && Executed != 0) {
                 UINT32 R22 = g_PpcContext.Gpr[22];
                 UINT32 R31 = g_PpcContext.Gpr[31];
@@ -4501,7 +4453,7 @@ UINTN TbProbe = 0;
         if (Current == 0x40B1F614u || Current == 0x40B1F668u) {
             UINT32 Ex = g_PpcContext.Gpr[24];
             UINT32 Nw2 = g_PpcContext.Gpr[31];
-            STATIC BOOLEAN MergeHarmonized = FALSE;
+            static BOOLEAN MergeHarmonized = FALSE;
             if ((Ex & 3) == 0 && (Nw2 & 3) == 0 &&
                 PpcGuestAddrWritable(Ex + 0x2C) &&
                 PpcGuestAddrWritable(Nw2 + 0x2C)) {

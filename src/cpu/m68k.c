@@ -10,6 +10,7 @@
 #include "m68k.h"
 #include "interpreter.h"
 #include "translation.h"
+#include "emul_op.h"
 #include "boot/bootloader.h"
 #include <efi.h>
 #include <efilib.h>
@@ -20,10 +21,10 @@ UINT32 M68kGetStackPointer (VOID);
 // ---------------------------------------------------------------------------
 // Trace file logging
 // ---------------------------------------------------------------------------
-STATIC CHAR16 g_TraceBuf[8192];
-STATIC UINTN  g_TraceLen = 0;
+static CHAR16 g_TraceBuf[8192];
+static UINTN  g_TraceLen = 0;
 
-STATIC
+static
 VOID
 M68kTraceFlush (
     VOID
@@ -56,7 +57,7 @@ M68kTraceFlush (
     g_TraceLen = 0;
 }
 
-STATIC
+static
 VOID
 M68kTrace (
     IN CHAR16* Line
@@ -72,7 +73,7 @@ M68kTrace (
 }
 
 // Helper: write a formatted trace line using simple hex formatting
-STATIC
+static
 VOID
 M68kTraceLine (
     IN UINT32 Step,
@@ -105,7 +106,7 @@ UINTN g_M68kDebugSteps = 0;
 // Log any control transfer (JMP/JSR/RTS) that lands in low memory (<0x1000),
 // where only vectors/globals live — these indicate a bad thunk chain pointer.
 // ---------------------------------------------------------------------------
-STATIC UINTN g_M68kLowXferCount = 0;
+static UINTN g_M68kLowXferCount = 0;
 
 static VOID
 M68kLogLowTransfer (
@@ -181,16 +182,16 @@ M68kLogLowTransfer (
 
 // Recent-PC ring shared by the batch loop (runaway reports) and the
 // DR-service-call redirect (ping-pong detection).
-STATIC UINT32 g_LastPcRing[256];
-STATIC UINT16 g_LastOpRing[256];
-STATIC UINTN  g_LastPcIdx = 0;
+static UINT32 g_LastPcRing[256];
+static UINT16 g_LastOpRing[256];
+static UINTN  g_LastPcIdx = 0;
 
 // ---------------------------------------------------------------------------
 // Detect addresses that belong to the DR emulator's domain (PPC opcode table,
 // emulator code area).  Jumps into these regions must be intercepted and
 // redirected to A6 (the callback return address).
 // ---------------------------------------------------------------------------
-STATIC
+static
 BOOLEAN
 M68kIsDrEmulatorAddress (
     IN UINT32 Addr
@@ -251,7 +252,7 @@ M68kWriteWord (
     )
 {
     {
-        STATIC UINTN RomWatchWHits = 0;
+        static UINTN RomWatchWHits = 0;
         if (RomWatchWHits < 8 &&
             Address >= 0x4080AE00u && Address < 0x4080B000u) {
             RomWatchWHits++;
@@ -270,7 +271,7 @@ M68kWriteLong (
     )
 {
     {
-        STATIC UINTN RomWatchHits = 0;
+        static UINTN RomWatchHits = 0;
         if (RomWatchHits < 8 &&
             Address >= 0x4080AE00u && Address < 0x4080B000u) {
             RomWatchHits++;
@@ -282,7 +283,7 @@ M68kWriteLong (
         }
     }
     {
-        STATIC UINTN Ab4eWatchHits = 0;
+        static UINTN Ab4eWatchHits = 0;
         if (Ab4eWatchHits < 8 &&
             Value >= 0x4080AB00u && Value <= 0x4080ABFFu) {
             Ab4eWatchHits++;
@@ -297,7 +298,40 @@ M68kWriteLong (
         }
     }
     {
-        STATIC UINTN StoreWatchHits = 0;
+        // Trampoline-value watch: ANY store of an address inside the NK
+        // continuation-stub region, regardless of the store's mechanism
+        // (MOVE.L Dx,-(SP) bypasses M68kPushLong entirely).
+        static UINTN TrampValSeen = 0;
+        if (TrampValSeen < 24 &&
+            Value >= 0x7F0000u && Value < 0x800000u &&
+            Address < 0x7F0000u) {                 // exclude region itself
+            TrampValSeen++;
+            Print (L"  TRAMP-VAL [%08x] <- %08x @PC=%08x d0=%08x "
+                   L"d1=%08x a0=%08x a6=%08x sp=%08x\n",
+                   Address, Value, g_M68kContext.PC,
+                   g_M68kContext.D[0], g_M68kContext.D[1],
+                   g_M68kContext.A[0], g_M68kContext.A[6],
+                   M68kGetStackPointer ());
+        }
+    }
+    {
+        // Thunk-table watch: who initializes the NK MixedMode dispatch
+        // slots that the 0x4080A46x trampolines read via tbl(A0,D1.l)?
+        // Log every write into the region so the producer (or its
+        // absence) becomes visible.
+        static UINTN ThunkWatchHits = 0;
+        if (ThunkWatchHits < 48 &&
+            Address >= 0x40804960u && Address < 0x40804A00u) {
+            ThunkWatchHits++;
+            Print (L"  THUNK-W [%08x] <- %08x @PC=%08x d0=%08x d1=%08x "
+                   L"a0=%08x a1=%08x\n",
+                   Address, Value, g_M68kContext.PC,
+                   g_M68kContext.D[0], g_M68kContext.D[1],
+                   g_M68kContext.A[0], g_M68kContext.A[1]);
+        }
+    }
+    {
+        static UINTN StoreWatchHits = 0;
         if (StoreWatchHits < 24 &&
             Address >= 0x9E00u && Address < 0xA200u &&
             (Value == 0x68F168F1u || Value == 0xD1E2D1E2u)) {
@@ -394,14 +428,26 @@ M68kPushLong (
     IN UINT32 Value
     )
 {
+    // Continuation-target watch: pushes of addresses inside the NK
+    // trampoline region reveal who sets up the bogus callback target.
+    {
+        static UINTN TrampPushSeen = 0;
+        if (TrampPushSeen < 24 &&
+            Value >= 0x7F0000u && Value < 0x800000u) {
+            TrampPushSeen++;
+            Print (L"  TRAMP-PUSH %08x @PC=%08x sp->%08x\n",
+                   Value, g_M68kContext.PC,
+                   (UINT32)(M68kGetStackPointer () - 4));
+        }
+    }
     UINT32 Sp = M68kGetStackPointer () - 4;
     M68kSetStackPointer (Sp);
     M68kWriteLong (Sp, Value);
     {
-        STATIC UINT32 LastPushVal[64];
-        STATIC UINT32 LastPushSp[64];
-        STATIC UINTN  LastPushIdx = 0;
-        STATIC UINTN  PushCount = 0;
+        static UINT32 LastPushVal[64];
+        static UINT32 LastPushSp[64];
+        static UINTN  LastPushIdx = 0;
+        static UINTN  PushCount = 0;
         LastPushVal[LastPushIdx] = Value;
         LastPushSp[LastPushIdx] = Sp;
         LastPushIdx = (LastPushIdx + 1) % 64;
@@ -926,6 +972,18 @@ M68kReadEA (
     } else {
         BOOLEAN IsMem = M68kComputeEA (Opcode, &EA, NULL);
         if (!IsMem && Mode >= 2) return 0;
+    }
+
+    // Post-increment AFTER reading (mode 3): mirrors M68kWriteEA. Without
+    // this every "(An)+" SOURCE operand left the register unadvanced,
+    // desynchronizing caller frames (the BAD-RTS storm root cause).
+    if (Mode == 3) {
+        UINT8 IncSize = (Size == M68K_SIZE_LONG) ? 4 :
+                        (Size == M68K_SIZE_WORD) ? 2 : 1;
+        if (IncSize < 2) IncSize = 2;
+        UINT32 Base = (Reg == 7) ? M68kGetStackPointer ()
+                                 : g_M68kContext.A[Reg];
+        M68kWriteAn (Reg, Base + IncSize);
     }
 
     UINT32 Result;
@@ -1956,6 +2014,11 @@ M68kExecuteAndiEoriOriSr (
     g_M68kContext.Supervisor = (g_M68kContext.SR & M68K_SR_S) != 0;
 }
 
+// Set while a 68K exception is being serviced (raised but not yet RTE'd).
+// Prevents the host-side VBL injector from nesting interrupts inside the
+// handler chain.
+BOOLEAN g_M68kInInterrupt = FALSE;
+
 // Execute STOP #imm
 static VOID
 M68kExecuteStop (
@@ -1992,6 +2055,22 @@ M68kExecuteRte (
     g_M68kContext.SR = M68kPopWord ();
     g_M68kContext.Supervisor = (g_M68kContext.SR & M68K_SR_S) != 0;
     g_M68kContext.PC = M68kPopLong ();
+    if ((g_M68kContext.SR & M68K_SR_S) == 0) {
+        g_M68kInInterrupt = FALSE;            // returned to problem state
+    }
+}
+
+// Execute RTR: pop CCR then PC. (Previously routed to RTE, which pops a
+// FULL SR word — corrupting the interrupt mask and consuming a word that
+// belongs to the return address.)
+static VOID
+M68kExecuteRtr (
+    VOID
+    )
+{
+    UINT16 Ccr = M68kPopWord ();
+    g_M68kContext.SR = (UINT16)((g_M68kContext.SR & 0xFF00) | (Ccr & 0xFF));
+    g_M68kContext.PC = M68kPopLong ();
 }
 
 // Execute TRAP #vector
@@ -2014,7 +2093,7 @@ M68kExecuteIllegal (
     UINTN K;
     Print (L"  68K ILLEGAL INSTRUCTION: 0x%04x at PC=0x%08x\n", Opcode, g_M68kContext.PC - 2);
     {
-        STATIC BOOLEAN RingShown = FALSE;
+        static BOOLEAN RingShown = FALSE;
         if (!RingShown) {
             RingShown = TRUE;
             Print (L"  ILLEGAL last 64 PCs:");
@@ -2043,6 +2122,7 @@ M68kRaiseException (
     // Set supervisor mode
     g_M68kContext.SR |= M68K_SR_S;
     g_M68kContext.Supervisor = TRUE;
+    g_M68kInInterrupt = TRUE;
 
     // Read vector address from exception table
     UINT32 VecAddr = M68kReadLong ((UINT32)VectorNumber);
@@ -2243,6 +2323,616 @@ M68kExecuteInstruction (
     UINT16 Opcode = M68kFetchWord (g_M68kContext.PC);
     g_M68kContext.PC += 2;
     g_M68kContext.CurrentOpcode = Opcode;
+
+    // ---- PHASE B: low-memory scrub-loop fast path -----------------------
+    // The New World boot clears low memory with the tight sequence
+    //   0x408005F2: MOVE.L D1,(A0)      (20 C1)
+    //   0x408005F4: CMPA.L (A1),A0      (B1 C9)   bound lives at [A1]
+    //   0x408005F6: BCS.S back          (65 FA)
+    // i.e. it fills longwords from A0 while A0 < [A1]. Executing this one
+    // store at a time costs thousands of interpreter iterations; complete
+    // the whole fill in one step with identical exit semantics.
+    if (g_M68kContext.PC - 2 == 0x408005F4u &&
+        Opcode == 0xB1C9u &&
+        M68kFetchWord (0x408005F2u) == 0x20C1u &&
+        M68kFetchWord (0x408005F6u) == 0x65FAu &&
+        g_M68kContext.A[1] == 0x2800u) {
+        static BOOLEAN ScrubFastOnce = FALSE;
+        UINT32 Limit = M68kReadLong (g_M68kContext.A[1]);
+        UINT32 Start = g_M68kContext.A[0];
+        UINT32 Value = g_M68kContext.D[1];
+        // The XLM signature slot doubles as the scrub bound. If it holds a
+        // value that is clearly not an address (XLM 'Baah', uninit FFFF...),
+        // clamp to the canonical New World low-memory scrub end.
+        if ((INT32)Limit <= 0 || Limit > 0x00100000u) {
+            if (!ScrubFastOnce) {
+                ScrubFastOnce = TRUE;
+                Print (L"  SCRUB-FAST: clamping bogus limit [2800]=%08x "
+                       L"-> 0x2800 (start=%08x val=%08x)\n",
+                       Limit, Start, Value);
+            }
+            Limit = 0x2800;
+        }
+        {
+            UINT32 Addr = Start & ~3u;
+            UINTN Longs = 0;
+            while (Addr + 4 <= Limit) {
+                M68kWriteLong (Addr, Value);
+                Addr += 4;
+                Longs++;
+            }
+            while (Addr < Limit) {           // rare non-aligned tail
+                M68kWriteByte (Addr, (UINT8)(Value >> ((Addr & 3) * 8)));
+                Addr++;
+            }
+            g_M68kContext.A[0] = Addr;
+            if (!ScrubFastOnce || Longs > 0) {
+                static UINTN ScrubFastCount = 0;
+                ScrubFastCount++;
+                if (ScrubFastCount <= 6 ||
+                    (ScrubFastCount & 0x3FF) == 0) {
+                    Print (L"  SCRUB-FAST #%d: fill %08x..%08x (%d longs, "
+                           L"val=%08x)\n", (UINT32)ScrubFastCount,
+                           Start, Limit, (UINT32)Longs, Value);
+                }
+            }
+        }
+        // Exit semantics: the real loop leaves via BCS.S when C=0, which
+        // happens when A0 >= limit. With A0 now == limit the comparison is
+        // equal -> Z=1, C=0; PC already points at the BCS.S, which now
+        // falls through to RTS.
+        g_M68kContext.SR = (UINT16)((g_M68kContext.SR & ~(M68K_CCR_N |
+                                M68K_CCR_Z | M68K_CCR_V | M68K_CCR_C)) | M68K_CCR_Z);
+        return 16;                           // approximate cycles
+    }
+    // ---- END scrub fast path --------------------------------------------
+
+    // ---- Resolver-wedge escape (see note below; lives here because most
+    // boot-time guest code runs via M68kExecuteBlock, which bypasses the
+    // ExecuteFromPPC probe ring). The patch-era resolver can wedge cycling
+    // E022<->E04A when its table lookup depends on NK state our environment
+    // lacks (Apple's NK pre-patches these stages on real hardware).
+    // Signature: the back-branch BGT.S at E04A repeats with an unchanged
+    // D0/D1 pair. Unwind to the trampoline continuation at 0x408001EE when
+    // its return word (0x408001E8) is on the stack; otherwise fall back to
+    // the closest plausible ROM return address.
+    if (Opcode == 0x6ED6u && g_M68kContext.PC - 2 == 0x4080E04Au) {
+        static UINT32 RLastSig = 0;
+        static UINTN RReps = 0;
+        // EXPERIMENT (c): escape DISABLED — test whether NK's resolver
+        // completes on its own now that the (An)+ post-increment bug is
+        // fixed (the original wedge was likely a frame-desync victim).
+        static BOOLEAN REscaped = TRUE;
+        UINT32 RSig = g_M68kContext.D[0] ^ g_M68kContext.D[1];
+        if (!REscaped && RSig == RLastSig) {
+            RReps++;
+            if (RReps >= 3) {
+                UINT32 Sp = M68kGetStackPointer ();
+                UINT32 K;
+                BOOLEAN Found = FALSE;
+                Print (L"  RESOLVER-WEDGE: sig=%08x sp=%08x, "
+                       L"scanning stack\n", RSig, Sp);
+                for (K = 0; K < 256; K++) {
+                    UINT32 V = M68kReadLong ((UINT32)(Sp + K * 4));
+                    if (V == 0x408001E8u) {
+                        Found = TRUE;
+                        M68kWriteAn (7, Sp + K * 4 + 4);
+                        g_M68kContext.PC = 0x408001EEu;
+                        break;
+                    }
+                }
+                if (!Found) {
+                    for (K = 0; K < 256; K++) {
+                        UINT32 V = M68kReadLong ((UINT32)(Sp + K * 4));
+                        if (V >= 0x40800000u && V < 0x40A00000u &&
+                            (V & 1) == 0) {
+                            Found = TRUE;
+                            Print (L"  RESOLVER-WEDGE: fallback return "
+                                   L"%08x at sp+%d\n", V, (UINT32)K);
+                            M68kWriteAn (7, Sp + K * 4 + 4);
+                            g_M68kContext.PC = V;
+                            break;
+                        }
+                    }
+                }
+                if (Found) {
+                    Print (L"  RESOLVER-WEDGE: escaped\n");
+                    REscaped = TRUE;             // one-shot per wedged site
+                    RReps = 0;
+                    RLastSig = 0;
+                    return 8;
+                }
+                RReps = 0;                       // retry next window
+            }
+        } else {
+            RLastSig = RSig;
+            RReps = 0;
+        }
+    }
+    // ---- END resolver-wedge escape --------------------------------------
+
+    // ---- Second scrub-loop fast path (word-clear variant) ---------------
+    // Same family as the low-memory scrubber: the NK init clears a region
+    // with CLR.W (A0)+ / CMPA.L (A1),A0 / BNE.S at 0x4087CA20..7CA25.
+    // Equality-stepping-by-2 hangs when the bound at [A1] cannot be met;
+    // complete the whole clear in one step with identical exit semantics.
+    // One-shot live-code dump just before the poisoned tail-dispatch stub,
+    // to identify the function whose fall-through enters it.
+    if (g_M68kContext.PC - 2 == 0x4080A494u && Opcode == 0x2F30u) {
+        static UINTN A494Dumped = 0;
+        if (A494Dumped < 2) {
+            A494Dumped++;
+            UINTN K;
+            UINT32 Sp = M68kGetStackPointer ();
+            Print (L"  A494-HIT #%d: sp=%08x [sp]=%08x\n",
+                   (UINT32)A494Dumped, Sp, M68kReadLong (Sp));
+            Print (L"    a0=%08x a1=%08x d0=%08x d1=%08x\n",
+                   g_M68kContext.A[0], g_M68kContext.A[1],
+                   g_M68kContext.D[0], g_M68kContext.D[1]);
+            Print (L"    live@A460:");
+            for (K = 0; K < 26; K++) {
+                Print (L" %04x",
+                       M68kFetchWord ((UINT32)(0x4080A460u + K * 2)));
+                if ((K & 7) == 7) Print (L"\n       ");
+            }
+            Print (L"\n");
+        }
+    }
+
+    // Trace entry into the clear-loop function: capture full register
+    // state plus the argument the caller passed (should be a pointer into
+    // NK RAM; observing small sentinels like 6 identifies the broken
+    // producer upstream).
+    if (g_M68kContext.PC - 2 == 0x4087CA00u && Opcode == 0x4E56u) {
+        UINT32 ArgVal = M68kReadLong ((UINT32)(M68kGetStackPointer () + 4));
+        if ((ArgVal & 1u) == 0u &&
+            (UINT64)ArgVal >= 0x1000ull &&
+            ((UINT64)ArgVal < 0x01000000ull ||
+             (UINT64)ArgVal >= 0x40000000ull)) {
+            // Plausible pointer: let the function run normally.
+        } else {
+            static UINTN CaSkipCount = 0;
+            CaSkipCount++;
+            if (CaSkipCount <= 6 || (CaSkipCount & 0xFF) == 0) {
+                Print (L"  CA00-SKIP #%d: bad arg %08x -> rts\n",
+                       (UINT32)CaSkipCount, ArgVal);
+            }
+            g_M68kContext.PC = M68kPopLong ();
+            return 8;
+        }
+        static UINTN CaEntryCount = 0;
+        if (CaEntryCount < 3) {
+            CaEntryCount++;
+            UINTN I;
+            Print (L"  CA00-ENTRY #%d:", (UINT32)CaEntryCount);
+            for (I = 0; I < 8; I++) {
+                Print (L" d%u=%08x", (UINT32)I, g_M68kContext.D[I]);
+            }
+            Print (L"\n    ");
+            for (I = 0; I < 8; I++) {
+                Print (L" a%u=%08x", (UINT32)I,
+                       (I == 7) ? M68kGetStackPointer ()
+                                : g_M68kContext.A[I]);
+            }
+            Print (L"\n    sp-args:");
+            {
+                UINT32 Sp = M68kGetStackPointer ();
+                UINTN K;
+                for (K = 0; K < 8; K++) {
+                    Print (L" %08x", M68kReadLong ((UINT32)(Sp + K * 4)));
+                }
+            }
+            Print (L"\n");
+        }
+    }
+
+    if (g_M68kContext.PC - 2 == 0x4087CA22u) {
+        static UINTN WTraceCount = 0;
+        if (WTraceCount < 1) {
+            WTraceCount++;
+            UINT32 Fp = g_M68kContext.A[6];
+            UINT32 Arg = M68kReadLong ((UINT32)(Fp + 8));   // 8(A6) = A4 src
+            UINT32 Ret = M68kReadLong ((UINT32)(Fp + 4));
+            Print (L"  WTRACE: op=%04x a0=%08x a1=%08x bound=%08x\n",
+                   Opcode, g_M68kContext.A[0], g_M68kContext.A[1],
+                   M68kReadLong (g_M68kContext.A[1]));
+            Print (L"    frame fp=%08x ret=%08x arg(8fp)=%08x a4=%08x\n",
+                   Fp, Ret, Arg, g_M68kContext.A[4]);
+            // Disassemble live code around the caller return point
+            {
+                UINTN K;
+                Print (L"    code@ret-24:");
+                for (K = 0; K < 28; K++) {
+                    Print (L" %04x",
+                           M68kFetchWord ((UINT32)(Ret - 24 + K * 2)));
+                    if ((K & 7) == 7) Print (L"\n       ");
+                }
+                Print (L"\n");
+            }
+        }
+    }
+    if (Opcode == 0xB1C9u && g_M68kContext.PC - 2 == 0x4087CA22u &&
+        M68kFetchWord (0x4087CA20u) == 0x4258u &&
+        M68kFetchWord (0x4087CA24u) == 0x66FAu) {
+        // EXPERIMENT (c): wedge escape DISABLED alongside RESOLVER-WEDGE.
+        // WScrubFast stays armed so a legitimate sane-bound clear still
+        // gets bulk-completed; only the wedge unwind is off.
+        static BOOLEAN WScrubDone = FALSE;
+        static BOOLEAN WWedgeDisabled = TRUE;
+        UINT32 Limit = M68kReadLong (g_M68kContext.A[1]);
+        UINT32 Start = g_M68kContext.A[0];
+        // Sanity gate: only fast-path when [A1] is a plausible end pointer
+        // ABOVE the start cursor. Otherwise this is not a scrub loop —
+        // either upstream state is broken or the bound register contract
+        // was never met. Spin a few passes, then escape exactly like the
+        // resolver wedge: unwind to the trampoline continuation
+        // (return word 0x408001E8 -> 0x408001EE) or the nearest plausible
+        // ROM return address still on the stack.
+        if (!WWedgeDisabled &&
+            !WScrubDone &&
+            !((UINT64)(Limit & ~1u) > (UINT64)Start &&
+              (UINT64)(Limit & ~1u) <= (UINT64)Start + 0x01000000ull)) {
+            static UINTN WSpinReps = 0;
+            static UINT32 WSpinSig = 0;
+            UINT32 Sig = Limit ^ g_M68kContext.A[4] ^ g_M68kContext.A[5];
+            if (Sig == WSpinSig) {
+                WSpinReps++;
+                if (WSpinReps >= 3) {
+                    // Faithful epilogue unwind anchored ONLY on A6 (set by
+                    // LINK A6,#0 in this frame's prologue):
+                    //   [A6+0]=caller A6   [A6+4]=return address
+                    //   MOVEM slots sit BELOW A6: D2@[A6-4] A2@[-8] A4@[-12]
+                    UINT32 Fp   = g_M68kContext.A[6];
+                    UINT32 Ret  = M68kReadLong ((UINT32)(Fp + 4));
+                    UINT32 Old6 = M68kReadLong (Fp);
+                    BOOLEAN RetOk = ((Ret & 1) == 0) &&
+                                    (Ret >= 0x40800000u &&
+                                     (Ret < 0x41000000u ||
+                                      Ret >= 0xFFC00000u));
+                    Print (L"  WSCRUB-WEDGE: a0=%08x bound=%08x fp=%08x "
+                           L"ret=%08x olda6=%08x%s\n", Start, Limit, Fp,
+                           Ret, Old6, RetOk ? L"" : L" INVALID");
+                    if (RetOk && ((Old6 & 1) == 0)) {
+                        static UINTN WEscapes = 0;
+                        WEscapes++;
+                        // Restore callee-saved regs pushed by MOVEM
+                        g_M68kContext.D[2] =
+                            M68kReadLong ((UINT32)(Fp - 4));
+                        g_M68kContext.A[2] =
+                            M68kReadLong ((UINT32)(Fp - 8));
+                        g_M68kContext.A[4] =
+                            M68kReadLong ((UINT32)(Fp - 12));
+                        // UNLK-equivalent + RTS
+                        g_M68kContext.A[6] = Old6;
+                        g_M68kContext.A[7] = Fp + 8;
+                        g_M68kContext.PC = Ret;
+                        Print (L"  WSCRUB-WEDGE: escaped #%d -> %08x\n",
+                               (UINT32)WEscapes, Ret);
+                        WSpinReps = 0;
+                        WSpinSig = 0;
+                        if (WEscapes >= 16) {
+                            Print (L"  WSCRUB-WEDGE: 16 escapes, halting\n");
+                            g_M68kContext.Halted = TRUE;
+                        }
+                        return 8;
+                    }
+                    WSpinReps = 0;               // retry next window
+                }
+            } else {
+                WSpinSig = Sig;
+                WSpinReps = 0;
+            }
+        }
+        // Empty-range completion: with the stack rescued, this stage calls
+        // the clearer with a bound inside the rescued stack (its own frame
+        // region) but a start cursor that is stale ROM-window garbage.
+        // The intended "zero my frame" is a no-op for us — complete it by
+        // snapping A0 to the bound and reporting equal-compare exit.
+        if (!WScrubDone &&
+            Start >= 0x40000000u &&
+            (Limit & ~1u) >= 0x400u && (Limit & ~1u) < 0x10000u) {
+            WScrubDone = TRUE;
+            Print (L"  WSCRUB-EMPTY: start %08x (rom-garbage), bound "
+                   L"%08x -> skip clear\n", Start, Limit & ~1u);
+            g_M68kContext.A[0] = Limit & ~1u;
+            g_M68kContext.SR = (UINT16)((g_M68kContext.SR & ~(M68K_CCR_N |
+                                    M68K_CCR_Z | M68K_CCR_V | M68K_CCR_C)) |
+                                    M68K_CCR_Z);
+            return 12;
+        }
+        // Sane-range fast clear (unchanged)
+        if (!WScrubDone &&
+            (UINT64)(Limit & ~1u) > (UINT64)Start &&
+            (UINT64)(Limit & ~1u) <= (UINT64)Start + 0x01000000ull) {
+            WScrubDone = TRUE;
+            Print (L"  WSCRUB-FAST: clear %08x..%08x ([a1]=%08x)\n",
+                   Start, Limit & ~1u, Limit);
+            {
+                UINT32 Addr = Start & ~1u;
+                UINT32 End = Limit & ~1u;
+                UINTN Words = 0;
+                while (Addr + 2 <= End) {
+                    M68kWriteWord (Addr, 0);
+                    Addr += 2;
+                    Words++;
+                }
+                g_M68kContext.A[0] = Addr;
+                Print (L"  WSCRUB-FAST: %d words cleared\n", (UINT32)Words);
+            }
+            // Exit semantics: force compare-equal (Z=1,C=0) so the BNE.S
+            // falls through; PC already points at the BNE.S.
+            g_M68kContext.SR = (UINT16)((g_M68kContext.SR & ~(M68K_CCR_N |
+                                    M68K_CCR_Z | M68K_CCR_V | M68K_CCR_C)) |
+                                    M68K_CCR_Z);
+            return 12;
+        }
+    }
+    // ---- END second scrub fast path -------------------------------------
+
+    // Dead table-JSR interceptor (MacOS-side init): at 0x4087CA86 the
+    // startup calls JSR (A0,A1.L*1-31) — another unseeded NK dispatch
+    // table. DISABLED after A/B test: skipping diverts flow into $FF-
+    // filled low RAM (ILLEGAL) which is WORSE than the deterministic
+    // ZERO-EXEC guard halt. Kept for reference.
+    if (FALSE && Opcode == 0x4EB0u && g_M68kContext.PC - 2 == 0x4087CA86u &&
+        M68kFetchWord ((UINT32)(g_M68kContext.PC)) == 0x81E1u) {
+        UINT32 BaseVal = g_M68kContext.A[0];
+        INT32 IdxVal = (INT32)(INT16)(UINT16)g_M68kContext.A[1];
+        UINT32 TableAddr = BaseVal + (UINT32)IdxVal - 31u;
+        UINT32 Target = M68kReadLong (TableAddr);
+        BOOLEAN Plausible = ((Target & 1) == 0) &&
+                            (Target >= 0x40800000u &&
+                             (Target < 0x41000000u ||
+                              Target >= 0xFFC00000u));
+        if (!Plausible) {
+            static UINTN Ca86Skip = 0;
+            Ca86Skip++;
+            if (Ca86Skip <= 8 || (Ca86Skip & 0xFF) == 0) {
+                Print (L"  CA86-SKIP #%d: [%08x]=%08x -> nop call\n",
+                       (UINT32)Ca86Skip, TableAddr, Target);
+            }
+            M68kWriteAn (7, M68kGetStackPointer () + 4);  // undo JSR push
+            g_M68kContext.D[0] = 0;
+            g_M68kContext.SR = (UINT16)((g_M68kContext.SR & 0xFF00) |
+                                        M68K_CCR_Z);
+            return 12;                     // PC already past the JSR
+        }
+    }
+
+    // Zero-region execution guard: opcode 0000 executed in low-RAM far
+    // above the vector area means a lost control flow (code pointer or
+    // return address pointed at uninitialized memory). Halt immediately
+    // with full history instead of silently crawling megabytes of ORI.Bs.
+    if (Opcode == 0x0000u &&
+        g_M68kContext.PC >= 0x0010000u && g_M68kContext.PC < 0x40800000u) {
+        static BOOLEAN ZeroExecReported = FALSE;
+        if (!ZeroExecReported) {
+            ZeroExecReported = TRUE;
+            Print (L"  ZERO-EXEC GUARD: executing zeros @%08x sp=%08x — "
+                   L"lost flow, halting\n",
+                   g_M68kContext.PC - 2, M68kGetStackPointer ());
+            Print (L"   a0=%08x a1=%08x a2=%08x a4=%08x a5=%08x "
+                   L"a6=%08x d0=%08x d1=%08x\n",
+                   g_M68kContext.A[0], g_M68kContext.A[1],
+                   g_M68kContext.A[2], g_M68kContext.A[4],
+                   g_M68kContext.A[5], g_M68kContext.A[6],
+                   g_M68kContext.D[0], g_M68kContext.D[1]);
+            {
+                UINT32 Sp = M68kGetStackPointer ();
+                UINTN K;
+                Print (L"   stack@sp-32:");
+                for (K = 0; K < 24; K++) {
+                    Print (L" %08x", M68kReadLong (
+                               (UINT32)(Sp - 32 + K * 4)));
+                    if ((K & 7) == 7) Print (L"\n   ");
+                }
+            }
+            // Live code at the epilogue we RTS'd through and at the
+            // caller return point — reveals the arg-skip displacement
+            // vs. the actual frame.
+            {
+                UINTN K;
+                Print (L"   code@33770:");
+                for (K = 0; K < 14; K++) {
+                    Print (L" %04x", M68kFetchWord (
+                               (UINT32)(0x40833770u + K * 2)));
+                }
+                Print (L"\n   code@CA5C:");
+                for (K = 0; K < 26; K++) {
+                    Print (L" %04x", M68kFetchWord (
+                               (UINT32)(0x4087CA5Cu + K * 2)));
+                    if ((K & 7) == 7) Print (L"\n     ");
+                }
+                Print (L"\n");
+            }
+            {
+                UINTN K;
+                Print (L"   last PCs:");
+                for (K = 1; K <= 32; K++) {
+                    UINTN Idx = (g_LastPcIdx + 256 - K) % 256;
+                    Print (L" %08x/%04x", g_LastPcRing[Idx],
+                           g_LastOpRing[Idx]);
+                    if ((K & 7) == 0) Print (L"\n   ");
+                }
+                Print (L"\n");
+            }
+            M68kTraceFlush ();
+            g_M68kContext.Halted = TRUE;
+        }
+    }
+
+    // Zero-region entry detector: the post-NewHandle flow jumps into a big
+    // zeroed RAM area and "executes" ORI.B no-ops across it. Capture the
+    // first entry to identify the jump source.
+    if (g_M68kContext.PC >= 0x7E0000u && g_M68kContext.PC < 0x800000u) {
+        static BOOLEAN ZeroMarchSeen = FALSE;
+        if (!ZeroMarchSeen && Opcode == 0x0000u) {
+            ZeroMarchSeen = TRUE;
+            Print (L"  ZERO-MARCH entry @%08x\n", g_M68kContext.PC);
+            {
+                UINTN K;
+                for (K = 1; K <= 32; K++) {
+                    UINTN Idx = (g_LastPcIdx + 256 - K) % 256;
+                    Print (L" %08x/%04x", g_LastPcRing[Idx],
+                           g_LastOpRing[Idx]);
+                    if ((K & 7) == 0) Print (L"\n");
+                }
+            }
+        }
+    }
+
+    // Low-stack detector: the NK MixedMode-era caller runs with SP~0x10,
+    // pushing over the vector table. Catch the first instruction executed
+    // under such a stack and arm the SS trace window so the setter of the
+    // bogus SSP becomes visible.
+    {
+        static UINTN LowSpSeenCount = 0;
+        UINT32 SpNow = g_M68kContext.Supervisor ? g_M68kContext.SSP
+                                                : g_M68kContext.A[7];
+        // Rescue v2: the NK stage at 0x408049xx-4Bxx does real frame
+        // allocation (LEA -346(A7),A7 etc.) but inherits SP~=0x10 from the
+        // JMP-chain bootstrap web, so its frames land in the alias-ROM
+        // window and its arguments are read from garbage. When execution
+        // FIRST enters this stage with an implausible stack, hand it a
+        // real one: 0x7800 sits below the long-abandoned 0x7FFC boot
+        // stack, inside the writable 16 MB bank, far from XLM (0x2800).
+        if (LowSpSeenCount < 2 && SpNow < 0x400u &&
+            g_M68kContext.PC >= 0x40804960u &&
+            g_M68kContext.PC < 0x40804B00u) {
+            LowSpSeenCount++;
+
+            if (!g_M68kContext.Supervisor) {
+                g_M68kContext.A[7] = 0x00007800u;
+            } else {
+                g_M68kContext.SSP = 0x00007800u;
+            }
+            Print (L"  LOW-SP RESCUE #%d: sp=%08x -> 7800 @pc=%08x\n",
+                   (UINT32)LowSpSeenCount, SpNow, g_M68kContext.PC);
+        }
+    }
+
+    // One-shot micro-trace of the caller block that pushes the poisoned
+    // argument (ret=0x40804AD8). Arms when PC first enters its window;
+    // prints each step until the call or budget exhaustion.
+    if (g_M68kContext.PC >= 0x40804A90u && g_M68kContext.PC < 0x40804AE0u) {
+        static BOOLEAN CallerArm = FALSE;
+        static UINTN CallerSteps = 0;
+        if (!CallerArm) {
+            CallerArm = TRUE;
+            Print (L"  CALLER-TRACE armed @%08x\n", g_M68kContext.PC);
+            // Snapshot the classic low-mem globals this block consults.
+            Print (L"   globals: [2BA]=%08x [AF0]=%08x [A58]=%08x "
+                   L"[A5A]=%08x [BFF]=%02x\n",
+                   M68kReadLong (0x2BAu), M68kReadLong (0xAF0u),
+                   M68kReadWord (0xA58u), M68kReadWord (0xA5Au),
+                   M68kReadByte (0xBFFu));
+        }
+        if (CallerSteps < 90) {
+            CallerSteps++;
+            Print (L"   C%02d %08x: %04x d0=%08x d1=%08x d3=%08x "
+                   L"d6=%08x a0=%08x a5=%08x sp=%08x\n",
+                   (UINT32)CallerSteps, g_M68kContext.PC, Opcode,
+                   g_M68kContext.D[0], g_M68kContext.D[1],
+                   g_M68kContext.D[3], g_M68kContext.D[6],
+                   g_M68kContext.A[0], g_M68kContext.A[5],
+                   M68kGetStackPointer ());
+        }
+    }
+
+    // ---- Dead tail-dispatch skip ----------------------------------------
+    // The NK thunk array around 0x4080A460 consists of per-selector
+    // trampolines
+    //   MOVE.L tbl(A0,Dn.L),-(SP)   (2F30 <ext>)
+    //   MOVE.L (A0),D0              (2010)
+    //   ORI.B #sel,D0               (00xx)
+    //   RTS                          (4E75)
+    // interleaved with default stubs "MOVEQ #0,D0 ; RTS". The dispatch
+    // tables they index are built by Apple's loader/an early NK stage that
+    // never runs in our environment (verified: zero writes to the table
+    // region all boot), so targets read as sentinel garbage. When the
+    // computed target is not a plausible code pointer, execute the
+    // array's own DEFAULT semantic instead: D0 = 0 and return to caller.
+    if (Opcode == 0x2F30u &&
+        g_M68kContext.PC - 2 >= 0x40804000u &&
+        g_M68kContext.PC - 2 <  0x40890000u) {
+        // Family shape: 2F30 <ext> <MOVEA.L (An),A0> <ORI.B sel,Dx> 4E75
+        UINT16 Mid = M68kFetchWord ((UINT32)(g_M68kContext.PC + 2));
+        UINT16 Ori = M68kFetchWord ((UINT32)(g_M68kContext.PC + 4));
+        UINT16 Rts = M68kFetchWord ((UINT32)(g_M68kContext.PC + 6));
+        BOOLEAN MoveaForm = ((Mid & 0xF038u) == 0x2010u);
+        // DISABLED after testing: null-returning (D0=0) diverts callers
+        // down untested error paths (alias-stack jumps -> ILLEGAL). The
+        // original flow — complete the push, RTS into junk, BAD-RTS
+        // healer resyncs — proved more stable (~130M instructions).
+        // Left here for future use once the tables are seeded properly.
+        MoveaForm = FALSE;
+        if (MoveaForm && Rts == 0x4E75u && (Ori >> 8) == 0x00u) {
+            UINT16 Ext = M68kFetchWord (g_M68kContext.PC);
+            BOOLEAN Brief = (Ext & 0x0100u) == 0;
+            INT32 Disp = Brief ? (INT32)(INT8)(Ext & 0xFF)
+                               : (INT32)(INT16)M68kFetchWord (
+                                     (UINT32)(g_M68kContext.PC + 4));
+            UINT8 IdxReg = (Ext >> 12) & 7;
+            UINT32 BaseVal = (Ext & 0x8000)
+                             ? ((IdxReg == 7) ? M68kGetStackPointer ()
+                                              : g_M68kContext.A[IdxReg])
+                             : g_M68kContext.D[IdxReg];
+            UINT32 Scale = 1u << ((Ext >> 9) & 3);
+            UINT32 TableAddr;
+            UINT32 Target;
+            {
+                UINT32 RawIdx = (Ext & 0x8000)
+                                ? g_M68kContext.A[IdxReg]
+                                : g_M68kContext.D[IdxReg];
+                TableAddr = BaseVal +
+                            (UINT32)((INT32)(INT16)(UINT16)RawIdx *
+                                     (INT32)Scale) +
+                            (UINT32)Disp;
+            }
+            Target = M68kReadLong (TableAddr);
+            if (!((Target & 1) == 0 &&
+                  (Target >= 0x40800000u &&
+                   (Target < 0x41000000u || Target >= 0xFFC00000u)))) {
+                static UINTN DeadThunkCount = 0;
+                DeadThunkCount++;
+                if (DeadThunkCount <= 10 ||
+                    (DeadThunkCount & 0x3FF) == 0) {
+                    Print (L"  THUNK-NULL #%d @%08x: [%08x]=%08x -> "
+                           L"default\n", (UINT32)DeadThunkCount,
+                           g_M68kContext.PC - 2, TableAddr, Target);
+                }
+                // Default-stub semantic: D0 = 0, return to caller — but
+                // validate the return first: these thunks are often entered
+                // with a broken stack, so [SP] may be garbage.
+                g_M68kContext.D[0] = 0;
+                {
+                    UINT32 Ret = M68kPopLong ();
+                    BOOLEAN RetOk =
+                        (((Ret & 1) == 0) &&
+                         ((Ret >= 0x40800000u &&
+                           (Ret < 0x41000000u || Ret >= 0xFFC00000u)) ||
+                          Ret < 0x00100000u));
+                    if (!RetOk) {
+                        UINT32 Sp = M68kGetStackPointer ();
+                        UINT32 K;
+                        for (K = 0; K < 256 && !RetOk; K++) {
+                            UINT32 V = M68kReadLong ((UINT32)(Sp + K * 4));
+                            if (((V & 1) == 0) &&
+                                V >= 0x40800000u &&
+                                (V < 0x41000000u || V >= 0xFFC00000u)) {
+                                Ret = V;
+                                M68kWriteAn (7, Sp + K * 4 + 4);
+                                RetOk = TRUE;
+                            }
+                        }
+                    }
+                    g_M68kContext.PC = Ret;
+                    return 12;
+                }
+            }
+        }
+    }
+    // ---- END dead tail-dispatch skip -------------------------------------
 
     // Dispatch based on the top 10 bits (bits 15-6) of the opcode
     UINT8 TopBits = Opcode >> 12;
@@ -2513,6 +3203,52 @@ M68kExecuteInstruction (
                             (NewPC < 0x00100000u ||
                              (NewPC >= 0x40800000u && (NewPC < 0x41000000u || NewPC >= 0xFFC00000u)));
             if (!RtsOk) {
+                // Dead-table sentinel fast path: NK init routines tail-call
+                // through RAM tables our environment never populated; when a
+                // LINK A6 frame anchor is present, unwind faithfully.
+                {
+                    UINT32 Fp = g_M68kContext.A[6];
+                    // Frame must sit near the active stack to be ours.
+                    UINT32 CurSp = g_M68kContext.Supervisor
+                                   ? g_M68kContext.SSP : g_M68kContext.A[7];
+                    static UINTN DeadDbg = 0;
+                    if (DeadDbg < 6) {
+                        DeadDbg++;
+                        Print (L"  DEADTBL-CHK #%d: newpc=%08x fp=%08x "
+                               L"cursp=%08x win=%d\n",
+                               (UINT32)DeadDbg, NewPC, Fp, CurSp,
+                               (Fp >= CurSp &&
+                                (UINT32)(Fp - CurSp) < 0x200u) ? 1 : 0);
+                    }
+                    if (NewPC < 0x00001000u &&
+                        Fp >= CurSp && (UINT32)(Fp - CurSp) < 0x200u &&
+                        (Fp & 1) == 0) {
+                        UINT32 Ret = M68kReadLong ((UINT32)(Fp + 4));
+                        UINT32 Old6 = M68kReadLong (Fp);
+                        BOOLEAN Ok = ((Ret & 1) == 0) &&
+                                     (Ret >= 0x40800000u &&
+                                      (Ret < 0x41000000u ||
+                                       Ret >= 0xFFC00000u)) &&
+                                     ((Old6 & 1) == 0) &&
+                                     (Old6 >= CurSp);
+                        if (Ok) {
+                            static UINTN DeadTblCount = 0;
+                            DeadTblCount++;
+                            g_M68kContext.A[6] = Old6;
+                            g_M68kContext.A[7] = Fp + 8;
+                            g_M68kContext.PC = Ret;
+                            if (DeadTblCount <= 12 ||
+                                (DeadTblCount & 0xFF) == 0) {
+                                Print (L"  DEADTBL #%d: sentinel ret -> "
+                                       L"frame-unwind %08x\n",
+                                       (UINT32)DeadTblCount, Ret);
+                            }
+                            M68kLogLowTransfer (
+                                g_M68kContext.PC, Opcode, Ret);
+                            break;
+                        }
+                    }
+                }
                 // Self-heal: a corrupted return address means some upstream
                 // DR-callback chain ran off the rails. Rather than executing
                 // data, resynchronize to the nearest plausible caller return
@@ -2535,7 +3271,7 @@ M68kExecuteInstruction (
                         break;
                     }
                 }
-                STATIC INTN BadRtsCount = -1;
+                static INTN BadRtsCount = -1;
                 BadRtsCount++;
                 if (BadRtsCount < 8) {
                     Print (L"68K BAD RTS #%d from PC=0x%08x -> 0x%08x "
@@ -2574,7 +3310,7 @@ M68kExecuteInstruction (
             break;
         }
         // RTR: 0100 1110 0111 0111
-        if (Opcode == 0x4E77) { M68kExecuteRte (); break; }
+        if (Opcode == 0x4E77) { M68kExecuteRtr (); break; }
         // TRAPV: 0100 1110 0111 0110
         if (Opcode == 0x4E76) break;
         // TRAP #n: 0100 1110 0100 xxxx
@@ -2625,8 +3361,33 @@ M68kExecuteInstruction (
         }
         // LEA: 0100 xxx1 1111 1xxx
         if ((Opcode & 0xF1C0) == 0x41C0) { M68kExecuteLea (Opcode); break; }
-        // CHK: 0100 xxx1 1011 1xxx
-        if ((Opcode & 0xF1C0) == 0x4180) { M68kExecuteLea (Opcode); break; }
+        // CHK: 0100 xxx1 1000 sxxx — bounds-check Dn against <ea>;
+        // trap vector 6 (0x18) when out of range.
+        if ((Opcode & 0xF138) == 0x4100) {
+            UINT8 Dn = (Opcode >> 9) & 7;
+            BOOLEAN IsLong = ((Opcode >> 7) & 1) != 0;
+            UINT32 Ub = IsLong
+                        ? M68kReadEA (Opcode & 0x3F, M68K_SIZE_LONG)
+                        : M68kReadEA (Opcode & 0x3F, M68K_SIZE_WORD);
+            INT32 Val = IsLong
+                        ? (INT32)g_M68kContext.D[Dn]
+                        : (INT32)(INT16)(UINT16)g_M68kContext.D[Dn];
+            if (Val < 0) {
+                M68kSetFlag (M68K_CCR_N);
+                g_M68kContext.PC -= 2;            // exception restarts insn
+                M68kRaiseException (M68K_VEC_CHK);
+            } else if ((UINT32)Val > Ub) {
+                M68kClearFlag (M68K_CCR_N);
+                g_M68kContext.PC -= 2;
+                M68kRaiseException (M68K_VEC_CHK);
+            } else {
+                M68kClearFlag (M68K_CCR_N);
+                // Z reflects the register compare result.
+                if (Val == 0) M68kSetFlag (M68K_CCR_Z);
+                else          M68kClearFlag (M68K_CCR_Z);
+            }
+            break;
+        }
         // SWAP: 0100 1000 0100 0xxx
         if ((Opcode & 0xFFF8) == 0x4840) { M68kExecuteSwap (Opcode); break; }
         // EXT.W: 0100 1000 1000 0xxx
@@ -2639,8 +3400,22 @@ M68kExecuteInstruction (
         if ((Opcode & 0xFF00) == 0x4A00) { M68kExecuteTst (Opcode); break; }
         // PEA: 0100 1000 0111 1xxx
         if ((Opcode & 0xFFC0) == 0x4840) { M68kExecutePea (Opcode); break; }
-        // NBCD: 0100 1000 00xx xxxx
-        if ((Opcode & 0xFFC0) == 0x4800) { M68kExecuteTas (Opcode); break; }
+        // NBCD: 0100 1000 00xx xxxx — BCD negate: dst = 0 - dst - X.
+        if ((Opcode & 0xFFC0) == 0x4800) {
+            UINT16 EaOp = Opcode & 0x3F;
+            UINT8 DstVal = (UINT8)M68kReadEA (EaOp, M68K_SIZE_BYTE);
+            UINT8 X = M68kTestFlag (M68K_CCR_X) ? 1 : 0;
+            INTN T = (INTN)0 - (INTN)DstVal - (INTN)X;
+            UINT8 Result;
+            if ((T & 0xF) > 9) T -= 6;
+            if (T > 0x99) { T -= 0x100; M68kSetFlag (M68K_CCR_C); }
+            else          { M68kClearFlag (M68K_CCR_C); }
+            Result = (UINT8)T;
+            if (Result == 0) M68kSetFlag (M68K_CCR_Z);   // Z is ANDed
+            else             M68kClearFlag (M68K_CCR_Z);
+            M68kWriteEA (EaOp, M68K_SIZE_BYTE, Result);
+            break;
+        }
         // MOVEM to memory: 0100 1000 1xxx 1xxx
         if ((Opcode & 0xFF80) == 0x4880) { M68kExecuteMovem (Opcode); break; }
         // MOVEM to register: 0100 1100 1xxx 1xxx
@@ -2779,14 +3554,32 @@ M68kExecuteInstruction (
                 M68kSetFlagsFromResult (Quotient, M68K_SIZE_WORD);
             }
         } else if (SubBits == 4) {
-            // SBCD
+            // SBCD with proper BCD adjust and X/Z/C semantics.
             UINT8 Dst = (Opcode >> 9) & 7;
             UINT8 Src = Opcode & 7;
             BOOLEAN IsMemory = (Opcode >> 3) & 1;
-            UINT8 SrcVal = IsMemory ? M68kReadByte (g_M68kContext.A[Src]) : (UINT8)(g_M68kContext.D[Src] & 0xFF);
-            UINT8 DstVal = IsMemory ? M68kReadByte (g_M68kContext.A[Dst]) : (UINT8)(g_M68kContext.D[Dst] & 0xFF);
+            UINT8 SrcVal, DstVal;
+            if (IsMemory) {
+                g_M68kContext.A[Src]--;         // -(Ay) predecrement source
+                SrcVal = M68kReadByte (g_M68kContext.A[Src]);
+                g_M68kContext.A[Dst]--;         // -(Ax) predecrement dest
+                DstVal = M68kReadByte (g_M68kContext.A[Dst]);
+            } else {
+                SrcVal = (UINT8)(g_M68kContext.D[Src] & 0xFF);
+                DstVal = (UINT8)(g_M68kContext.D[Dst] & 0xFF);
+            }
             UINT8 X = M68kTestFlag (M68K_CCR_X) ? 1 : 0;
-            UINT8 Result = DstVal - SrcVal - X;
+            INTN T = (INTN)DstVal - (INTN)SrcVal - (INTN)X;
+            UINT8 Result;
+            if ((T & 0xF) > 9) T -= 6;            // low-nibble borrow fix
+            if (T > 0x99) { T -= 0x100; M68kSetFlag (M68K_CCR_C); }
+            else          { M68kClearFlag (M68K_CCR_C); }
+            Result = (UINT8)T;
+            // Z is ANDed across chained BCD operations.
+            if (Result == 0) M68kSetFlag (M68K_CCR_Z);
+            else             M68kClearFlag (M68K_CCR_Z);
+            if (M68kTestFlag (M68K_CCR_C)) M68kSetFlag (M68K_CCR_X);
+            else                           M68kClearFlag (M68K_CCR_X);
             if (IsMemory) {
                 M68kWriteByte (g_M68kContext.A[Dst], Result);
             } else {
@@ -2818,9 +3611,58 @@ M68kExecuteInstruction (
                               : g_M68kContext.A[DstReg];
                 M68kWriteAn (DstReg, Base - SrcVal);
             }
-        } else if ((Opcode & 0xF130) == 0x9100) {
-            // SUBX
-            M68kExecuteIllegal (Opcode);
+        } else if ((Opcode & 0xF138) == 0x9100) {
+            // SUBX: 1001 Ry 1 size m 00 Rx — register (m=0) or
+            // predecrement-memory (m=1) forms, with X flag.
+            {
+                UINT8 Ry = (Opcode >> 9) & 7;
+                UINT8 Rx = Opcode & 7;
+                UINT8 SizeSel = (Opcode >> 6) & 3;
+                BOOLEAN IsMemory = ((Opcode >> 3) & 1) != 0;
+                UINT8 Size = (SizeSel == 1) ? M68K_SIZE_WORD : M68K_SIZE_LONG;
+                UINTN Step = (Size == M68K_SIZE_WORD) ? 2 : 4;
+                UINT32 SrcVal, DstVal, Result;
+
+                if (IsMemory) {
+                    g_M68kContext.A[Rx] -= Step;
+                    SrcVal = (Size == M68K_SIZE_WORD)
+                             ? M68kReadWord (g_M68kContext.A[Rx])
+                             : M68kReadLong (g_M68kContext.A[Rx]);
+                    g_M68kContext.A[Ry] -= Step;
+                    DstVal = (Size == M68K_SIZE_WORD)
+                             ? M68kReadWord (g_M68kContext.A[Ry])
+                             : M68kReadLong (g_M68kContext.A[Ry]);
+                } else {
+                    SrcVal = g_M68kContext.D[Rx];
+                    DstVal = g_M68kContext.D[Ry];
+                }
+                {
+                    UINT8 X = M68kTestFlag (M68K_CCR_X) ? 1 : 0;
+                    UINT64 T = (UINT64)DstVal - (UINT64)SrcVal - X;
+                    UINTN ShiftN = (Size == M68K_SIZE_WORD) ? 15 : 31;
+                    Result = (UINT32)T;
+                    if (T > 0xFFFFFFFFull) M68kSetFlag (M68K_CCR_C);
+                    else                   M68kClearFlag (M68K_CCR_C);
+                    if (((DstVal ^ SrcVal) & (DstVal ^ Result)) >> ShiftN)
+                        M68kSetFlag (M68K_CCR_V);
+                    else
+                        M68kClearFlag (M68K_CCR_V);
+                    if ((INT32)Result < 0) M68kSetFlag (M68K_CCR_N);
+                    else                   M68kClearFlag (M68K_CCR_N);
+                }
+                if (Result == 0) M68kSetFlag (M68K_CCR_Z);   // Z ANDed
+                else             M68kClearFlag (M68K_CCR_Z);
+                if (M68kTestFlag (M68K_CCR_C)) M68kSetFlag (M68K_CCR_X);
+                else                           M68kClearFlag (M68K_CCR_X);
+                if (IsMemory) {
+                    if (Size == M68K_SIZE_WORD)
+                        M68kWriteWord (g_M68kContext.A[Ry], (UINT16)Result);
+                    else
+                        M68kWriteLong (g_M68kContext.A[Ry], Result);
+                } else {
+                    g_M68kContext.D[Ry] = Result;
+                }
+            }
         } else {
             M68kExecuteALU_Dn_EA (Opcode, 1);  // SUB
         }
@@ -2883,6 +3725,70 @@ M68kExecuteInstruction (
                     M68kWriteWord ((UINT32)(Rec + 0x0C), 0x20);
                 }
             }
+            // ---- HOST TRAP SERVICES ------------------------------------
+            // The NK maintains its own heap via Toolbox-style traps long
+            // before any MacOS zone exists. Rather than reimplementing the
+            // allocator (register conventions unknown), SEED the minimal
+            // chain the ROM handlers walk — [0x08A4] -> master -> zone ->
+            // free node — into a host-managed scratch arena in the writable
+            // 16 MB bank, then let the genuine ROM handler run.
+            {
+                static BOOLEAN NkHeapSeeded = FALSE;
+                if (!NkHeapSeeded) {
+                    NkHeapSeeded = TRUE;
+                    // Arena layout inside low bank, clear of stacks/XLM:
+                    const UINT32 Master = 0x00061000u;
+                    const UINT32 Zone   = 0x00061100u;
+                    const UINT32 Node   = 0x00061200u;
+                    const UINT32 BlkBase= 0x00062000u;
+                    M68kWriteLong (0x08A4u, Master);
+                    M68kWriteLong (Master, Zone);
+                    // +0x16 offset consumed by the 40879790 handler walk;
+                    // word-aligned writes via byte pairs to be safe.
+                    M68kWriteLong ((UINT32)(Zone + 0x14u), 0);
+                    M68kWriteLong ((UINT32)(Zone + 0x18u), 0);
+                    {
+                        UINT16 Hi = (UINT16)((Node >> 16) & 0xFFFFu);
+                        UINT16 Lo = (UINT16)(Node & 0xFFFFu);
+                        M68kWriteWord ((UINT32)(Zone + 0x16u), Hi);
+                        M68kWriteWord ((UINT32)(Zone + 0x18u), Lo);
+                    }
+                    M68kWriteLong (Node, BlkBase);
+                    Print (L"  NKHEAP-SEED: [08A4]=%08x -> z=%08x "
+                           L"[z+16]=%08x node->%08x\n",
+                           Master, Zone, Node, BlkBase);
+                }
+                // $A051: NK allocator observed at 0x4087CA6A during early
+                // MacOS-side init; result expected in A0 (caller stores it
+                // into $0CC8/$08A0 immediately after). Serve blocks from a
+                // bump arena; page-framed consumers (pid<<12|off) then get
+                // valid RAM instead of constructing 0x7Fxxxx zeros.
+                if (Opcode == 0xA051u) {
+                    static UINT32 NkBrk = 0x00063000u;
+                    const UINT32 NkEnd = 0x00100000u;   // 1 MB arena
+                    UINT32 Size = g_M68kContext.D[0];
+                    if (Size == 0 || Size > 0x90000u) Size = 0x1000u;
+                    Size = (Size + 0xFFFu) & ~0xFFFu;    // page-align
+                    if (NkBrk + Size > NkEnd) {
+                        Print (L"  HOSTTRAP A051: exhausted\n");
+                        g_M68kContext.D[0] = 0xFFFFFFFFu;
+                    } else {
+                        static UINTN A051Seen = 0;
+                        if (A051Seen++ < 10) {
+                            Print (L"  HOSTTRAP A051: %08x -> "
+                                   L"a0=%08x\n", Size, NkBrk);
+                        }
+                        g_M68kContext.A[0] = NkBrk;
+                        NkBrk += Size;
+                        g_M68kContext.D[0] = 0;
+                        g_M68kContext.SR = (UINT16)(
+                            (g_M68kContext.SR & 0xFF00) | M68K_CCR_Z);
+                        break;                            // serviced
+                    }
+                }
+            }
+            // ---- END HOST TRAP SERVICES ---------------------------------
+
             // NOTE: do NOT blanket-zero D0 here. Per-selector cases above
             // set meaningful results (VMInit=1, allocations return A0...);
             // wiping D0 turned service success into failure and spun the
@@ -2915,7 +3821,7 @@ M68kExecuteInstruction (
                     if (Handler < 0x400000u) {
                         Handler += 0x40800000u;
                     }
-                    STATIC INTN TrapDbg = -1;
+                    static INTN TrapDbg = -1;
                     TrapDbg++;
                     if (TrapDbg < 12) {
                         Print (L"  TRAP %04X -> tbl=%08x handler=%08x\n",
@@ -2985,14 +3891,33 @@ M68kExecuteInstruction (
                 g_M68kContext.D[(Opcode >> 9) & 7] = DstVal * SrcVal;
             }
         } else if (SubBits == 4) {
-            // ABCD
+            // ABCD with proper BCD adjust and X/Z/C semantics.
             UINT8 Dst = (Opcode >> 9) & 7;
             UINT8 Src = Opcode & 7;
             BOOLEAN IsMemory = (Opcode >> 3) & 1;
-            UINT8 SrcVal = IsMemory ? M68kReadByte (g_M68kContext.A[Src]) : (UINT8)(g_M68kContext.D[Src] & 0xFF);
-            UINT8 DstVal = IsMemory ? M68kReadByte (g_M68kContext.A[Dst]) : (UINT8)(g_M68kContext.D[Dst] & 0xFF);
+            UINT8 SrcVal, DstVal;
+            if (IsMemory) {
+                g_M68kContext.A[Src]--;         // -(Ay) predecrement source
+                SrcVal = M68kReadByte (g_M68kContext.A[Src]);
+                g_M68kContext.A[Dst]--;         // -(Ax) predecrement dest
+                DstVal = M68kReadByte (g_M68kContext.A[Dst]);
+            } else {
+                SrcVal = (UINT8)(g_M68kContext.D[Src] & 0xFF);
+                DstVal = (UINT8)(g_M68kContext.D[Dst] & 0xFF);
+            }
             UINT8 X = M68kTestFlag (M68K_CCR_X) ? 1 : 0;
-            UINT8 Result = DstVal + SrcVal + X;
+            INTN T = (INTN)DstVal + (INTN)SrcVal + (INTN)X;
+            BOOLEAN HalfCarry = (((DstVal & 0xF) + (SrcVal & 0xF) + X) > 9);
+            UINT8 Result;
+            if ((T & 0xF) > 9 || HalfCarry) T += 6;   // low-nibble carry fix
+            if (T > 0x99) { T += 0x60; M68kSetFlag (M68K_CCR_C); }
+            else          { M68kClearFlag (M68K_CCR_C); }
+            Result = (UINT8)T;
+            // Z is ANDed across chained BCD operations.
+            if (Result == 0) M68kSetFlag (M68K_CCR_Z);
+            else             M68kClearFlag (M68K_CCR_Z);
+            if (M68kTestFlag (M68K_CCR_C)) M68kSetFlag (M68K_CCR_X);
+            else                           M68kClearFlag (M68K_CCR_X);
             if (IsMemory) {
                 M68kWriteByte (g_M68kContext.A[Dst], Result);
             } else {
@@ -3026,9 +3951,58 @@ M68kExecuteInstruction (
                               : g_M68kContext.A[DstReg];
                 M68kWriteAn (DstReg, Base + SrcVal);
             }
-        } else if ((Opcode & 0xF130) == 0xD100) {
-            // ADDX
-            M68kExecuteIllegal (Opcode);
+        } else if ((Opcode & 0xF138) == 0xD100) {
+            // ADDX: 1101 Ry 1 size m 00 Rx — register (m=0) or
+            // predecrement-memory (m=1) forms, with X flag.
+            {
+                UINT8 Ry = (Opcode >> 9) & 7;
+                UINT8 Rx = Opcode & 7;
+                UINT8 SizeSel = (Opcode >> 6) & 3;
+                BOOLEAN IsMemory = ((Opcode >> 3) & 1) != 0;
+                UINT8 Size = (SizeSel == 1) ? M68K_SIZE_WORD : M68K_SIZE_LONG;
+                UINTN Step = (Size == M68K_SIZE_WORD) ? 2 : 4;
+                UINT32 SrcVal, DstVal, Result;
+
+                if (IsMemory) {
+                    g_M68kContext.A[Rx] -= Step;
+                    SrcVal = (Size == M68K_SIZE_WORD)
+                             ? M68kReadWord (g_M68kContext.A[Rx])
+                             : M68kReadLong (g_M68kContext.A[Rx]);
+                    g_M68kContext.A[Ry] -= Step;
+                    DstVal = (Size == M68K_SIZE_WORD)
+                             ? M68kReadWord (g_M68kContext.A[Ry])
+                             : M68kReadLong (g_M68kContext.A[Ry]);
+                } else {
+                    SrcVal = g_M68kContext.D[Rx];
+                    DstVal = g_M68kContext.D[Ry];
+                }
+                {
+                    UINT8 X = M68kTestFlag (M68K_CCR_X) ? 1 : 0;
+                    UINT64 T = (UINT64)DstVal + (UINT64)SrcVal + X;
+                    UINTN ShiftN = (Size == M68K_SIZE_WORD) ? 15 : 31;
+                    Result = (UINT32)T;
+                    if (T > 0xFFFFFFFFull) M68kSetFlag (M68K_CCR_C);
+                    else                   M68kClearFlag (M68K_CCR_C);
+                    if (~(DstVal ^ SrcVal) & (DstVal ^ Result) >> ShiftN)
+                        M68kSetFlag (M68K_CCR_V);
+                    else
+                        M68kClearFlag (M68K_CCR_V);
+                    if ((INT32)Result < 0) M68kSetFlag (M68K_CCR_N);
+                    else                   M68kClearFlag (M68K_CCR_N);
+                }
+                if (Result == 0) M68kSetFlag (M68K_CCR_Z);   // Z ANDed
+                else             M68kClearFlag (M68K_CCR_Z);
+                if (M68kTestFlag (M68K_CCR_C)) M68kSetFlag (M68K_CCR_X);
+                else                           M68kClearFlag (M68K_CCR_X);
+                if (IsMemory) {
+                    if (Size == M68K_SIZE_WORD)
+                        M68kWriteWord (g_M68kContext.A[Ry], (UINT16)Result);
+                    else
+                        M68kWriteLong (g_M68kContext.A[Ry], Result);
+                } else {
+                    g_M68kContext.D[Ry] = Result;
+                }
+            }
         } else {
             M68kExecuteALU_Dn_EA (Opcode, 0);  // ADD
         }
@@ -3042,18 +4016,25 @@ M68kExecuteInstruction (
     }
 
     case 0xF: {
-        // Coprocessor/Line-F group. The DR emulator claims the $FE00-$FE0F
-        // range as nanokernel software-function opcodes: boot code loads a
-        // selector into D0 and executes one ($FE0A = VMDispatch per the
-        // NanoKernel's VirtualMem.s; $FE04/$FE05 appear at paired call
-        // sites sharing the same selector space). We run a flat-memory
-        // machine where virtual == physical and every page is resident and
-        // writable, so services answer with identity/success semantics.
-        // Raising a Line-F exception here instead would vector through a
-        // garbage table.
+        // Coprocessor/Line-F group. The ROM's opcode dispatch table carries
+        // EMUL_OP extended opcodes starting at 0xFE40. The lower 6 bits
+        // encode a selector that maps 1:1 to the PPC interpreter's
+        // PpcEmulatorDispatchOp marker scheme: selector N maps to
+        // EmulOpDispatch(N - 3) for selectors >= 3. Selectors 0-2 are
+        // legacy VM control words and fall through to the D0-based switch.
+        if ((Opcode & 0xFFC0) == 0xFE40) {
+            UINT32 Sel = Opcode & 0x3F;
+            if (Sel >= 3) {
+                EmulOpDispatch (Sel - 3);
+                break;
+            }
+            // Selectors 0-2 fall through to the D0-based VM services below.
+        }
+
+        // Legacy VM services: opcodes $FE00-$FE0F dispatch on D0.
         if ((Opcode & 0xFFF0) == 0xFE00) {
-            STATIC UINTN DbgVMSvc = 0;
-            STATIC BOOLEAN DumpedEd = FALSE;
+            static UINTN DbgVMSvc = 0;
+            static BOOLEAN DumpedEd = FALSE;
             UINT16 Sel = g_M68kContext.D[0] & 0xFFFF;
             // One-time dump of the DR emulator data area (r31 = 0xB000 at
             // runtime): holds the per-selector stubs that $FE04/$FE05 tail
@@ -3108,7 +4089,7 @@ M68kExecuteInstruction (
         // Any other Line-F word (real FPU instructions etc.) must not
         // raise an exception either; log and continue.
         {
-            STATIC UINTN DbgLineF = 0;
+            static UINTN DbgLineF = 0;
             if (DbgLineF++ < 20) {
                 Print (L"68K LINE-F op 0x%04x @PC=0x%08x (ignored)\n",
                        Opcode, g_M68kContext.PC - 2);
@@ -3149,7 +4130,7 @@ M68kExecuteFromPPC (
     )
 {
     if (g_M68kContext.Halted) {
-        STATIC BOOLEAN HaltReported = FALSE;
+        static BOOLEAN HaltReported = FALSE;
         if (!HaltReported) {
             HaltReported = TRUE;
             Print (L"  68K HALTED flag observed at hook entry\n");
@@ -3160,8 +4141,8 @@ M68kExecuteFromPPC (
     // Canary tripwire: identify the era in which host-side context
     // bytes get zeroed between explicit initializations.
     if (g_M68kContext.DiagCanary != 0xDEADC0DEu) {
-        STATIC BOOLEAN FlipReported = FALSE;
-        STATIC UINT32 FlipCount = 0;
+        static BOOLEAN FlipReported = FALSE;
+        static UINT32 FlipCount = 0;
         FlipCount++;
         if (!FlipReported) {
             FlipReported = TRUE;
@@ -3196,6 +4177,75 @@ M68kExecuteFromPPC (
 
     // Sync PPC registers into 68K context
     M68kSyncFromPPC ();
+
+    // ---- PHASE C: batch-start hooks ------------------------------------
+    // Refresh the XLM block if the ROM's pool-scrubber wiped it. The scrub
+    // loop borrows [0x2800] as its own fill bound while running, so NEVER
+    // rewrite the signature while the 68K PC is inside that routine.
+    if ((UINT32)(g_M68kContext.PC - 0x40800500u) > 0x200u &&
+        M68kReadLong (PPC_XLM_SIGNATURE_OFFSET) != 0x42616168u) {
+        static UINTN XlmRefreshCount = 0;
+        XlmRefreshCount++;
+        if (XlmRefreshCount <= 4 || (XlmRefreshCount & 0xFF) == 0) {
+            Print (L"  XLM-REFRESH #%d @PC=%08x (was %08x)\n",
+                   (UINT32)XlmRefreshCount, g_M68kContext.PC,
+                   M68kReadLong (PPC_XLM_SIGNATURE_OFFSET));
+        }
+        M68kWriteLong (PPC_XLM_SIGNATURE_OFFSET, 0x42616168);
+        M68kWriteLong (PPC_XLM_KERNEL_DATA_OFFSET, 0xA000);
+        M68kWriteLong (PPC_XLM_RUN_MODE_OFFSET, 0);
+        M68kWriteLong (PPC_XLM_IRQ_NEST_OFFSET, 0);
+    }
+
+    // Fire due timers: pop any primed TMTask whose deadline has passed,
+    // push the return address, and jump to the task's handler with
+    // A1 = task pointer (Time Manager calling convention).
+    {
+        UINT32 DelayUs = 0;
+        UINT32 TmTask = EmulOpPopDueTimer (&DelayUs);
+        if (TmTask != 0) {
+            UINT32 TmAddr = M68kReadLong (TmTask + 8);
+            if (TmAddr != 0) {
+                static UINTN TimerFireCount = 0;
+                TimerFireCount++;
+                Print (L"  TM-FIRE #%d task=%08x addr=%08x\n",
+                       (UINT32)TimerFireCount, TmTask, TmAddr);
+                g_M68kContext.A[1] = TmTask;
+                M68kPushLong (g_M68kContext.PC);
+                g_M68kContext.PC = TmAddr;
+            }
+        }
+    }
+
+    // VBL interrupt injection: when the VIA tick has fired but a level-1
+    // interrupt vector is installed and the CPU is ready to take it, push
+    // the exception frame. The InInterrupt guard prevents nesting. Flags
+    // are only consumed when actually injected; otherwise they are ORed
+    // back so a later batch can still deliver them.
+    {
+        static UINTN VblCount = 0;
+        BOOLEAN Injected = FALSE;
+        UINT32 Flags = EmulOpGetAndClearInterruptFlags ();
+        if ((Flags & INTFLAG_VIA) != 0 &&
+            !g_M68kInInterrupt &&
+            !g_M68kContext.Halted &&
+            (g_M68kContext.SR & 0x0700) < 0x0100) {
+            UINT32 Vec = M68kReadLong (0x64);  // level-1 vector
+            if (Vec != 0 && Vec != 0xFFFFFFFFu) {
+                VblCount++;
+                if (VblCount < 8) {
+                    Print (L"  VBL #%d inject -> 0x%08x SR=%04x\n",
+                           (UINT32)VblCount, Vec, g_M68kContext.SR);
+                }
+                Injected = TRUE;
+                M68kRaiseException (1);        // vector 1 = level-1 ext int
+            }
+        }
+        if (!Injected && Flags != 0) {
+            EmulOpSignalInterrupt (Flags);     // keep pending for later
+        }
+    }
+    // ---- END PHASE C batch-start hooks ---------------------------------
 
     // Execute a batch of instructions for performance
     // Log the first few PCs to understand the code flow
@@ -3362,7 +4412,7 @@ M68kExecuteFromPPC (
             BOOLEAN TgtOk = (Target < 0x01000000u) ||
                             (Target >= 0x40800000u && Target < 0x41000000u);
             if (!TgtOk) {
-                STATIC INTN WalkerRedirects = -1;
+                static INTN WalkerRedirects = -1;
                 WalkerRedirects++;
                 if (WalkerRedirects < 8) {
                     UINT32 A1 = g_M68kContext.A[1];
@@ -3392,7 +4442,7 @@ M68kExecuteFromPPC (
         // control block), swap in our fabricated one so the walker lands on
         // the completion stub instead of garbage.
         if (g_M68kContext.PC == 0x408081F8u) {
-            STATIC BOOLEAN CblkSwapped = FALSE;
+            static BOOLEAN CblkSwapped = FALSE;
             UINT32 A1 = g_M68kContext.A[1];
             UINT32 Handler = M68kReadLong ((UINT32)(A1 + 0x44));
             UINT32 Chain = (UINT32)(A1 + Handler);
@@ -3429,7 +4479,7 @@ M68kExecuteFromPPC (
                 (D7 >= 0x20000000u && D7 < 0x23000000u) ||
                 (D7 >= 0x40800000u && D7 < 0x41000000u) ||
                 (D7 >= 0x68000000u && D7 < 0x69000000u);
-            STATIC INTN EcHits = -1;
+            static INTN EcHits = -1;
             EcHits++;
             if (!Plausible) {
                 UINTN K;
@@ -3450,8 +4500,8 @@ M68kExecuteFromPPC (
         // the whole thing execute natively now that BAD-RTS healing and
         // the jsr-chain redirect guard are active.
         if (g_M68kContext.PC == 0x40800112u) {
-            STATIC INTN DrSkipCount = -1;
-            STATIC BOOLEAN LoaderProbed = FALSE;
+            static INTN DrSkipCount = -1;
+            static BOOLEAN LoaderProbed = FALSE;
             DrSkipCount++;
             if (DrSkipCount < 4) {
                 Print (L"  DR-callback @0x40800112 entered (#%d, "
@@ -3492,8 +4542,8 @@ M68kExecuteFromPPC (
         if (g_M68kContext.PC == 0x40800626u ||
             g_M68kContext.PC == 0x4080062Au ||
             g_M68kContext.PC == 0x40800646u) {
-            STATIC INTN DpCount = -1;
-            STATIC UINT32 CycCount = 0;
+            static INTN DpCount = -1;
+            static UINT32 CycCount = 0;
             if (g_M68kContext.PC == 0x40800626u) {
                 CycCount++;
                 if (CycCount <= 12 || (CycCount & 15) == 0) {
@@ -3527,8 +4577,8 @@ M68kExecuteFromPPC (
         // prepares before this stage. Re-seeded idempotently at gate
         // entry because the pool scrubber wipes low memory.
         if (g_M68kContext.PC == 0x40804770u) {
-            STATIC UINT32 FillIter = 0;
-            STATIC INTN FillSeen2 = -1;
+            static UINT32 FillIter = 0;
+            static INTN FillSeen2 = -1;
             FillIter++;
             if ((FillIter & 0xFFFu) == 1u && FillSeen2 < 6) {
                 FillSeen2++;
@@ -3538,7 +4588,7 @@ M68kExecuteFromPPC (
             }
         }
         if (g_M68kContext.PC == 0x4080473Au) {
-            STATIC INTN FillSeen = -1;
+            static INTN FillSeen = -1;
             FillSeen++;
             if (FillSeen < 4) {
                 Print (L"  nkfill #%d c24=[%08x] d3=%08x a2=%08x "
@@ -3549,7 +4599,7 @@ M68kExecuteFromPPC (
             }
         }
         if (g_M68kContext.PC == 0x40804640u) {
-            STATIC BOOLEAN NkSeeded = FALSE;
+            static BOOLEAN NkSeeded = FALSE;
             if (!NkSeeded ||
                 M68kReadLong (0x824u) < 0x1000u) {
                 NkSeeded = TRUE;
@@ -3597,7 +4647,7 @@ M68kExecuteFromPPC (
         if (g_M68kContext.PC == 0x408046A4u ||
             g_M68kContext.PC == 0x40804828u ||
             g_M68kContext.PC == 0x408047AEu) {
-            STATIC INTN NkSeen = -1;
+            static INTN NkSeen = -1;
             NkSeen++;
             if (NkSeen < 10) {
                 if (g_M68kContext.PC == 0x408046A4u) {
@@ -3622,7 +4672,7 @@ M68kExecuteFromPPC (
             }
         }
         // Decompressor exit + post-return chain probes.
-        if (g_M68kContext.PC == 0x40800672u) {            STATIC INTN RtsSeen = -1;
+        if (g_M68kContext.PC == 0x40800672u) {            static INTN RtsSeen = -1;
             RtsSeen++;
             if (RtsSeen < 3) {
                 Print (L"  672rts #%d sp=%08x [sp]=%08x d7=%08x a6=%08x\n",
@@ -3634,7 +4684,7 @@ M68kExecuteFromPPC (
         if (g_M68kContext.PC == 0x4080011Eu ||
             g_M68kContext.PC == 0x40800122u ||
             g_M68kContext.PC == 0x40800126u) {
-            STATIC INTN ChainSeen = -1;
+            static INTN ChainSeen = -1;
             ChainSeen++;
             if (ChainSeen < 12) {
                 Print (L"  chain@%03x sp=%08x\n",
@@ -3650,7 +4700,7 @@ M68kExecuteFromPPC (
         // popped A6 points at plausible RAM, let the real decompressor run;
         // only fabricate the AB4E copy when A6 is unusable.
         if (g_M68kContext.PC == 0x4080011Au) {
-            STATIC INTN StreamSeen = -1;
+            static INTN StreamSeen = -1;
             UINT32 A6v = g_M68kContext.A[6];
             BOOLEAN A6ok =
                 (A6v >= 0x00002000u && A6v < 0x00040000u) ||
@@ -3695,13 +4745,13 @@ M68kExecuteFromPPC (
         // 0x8000-0xA100 window seeded by r1=0xA000 at EMUSTART. Anything
         // outside means some instruction moved the active SP unexpectedly.
         {
-            STATIC UINT32 WanderCount = 0;
+            static UINT32 WanderCount = 0;
             UINT32 SpNow = g_M68kContext.Supervisor ? g_M68kContext.SSP
                                                     : g_M68kContext.A[7];
-            if (WanderCount < 24 &&
+            if (WanderCount < 3 &&
                 (SpNow < 0x00000F00u || SpNow > 0x0000A100u)) {
                 WanderCount++;
-                Print (L"68K STACK WANDER SP=0x%08x @PC=0x%08x SR=%04x "
+                Print (L"68K W2 SP=0x%08x @PC=0x%08x SR=%04x "
                        L"D0=%08x D1=%08x D7=%08x A0=%08x A4=%08x A6=%08x "
                        L"C=%08x\n",
                        SpNow, g_M68kContext.PC, g_M68kContext.SR,
@@ -3718,7 +4768,7 @@ M68kExecuteFromPPC (
         // at point of use; without it the boot parks in the bra-self
         // deadloop at 0x408047AE.
         if (g_M68kContext.PC == 0x408047AEu) {
-            STATIC INTN ParkSeen = -1;
+            static INTN ParkSeen = -1;
             ParkSeen++;
             if (ParkSeen < 3) {
                 UINT32 K;
@@ -3754,7 +4804,7 @@ M68kExecuteFromPPC (
         }
         if (g_M68kContext.PC == 0x40804646u &&
             M68kReadLong (0x00000DB0u) != 0x5A932BC7u) {
-            STATIC BOOLEAN SeedReported = FALSE;
+            static BOOLEAN SeedReported = FALSE;
             M68kWriteLong (0x00000DB0u, 0x5A932BC7u);
             if (!SeedReported) {
                 SeedReported = TRUE;
@@ -3772,7 +4822,7 @@ M68kExecuteFromPPC (
         // [0x7844]=0x7800 (arena base), [0x7800]=0x77E0 (record buffer top
         // consumed by 'movea.l (a1),a7' before the +0x8000 stack switch).
         {
-            STATIC BOOLEAN ArenaReported = FALSE;
+            static BOOLEAN ArenaReported = FALSE;
             if (M68kReadLong (0x68FFEFF0u) == 0) {
                 M68kWriteLong (0x68FFEFF0u, 0x00007840u);
                 M68kWriteLong (0x00007844u, 0x00007800u);
@@ -3785,7 +4835,7 @@ M68kExecuteFromPPC (
             }
         }
         if (g_M68kContext.PC == 0x40807BB8u) {
-            STATIC UINTN MemcpyEntries = 0;
+            static UINTN MemcpyEntries = 0;
             if (MemcpyEntries < 12) {
                 MemcpyEntries++;
                 Print (L"68K MEMCPY entry src(A0)=0x%08x dst(A1)=0x%08x "
@@ -3818,7 +4868,7 @@ M68kExecuteFromPPC (
             // planting the sentinel at the source.
             if (g_M68kContext.A[0] < 0x00100000u &&
                 M68kReadLong (g_M68kContext.A[0]) != 0xFFFFFFFFu) {
-                STATIC BOOLEAN SentinelReported = FALSE;
+                static BOOLEAN SentinelReported = FALSE;
                 M68kWriteLong (g_M68kContext.A[0], 0xFFFFFFFFu);
                 M68kWriteLong (g_M68kContext.A[0] + 4, 0);
                 if (!SentinelReported) {
@@ -3833,7 +4883,7 @@ M68kExecuteFromPPC (
         // (0x408A8D60) to capture instruction-by-instruction execution up to
         // and including the mis-executed trampoline that corrupts the frame.
         {
-            STATIC BOOLEAN HnofScanned = FALSE;
+            static BOOLEAN HnofScanned = FALSE;
             if (g_M68kContext.PC == 0x4080AA10u && !HnofScanned) {
                 HnofScanned = TRUE;
                 UINT32 SlotVal = M68kReadLong (0x68FFEFD0u);
@@ -3886,7 +4936,7 @@ M68kExecuteFromPPC (
             }
         }
         {
-            STATIC BOOLEAN Afc6Probed = FALSE;
+            static BOOLEAN Afc6Probed = FALSE;
             if (g_M68kContext.PC == 0x4080AFC6u && !Afc6Probed) {
                 Afc6Probed = TRUE;
                 UINT32 Pv = M68kReadLong (0x68FFEFD0u);
@@ -3908,7 +4958,7 @@ M68kExecuteFromPPC (
             }
         }
         {
-            STATIC BOOLEAN Ab68Probed = FALSE;
+            static BOOLEAN Ab68Probed = FALSE;
             if (g_M68kContext.PC == 0x4080AB68u && !Ab68Probed) {
                 Ab68Probed = TRUE;
                 UINT32 Pv = M68kReadLong (0x68FFEFD0u);
@@ -3938,7 +4988,7 @@ M68kExecuteFromPPC (
              g_M68kContext.PC == 0x408081A8u ||
              g_M68kContext.PC == 0x40808200u ||
              g_M68kContext.PC == 0x408075D0u) && g_M68kDebugSteps == 0) {
-            STATIC BOOLEAN SsArmed = FALSE;
+            static BOOLEAN SsArmed = FALSE;
             if (!SsArmed) {
                 SsArmed = TRUE;
                 g_M68kDebugSteps = 2000;
@@ -3949,7 +4999,7 @@ M68kExecuteFromPPC (
         // Second trace window: platform-init / patch-VM region entered
         // after the gamma unwind. Trace from its entry to the BAD RTS.
         if (g_M68kContext.PC == 0x40800402u && g_M68kDebugSteps == 0) {
-            STATIC BOOLEAN SsArmed2 = FALSE;
+            static BOOLEAN SsArmed2 = FALSE;
             if (!SsArmed2) {
                 SsArmed2 = TRUE;
                 g_M68kDebugSteps = 1600;
@@ -3958,7 +5008,7 @@ M68kExecuteFromPPC (
         }
         // Third trace window: NK event-delivery context-save at E12E.
         if (g_M68kContext.PC == 0x4080E12Eu && g_M68kDebugSteps == 0) {
-            STATIC BOOLEAN SsArmed3 = FALSE;
+            static BOOLEAN SsArmed3 = FALSE;
             if (!SsArmed3) {
                 SsArmed3 = TRUE;
                 g_M68kDebugSteps = 1200;
@@ -3972,9 +5022,9 @@ M68kExecuteFromPPC (
         // continuation at 0x408001EE -- SheepShaver replaces these very
         // stages wholesale, so skipping one wedged entry is faithful.
         if (g_M68kContext.PC == 0x4080E0AAu) {
-            STATIC UINT32 LastSig = 0;
-            STATIC UINT32 Reps = 0;
-            STATIC BOOLEAN Escaped = FALSE;
+            static UINT32 LastSig = 0;
+            static UINT32 Reps = 0;
+            static BOOLEAN Escaped = FALSE;
             UINT32 Sig = g_M68kContext.D[0] ^ g_M68kContext.A[1];
             if (!Escaped && Sig == LastSig) {
                 UINT32 Sp = M68kGetStackPointer ();
@@ -4001,8 +5051,10 @@ M68kExecuteFromPPC (
             }
         }
         // Resolver exit probe: where does the computed table entry land?
+        // (The E022<->E04A wedge escape itself lives inside
+        // M68kExecuteInstruction — see RESOLVER-WEDGE there.)
         if (g_M68kContext.PC == 0x4080E05Au && g_M68kContext.D[0] == 0u) {
-            STATIC INTN RtSeen = -1;
+            static INTN RtSeen = -1;
             RtSeen++;
             if (RtSeen < 3) {
                 UINT32 A1 = g_M68kContext.A[1];
@@ -4067,7 +5119,7 @@ M68kExecuteFromPPC (
         if (g_M68kContext.PC == 0x4080E07Au &&
             M68kGetStackPointer () < 0x0002D000u &&
             g_M68kDebugSteps == 0) {
-            STATIC BOOLEAN SsArmed4 = FALSE;
+            static BOOLEAN SsArmed4 = FALSE;
             if (!SsArmed4) {
                 SsArmed4 = TRUE;
                 g_M68kDebugSteps = 500;
@@ -4112,7 +5164,7 @@ M68kExecuteFromPPC (
         // scrubber wipes low memory between eras.
         if (g_M68kContext.PC == 0x4084A34Eu &&
             M68kReadLong (0x2010u) != 0x40805140u) {
-            STATIC BOOLEAN TblReseeded = FALSE;
+            static BOOLEAN TblReseeded = FALSE;
             M68kWriteLong (0x2010u, 0x40805140u);
             if (!TblReseeded) {
                 TblReseeded = TRUE;
@@ -4121,7 +5173,7 @@ M68kExecuteFromPPC (
         }
         if (g_M68kContext.PC == 0x408047AEu &&
             M68kReadWord (g_M68kContext.PC) == 0x60FEu) {
-            STATIC BOOLEAN ParkReported = FALSE;
+            static BOOLEAN ParkReported = FALSE;
             if (!ParkReported) {
                 UINTN K;
                 UINT32 SpNow = g_M68kContext.Supervisor ?
@@ -4154,7 +5206,7 @@ M68kExecuteFromPPC (
             // there restores d0-d2/d7/a0-a1 from -$18(a5), unlinks and
             // rts up the 122-chain by itself. One-shot.
             {
-                STATIC BOOLEAN GammaUnwound = FALSE;
+                static BOOLEAN GammaUnwound = FALSE;
                 UINT32 A5 = g_M68kContext.A[5];
                 if (!GammaUnwound && A5 >= 0x00010000u && A5 < 0x00040000u) {
                     GammaUnwound = TRUE;
@@ -4197,6 +5249,9 @@ M68kExecuteFromPPC (
             break;
         }
     }
+    // PHASE C: advance the emulated microsecond clock by the number of
+    // instructions we just executed (approximation of real cycle count).
+    EmulOpAdvanceClock (Count);
     TotalExecuted += Count;
     // Periodic sampling: shows where the 68K interpreter is after the
     // initial 500-instruction trace window ends.

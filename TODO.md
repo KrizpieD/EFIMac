@@ -39,6 +39,189 @@ emulation wired to UEFI protocols.
 
 ### Recent work
 
+- **Phase B/C session 8 (2026-08-25 cont.7): method-1 bisection EXECUTED,
+  verdict definitive.** Escalated watches until the 0x7F4085 continuation
+  value's origin was unambiguous: it is NEVER stored by 68K code
+  (TRAMP-VAL), never pushed via M68kPushLong, never written by PPC
+  CpuWrite32 — and the region itself receives zero writes all boot from
+  either CPU (TRAMP-W). Stack dump at guard-halt showed the poison sits
+  DIRECTLY ABOVE a legitimate return (0x4087CA90): it is an ARGUMENT of
+  the call whose epilogue mis-skips. Caller decoded at 0x4087CA5C-92:
+  DBF loop; MOVE.L #$60082,D0; LEA $0DA0,A0; **A051 trap** (allocator,
+  result in A0 -> stored to $0CC8/$08A0); zone stores; then pushes word
+  $007F and table-JSRs (4EB0 81E1) into ANOTHER unseeded table whose
+  callee page-frames $007F into bogus 0x7Fxxxx continuations.
+  Implemented + A/B tested: HOSTTRAP A051 (page-aligned bump allocator,
+  honored the real 384KB request after enlarging arena to 1MB) — works;
+  CA86-SKIP interceptor — REJECTED (diverts into $FF-filled low RAM,
+  worse than deterministic guard halt). Also swept yet another
+  reintroduced uppercase-STATIC batch (6 sites). STABLE CONFIG RESTORED:
+  rescue -> WSCRUB-EMPTY -> real MM trap -> NKHEAP/A051 services ->
+  single clean ZERO-EXEC halt, zero ILLEGALs.
+  CONCLUSION OF BISECTION: no single neutralized patch is responsible —
+  MULTIPLE independent dispatch tables + allocator state are simply never
+  constructed in our environment; every consumer surfaces a different
+  symptom. Further interpreter-side intervention has negative ROI.
+  REMAINING PATH TO DESKTOP requires reference state: seed (a) the
+  trampoline page at ~0x7F4000, (b) full [08A4] heap-chain semantics,
+  (c) the CA86 table's entries — obtainable only from a real-hardware
+  dump or same-ROM reference run (BasiliskII/SheepShaver), then installed
+  in bootloader_impl exactly like our working KDP/XLM seeds. All tooling,
+  watches, and one-line milestone logs are in place for that session.
+- **Phase B/C session 7 (2026-08-25 cont.6): continuation-target hunt.**
+  Added TRAMP-W (all guest writes into 0x7F0000-0x800000, both CPU paths)
+  and TRAMP-PUSH (M68kPushLong values in range). Result: ZERO of either —
+  the 0x7F4085 continuation target is never written nor pushed, so it
+  reaches the stack via arithmetic or a ROM-table absolute load. Combined
+  with its stable value across runs, conclusion: REAL hardware builds NK
+  continuation stubs at a FIXED low-RAM location (~0x7F4xxx) during an NK
+  init stage our patch set neutralized/skipped; the RTS-through-callback
+  then lands in zeros here. Tooling now in place: ZERO-EXEC guard (halts
+  with ring), TRAMP watches, THUNK-W, LOW-SP rescue (2 fires, args now
+  coherent), WSCRUB-EMPTY exit, NKHEAP-SEED chain. Stable end state:
+  guard-halt immediately at first missing continuation — clean, fast,
+  fully diagnosable.
+  DEFINITIVE NEXT STEP (needs reference data, not more inference):
+  obtain expected content/state of (a) 0x7F4000 trampoline page and
+  (b) [0x08A4] heap chain from a reference (real dump / BasiliskII+same
+  ROM run / SheepShaver synthetic equivalents), then seed both during
+  bootloader install exactly like KDP/XLM seeds. Interim alternative:
+  bisect our 11 NKPATCH sites by re-enabling one at a time to find which
+  stage would have built the stubs.
+- **Phase B/C session 6 (2026-08-25 cont.5): seeding executed + ZERO-EXEC
+  guard landed.** Implemented: (1) host trap-service framework in case 0xA;
+  replaced guess-the-convention allocator with NKHEAP-SEED — zone chain
+  [0x08A4]->master(0x61000)->zone(0x61100)->[z+0x16]=node(0x61200)->block
+  base(0x62000) so genuine ROM heap handlers walk valid memory; fires once,
+  verified. (2) ZERO-EXEC GUARD: opcode 0000 executed >=0x10000 in low RAM
+  halts with 32-deep PC ring instead of silently crawling megabytes of
+  ORI.B no-ops. (3) Alias windows FF0/FF4/FF8 made READ-ONLY (stray
+  broken-stack frame writes were corrupting the shared ROM buffer).
+  ROOT DISCOVERY via guard's ring: the post-NewHandle loss is NK's
+  CONTINUATION-TRAMPOLINE pattern — code pushes a callback address
+  (~0x7F4085, RAM) then RTS-jumps through it; the builder that should have
+  copied those stub bytes into the 0x7Fx region never ran/was skipped.
+  STABLE END STATE per run: rescue -> WSCRUB-EMPTY exit -> real MacOS MM
+  trap ($A833 -> 0x40879790) -> guard-halt at first missing continuation.
+  NEXT SESSION (single focused mission): find the trampoline BUILDER —
+  watchpoint writes into 0x7F0000-0x800000 during earlier eras (who was
+  SUPPOSED to copy stubs there), likely one of the stages our NKPATCH
+  sites neutralized; restore it selectively. Alternative: synthesize the
+  expected continuation stubs ourselves once their bytes are known (dump
+  from a reference run of the same ROM under BasiliskII/SS).
+- **Phase B/C session 5 (2026-08-25 cont.4): SEEDING BREAKTHROUGH.** Chain
+  of interventions that MOVED THE FRONTIER for the first time in days:
+  (1) ROM alias widened to ALL FOUR 4MB windows (FF0/FF4/FF8/FFC) so
+  unrelocated 0xFFxxxxxx table entries resolve everywhere;
+  PPC_MAX_GUEST_REGIONS 8->20. (2) CALLER micro-trace caught the arg=6
+  producer red-handed: live `LEA -$156(A7),A7` allocating a 346-byte local
+  frame on SP=0xE -> frames land in alias-ROM -> args are garbage.
+  (3) LOW-SP RESCUE v2: when PC first enters 0x40804960-4B00 with
+  SP<0x400, reseat stack to 0x7800 (below abandoned 0x7FFC boot stack).
+  Result: CA00-SKIP stopped firing (args coherent), clear-loop bound
+  became 0x7806 (caller's own frame region). (4) WSCRUB-EMPTY: stale A0
+  (ROM garbage) vs RAM bound -> complete as no-op, return success.
+  RESULT: boot EXITS the 0x4087CA24 spin and executes REAL MacOS code:
+  builds structures in rescued RAM, calls **_NewHandle ($A833)** through
+  the trap dispatcher into the Memory Manager at 0x40879790. Next wall:
+  MM handler reads current-zone pointer [0x08A4] = garbage (no
+  InitApplZone/SysZone ever ran) -> later jumps into zeroed 0x7F56xx.
+  NEXT SESSION (clear mission): seed classic MacOS low-memory globals —
+  zone pointers ([0x908]/[0x90A] current zone, SysZone/ApplZone bases,
+  [0x114] ApplLimit, stack bounds) either by porting SheepShaver
+  patch_68k()'s global-init block or by driving the ROM's own heap init
+  with proper boot blocks. Then continue toward Finder/desktop.
+- **Phase B/C session 4 (2026-08-25 cont.3):** Executed deep-dive on the NK
+  MixedMode wall. Findings: (1) THUNK-W watchpoint proved the dispatch
+  tables receive ZERO writes all boot — Apple's loader/an early NK stage
+  that never runs here is their only producer. (2) Decoded the full thunk
+  family: {MOVE.L tbl(A0,Dn.L),-(SP); MOVE.L (Am),D0; ORI.B #sel,Dx; RTS}
+  at 0x40804xxx-4088xxxx, variants with (A0)/(A2) bases and sel bytes
+  $60-$88. Built THUNK-NULL family interceptor (shape-match + validated
+  return w/ healer fallback) — works mechanically, but D0=0 null-return
+  diverts callers into untested paths (alias-stack jumps); DISABLED via
+  flag after A/B testing showed the original BAD-RTS-heal path is MORE
+  stable (~193M instructions, zero illegals vs early halt). (3) LOW-SP
+  detector mapped the stack collapse: NK's relocating-bootstrap web
+  (0x408004D6-59C copy-loops + JMP (A0/A2) chains) legitimately runs on
+  near-zero stacks; routines are continuation-style (JMP-entered, no
+  return addr) — stack rescue TESTED AND REJECTED (RTS pops garbage,
+  halts 68K early). (4) Found+fixed a REINTRODUCED STATIC-macro bug in
+  session-added code (uppercase STATIC = empty again -> automatic
+  counters; re-swept to lowercase static). STABLE STATE RESTORED:
+  ~193M instructions, frontier unchanged at 0x4087CA24 spin.
+  NEXT SESSION: stop intervening at the interpreter layer. The only
+  remaining lever is SEEDING the tables: dump what the tables must hold
+  from a real New World ROM's post-loader state (boot a reference
+  emulator / extract from SheepShaver's own generated images), then write
+  those bytes in bootloader_impl during ROM install — same approach as
+  our existing KDP/ECB/XLM seeds which already work.
+- **Phase B/C session 3 (2026-08-25 cont.2):** Executed plan items a/b/c.
+  (c) Escapes disabled -> IDENTICAL frontier => escapes never skipped a
+  needed builder; re-enabled nothing lost. (b) SheepShaver diff yielded
+  RomRelocateJumpTables(): New World image stores 68K jump-table entries as
+  0xFFxxxxxx ROM-relative words that Apple's loader rebases; we now scan for
+  header {41FA000E 21C82010 4E75}, rebase every 0xFFxxxxxx longword to
+  (v&0x3FFFFF)+RomBase, skip zeros, chain blocks (found+fixed 72 entries @
+  ROM+0x5130). (a) Sentinel audit traced the arg=6 producer: caller frame
+  at ret 0x40804AD8 pushes literal 6; upstream state poisoned by the FIRST
+  dead tail-dispatch (stub family {MOVE.L tbl(A0,D1.l),-(SP); MOVE.L (A0),
+  D0; ORI.B #sel,D0; RTS} array at 0x4080A460.. stride 0x10, per-selector
+  trampolines of the NK MixedMode/DR layer). Added CA00-SKIP (rts when arg
+  implausible) + DEADTBL diagnostics. STILL WALLS at 0x4087CA24 spin.
+  KEY NEW OBSERVATION: NK runs this stage with SP=0xFFFFFExx — a CLASSIC-
+  MAP-style top-of-memory stack through the 0xFFC alias, and executes code
+  AT FFC4Axxx alias addresses; suspect an entire NK init stage assumes the
+  classic memory map or expects Apple-loader-relocated tables we only
+  partially replicate.
+  NEXT SESSION STRATEGY (stop patching symptoms): port SheepShaver's
+  patch_nanokernel_boot WHOLESALE for New World — replace this entire
+  dispatcher/init region with hand-built equivalents like SS does
+  (LA_EmulatorCode/LA_DispatchTable already exist; extend to the 68K-side
+  thunk array + its RAM tables), OR emulate Apple's loader step-for-step:
+  find what fills the RAM table the thunks index (watchpoint writes to
+  0xC16/0xC34 region during early boot) and seed those values ourselves.
+- **Phase B/C session 2 (2026-08-25 cont.):** Decoded the 130M-instruction
+  frontier fully. Chain: boot glue 0x408001BA BSRs a tail-dispatch stub
+  (MOVE.L tbl(A0,D1.L),-(SP); RTS) whose RAM table slot holds sentinel 1 ->
+  BAD RTS -> healed -> NK init runs LINE-A $A019 handlers correctly -> later
+  function 0x4087CA00 (LINK/MOVEM prologue; arg struct at 8(A6)) clears via
+  CLR.W (A0)+/CMPA.L (A1),A0/BNE.S where A1=A4+4 and [A4+4] must hold the
+  region END pointer; ours holds 6 -> infinite spin. Added WSCRUB-WEDGE
+  escape doing faithful LINK-frame unwind ([A6+4]=ret, restore D2/A2/A4 from
+  [A6-4/-8/-12]) -> works, returns to 0x40804AD8 repeatedly. BUT every pass
+  re-enters more dead-table tail-dispatches (RTS->1 at 0x40870766,
+  0x4087CC7C, 0x40881518...) until JMP (A1)->0x1E000000 runaway.
+  **CONCLUSION: whack-a-mole escapes exhausted; root gap is UNSEEDED NK INIT
+  TABLES** (slots holding small-int sentinels where pointers belong —
+  something upstream writes success-sentinels into pointer slots, or an
+  entire seeding stage never ran). NEXT SESSION: (a) find who writes 1 into
+  [0x40804994]/friends — audit bootloader_impl seeds + NK patch layer for
+  constant-1 stores into ROM-page tables; (b) diff our low-mem/NK-area
+  layout vs SheepShaver rom_patches.cpp InitAwake/patch sequence for the
+  missing stage; (c) consider running the NK's own table-builder instead of
+  skipping it (the resolver-wedge escape may have SKIPPED the builder!).
+  Revert candidate if (c): RESOLVER-WEDGE one-shot may be too eager.
+- **Phase B/C session (2026-08-25):** `STATIC`-macro bug fixed project-wide —
+  gnu-efi's `#define STATIC` (empty) made every "static" local automatic, so
+  ALL one-shot guards/repetition detectors silently reset each call; replaced
+  with real `static` across src/ (12 files). Phase C `emul_op.c/.h` now
+  compile clean (translation.h include, 8KB NVRAM array, RMVTIME wired to
+  EmulTimerRemove). m68k.c: RTR pops CCR+PC (was RTE); NBCD/ABCD/SBCD proper
+  BCD adjust + ANDed-Z/X/C; ADDX/SUBX both forms with X/Z/V/N; real CHK trap;
+  native FE40+ EMUL_OP routing to EmulOpDispatch(sel-3); XLM refresh gate
+  (skips while PC inside scrub loop — [0x2800] doubles as the scrub bound!);
+  VBL injection no longer consumes flags it cannot deliver; timer fire sets
+  A1=task. interpreter.c: PpcEmulatorDispatchOp routes markers>=3 to
+  EmulOpDispatch. **Post-increment bug fixed in M68kReadEA** ((An)+ sources
+  never advanced the register — root cause of BAD-RTS frame storms).
+  Fast paths: low-mem scrub loop bulk-filled ([2800] 'Baah' clamp), resolver
+  wedge escape E022<->E04A -> trampoline 0x408001EE via stack scan.
+  **Boot frontier: ~130M instructions deep in NK init**, parked at word-clear
+  spin 0x4087CA20 (`CLR.W (A0)+ / CMPA.L (A1),A0 / BNE.S`) where [A1]=0x6 is
+  not a valid end pointer — upstream register contract unmet (suspect the
+  healed BAD RTS #0 at 0x4080A49C resumed mid-function). Next: trace callers
+  of the 7CA20 routine and why A1 is garbage; then continue Phase D/E.
 - **Phase A complete** (see the phase section below for the full list): MSR
   boot-path selection documented empirically; PMDT builder skip + gated
   injection; SCC device with scrub-proof poll hook and banner echo;

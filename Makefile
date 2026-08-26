@@ -62,6 +62,7 @@ APP_SRCS := \
 	src/ui/ui_impl.c \
 	src/cpu/interpreter.c \
 	src/cpu/m68k.c \
+	src/cpu/emul_op.c \
 	src/cpu/translation_impl.c \
 	src/memory/manager_impl.c \
 	src/hardware/abstraction_impl.c \

@@ -30,40 +30,40 @@ typedef struct {
 } PPC_HARDWARE_CONTEXT;
 
 // Global hardware context
-STATIC PPC_HARDWARE_CONTEXT g_HardwareContext = {0};
+static PPC_HARDWARE_CONTEXT g_HardwareContext = {0};
 
 // Real UEFI protocol instances found by the HAL
-STATIC EFI_GRAPHICS_OUTPUT_PROTOCOL  *g_Gop              = NULL;
-STATIC UINT32                         g_FramebufferPitch = 0;
-STATIC EFI_GRAPHICS_PIXEL_FORMAT      g_PixelFormat      = PixelRedGreenBlueReserved8BitPerColor;
-STATIC EFI_SIMPLE_FILE_SYSTEM_PROTOCOL **g_FileSystems    = NULL;
-STATIC UINTN                          g_FileSystemCount  = 0;
+static EFI_GRAPHICS_OUTPUT_PROTOCOL  *g_Gop              = NULL;
+static UINT32                         g_FramebufferPitch = 0;
+static EFI_GRAPHICS_PIXEL_FORMAT      g_PixelFormat      = PixelRedGreenBlueReserved8BitPerColor;
+static EFI_SIMPLE_FILE_SYSTEM_PROTOCOL **g_FileSystems    = NULL;
+static UINTN                          g_FileSystemCount  = 0;
 
 // Real network interface state
-STATIC struct {
+static struct {
     EFI_SIMPLE_NETWORK_PROTOCOL *Snp;
     BOOLEAN                      Inited;
 } g_SnpIfaces[PPC_MAX_NETWORK_INTERFACES];
-STATIC UINTN                          g_SnpIfaceCount   = 0;
-STATIC EFI_SIMPLE_NETWORK_PROTOCOL   *g_Snp             = NULL;
-STATIC PPC_NETWORK_INFO               g_NetworkInfo     = {0};
-STATIC BOOLEAN                        g_NetworkInited   = FALSE;
+static UINTN                          g_SnpIfaceCount   = 0;
+static EFI_SIMPLE_NETWORK_PROTOCOL   *g_Snp             = NULL;
+static PPC_NETWORK_INFO               g_NetworkInfo     = {0};
+static BOOLEAN                        g_NetworkInited   = FALSE;
 
 // Real block device state
-STATIC EFI_BLOCK_IO_PROTOCOL         **g_BlockDevices    = NULL;
-STATIC UINTN                          g_BlockDeviceCount = 0;
-STATIC PPC_BLOCK_IO_INFO              g_BlockIoInfo      = {0};
+static EFI_BLOCK_IO_PROTOCOL         **g_BlockDevices    = NULL;
+static UINTN                          g_BlockDeviceCount = 0;
+static PPC_BLOCK_IO_INFO              g_BlockIoInfo      = {0};
 
 // Emulated audio device state
-STATIC PPC_AUDIO_INFO                 g_AudioInfo        = {0};
-STATIC BOOLEAN                        g_AudioInited      = FALSE;
+static PPC_AUDIO_INFO                 g_AudioInfo        = {0};
+static BOOLEAN                        g_AudioInited      = FALSE;
 
 /**
   Fill the real GOP framebuffer with a simple pattern so that the wired
   graphics output is visibly non-trivial. Handles both RGB and BGR
   pixel layouts.
 **/
-STATIC
+static
 VOID
 GraphicsFillFramebuffer (
     IN UINT32 R,
@@ -106,7 +106,7 @@ GraphicsFillFramebuffer (
   Locate the Graphics Output Protocol instance. On success g_Gop points at
   the protocol and the framebuffer is available through its mode information.
 **/
-STATIC
+static
 EFI_STATUS
 GraphicsLocateGop (
     VOID
@@ -1062,7 +1062,7 @@ PpcGetFrameBufferInfo (
   Read a pixel from the guest framebuffer (big-endian 0xRRGGBB00).
   Unmapped or out-of-bounds reads return zero.
 **/
-STATIC
+static
 UINT32
 FrameBufferReadPixel (
     IN UINT32 X,
@@ -1088,7 +1088,7 @@ FrameBufferReadPixel (
   Write a pixel to the guest framebuffer in big-endian 0xRRGGBB00 layout.
   Out-of-bounds writes are dropped.
 **/
-STATIC
+static
 VOID
 FrameBufferWritePixel (
     IN UINT32 X,

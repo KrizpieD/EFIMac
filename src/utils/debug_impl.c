@@ -14,7 +14,7 @@ typedef struct {
 } PPC_DEBUG_CONTEXT;
 
 // Global debug context
-STATIC PPC_DEBUG_CONTEXT g_DebugContext = {0};
+static PPC_DEBUG_CONTEXT g_DebugContext = {0};
 
 EFI_STATUS
 PpcInitializeDebug (

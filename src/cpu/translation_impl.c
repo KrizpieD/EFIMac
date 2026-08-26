@@ -143,10 +143,10 @@ PpcSetFpscrValue (
 // CPU self-test
 // ---------------------------------------------------------------------------
 
-STATIC UINTN g_SelfTestPasses    = 0;
-STATIC UINTN g_SelfTestFailures  = 0;
+static UINTN g_SelfTestPasses    = 0;
+static UINTN g_SelfTestFailures  = 0;
 
-STATIC VOID
+static VOID
 SelfTestCheck (
     IN BOOLEAN Ok,
     IN CHAR16* Name
@@ -162,9 +162,9 @@ SelfTestCheck (
 }
 
 // 256-byte window mapped at guest addresses 0x10000..0x100FF for load/store tests
-STATIC UINT8 g_SelfTestMem[256];
+static UINT8 g_SelfTestMem[256];
 
-STATIC UINT8
+static UINT8
 SelfTestReadByte (
     IN UINT32 Address
     )
@@ -175,7 +175,7 @@ SelfTestReadByte (
     return 0;
 }
 
-STATIC VOID
+static VOID
 SelfTestWriteByte (
     IN UINT32 Address,
     IN UINT8  Value

@@ -57,14 +57,14 @@ typedef struct {
 } PPC_BOOTLOADER_CONTEXT;
 
 // Global bootloader context
-STATIC PPC_BOOTLOADER_CONTEXT g_BootContext = {0};
+static PPC_BOOTLOADER_CONTEXT g_BootContext = {0};
 
 // ---------------------------------------------------------------------------
 // File load helper: read a whole file from the boot volume into a page-aligned
 // buffer (UEFI pool allocations are limited to ~128 KB; Mac OS ROM images are
 // several MB, so ROM/ROM-like blobs are page-backed).
 // ---------------------------------------------------------------------------
-STATIC
+static
 EFI_STATUS
 BootOpenFile (
     IN  CHAR16* FilePath,
@@ -114,7 +114,7 @@ BootOpenFile (
     return EFI_SUCCESS;
 }
 
-STATIC
+static
 EFI_STATUS
 BootReadFileInto (
     IN  EFI_FILE_HANDLE File,
@@ -151,7 +151,7 @@ BootReadFileInto (
 // Read a whole file from the boot volume into a page-aligned buffer (UEFI
 // pool allocations are limited to ~128 KB; ROM and system blobs are several MB,
 // so they are page-backed).
-STATIC
+static
 EFI_STATUS
 BootReadFileToPages (
     IN  CHAR16* FilePath,
@@ -200,7 +200,7 @@ BootReadFileToPages (
 }
 
 // Check whether a file exists on the boot volume and get its size.
-STATIC
+static
 EFI_STATUS
 BootFileExists (
     IN  CHAR16* FilePath,
@@ -229,7 +229,7 @@ BootFileExists (
 }
 
 // Check whether a directory exists on the boot volume.
-STATIC
+static
 EFI_STATUS
 BootDirectoryExists (
     IN  CHAR16* DirPath,
@@ -268,10 +268,10 @@ BootDirectoryExists (
 // ---------------------------------------------------------------------------
 // Boot self-test bookkeeping (mirrors the CPU self-test style)
 // ---------------------------------------------------------------------------
-STATIC UINTN g_BootTestPasses   = 0;
-STATIC UINTN g_BootTestFailures = 0;
+static UINTN g_BootTestPasses   = 0;
+static UINTN g_BootTestFailures = 0;
 
-STATIC VOID
+static VOID
 BootSelfTestCheck (
     IN BOOLEAN Ok,
     IN CHAR16* Name
@@ -287,7 +287,7 @@ BootSelfTestCheck (
 }
 
 // Write a big-endian 32-bit word into guest memory.
-STATIC VOID
+static VOID
 BootWriteWord32 (
     IN UINT32 Address,
     IN UINT32 Value
@@ -300,7 +300,7 @@ BootWriteWord32 (
 }
 
 // NUL-terminated bounded string copy (avoids GNU-EFI StrnCpy padding pitfalls).
-STATIC VOID
+static VOID
 BootCopyString (
     OUT CHAR16* Dst,
     IN  CHAR16* Src,
@@ -315,7 +315,7 @@ BootCopyString (
 }
 
 // Case-insensitive CHAR16 comparison (ASCII; no GNU-EFI Stricmp dependency).
-STATIC INTN
+static INTN
 BootStriCmp (
     IN CHAR16* A,
     IN CHAR16* B
@@ -339,7 +339,7 @@ BootStriCmp (
 }
 
 // Build "DirPath\FileName" into OutPath (bounded).
-STATIC VOID
+static VOID
 BootBuildPath (
     IN  CHAR16* DirPath,
     IN  CHAR16* FileName,
@@ -365,7 +365,7 @@ BootBuildPath (
 }
 
 // Allocate and map the guest staging area for System/Finder/Mac OS ROM.
-STATIC EFI_STATUS
+static EFI_STATUS
 BootEnsureSystemArea (
     VOID
     )
@@ -401,7 +401,7 @@ BootEnsureSystemArea (
 }
 
 // Allocate and map the guest staging area for drivers (extensions).
-STATIC EFI_STATUS
+static EFI_STATUS
 BootEnsureDriverArea (
     VOID
     )
@@ -436,7 +436,7 @@ BootEnsureDriverArea (
     return EFI_SUCCESS;
 }
 
-STATIC VOID
+static VOID
 BootExtractFileName (
     IN  CHAR16* Path,
     OUT CHAR16* Name,
@@ -444,7 +444,7 @@ BootExtractFileName (
     );
 
 // Stage a single file from the boot volume into a guest staging area.
-STATIC EFI_STATUS
+static EFI_STATUS
 BootStageFile (
     IN  CHAR16* FilePath,
     IN  PPC_SYSTEM_FILE_TYPE Type,
@@ -507,7 +507,7 @@ BootStageFile (
 // Stage a single file from the mounted HFS volume into a guest staging area.
 // Mirrors BootStageFile but reads the data fork through the in-emulator HFS
 // reader (PpcHfsReadFile) instead of the FAT boot volume.
-STATIC EFI_STATUS
+static EFI_STATUS
 BootStageHfsFile (
     IN  PPC_HFS_ENTRY*     Entry,
     IN  CHAR16*            ReportPath,
@@ -557,7 +557,7 @@ BootStageHfsFile (
 }
 
 // Enumerate the Extensions folder and register every file as a driver.
-STATIC EFI_STATUS
+static EFI_STATUS
 BootEnumerateExtensions (
     VOID
     )
@@ -650,7 +650,7 @@ BootEnumerateExtensions (
 // Enumerate the Extensions folder on the attached Mac OS disc (in-emulator
 // HFS/HFS+ reader) and register every file as a driver. Mirrors
 // BootEnumerateExtensions, which reads the FAT boot volume instead.
-STATIC EFI_STATUS
+static EFI_STATUS
 BootEnumerateExtensionsHfs (
     VOID
     )
@@ -711,7 +711,7 @@ BootEnumerateExtensionsHfs (
 }
 
 // Extract the trailing file name component from a path.
-STATIC VOID
+static VOID
 BootExtractFileName (
     IN  CHAR16* Path,
     OUT CHAR16* Name,
@@ -1001,13 +1001,13 @@ PpcGetBootInfo (
 // 8.5+) are CHRP-style and begin with the <CHRP-BOOT> marker; classic Old
 // World PowerPC firmware dumps (System 7 through early Mac OS 8) do not, so
 // any other non-empty image the user supplies is treated as Old World.
-STATIC UINT32
+static UINT32
 BootIdentifyRomType (
     IN const UINT8* Rom,
     IN UINTN        Size
     )
 {
-    STATIC const UINT8 ChrpBoot[11] = { '<', 'C', 'H', 'R', 'P', '-',
+    static const UINT8 ChrpBoot[11] = { '<', 'C', 'H', 'R', 'P', '-',
                                         'B', 'O', 'O', 'T', '>' };
     if (Rom == NULL || Size == 0) {
         return PPC_ROM_TYPE_UNKNOWN;
@@ -1034,7 +1034,7 @@ BootIdentifyRomType (
 // expands to the flat 4 MB ROM window the CPU boots from. (Same layout as
 // SheepShaver rom_patches.cpp DecodeROM/decode_parcels/decode_lzss.)
 
-STATIC UINT32
+static UINT32
 BootReadBe32 (
     IN const UINT8* P
     )
@@ -1046,7 +1046,7 @@ BootReadBe32 (
 // Read the hexadecimal constant that immediately precedes the token
 // "constant <Name>" inside the CHRP descriptor text, e.g. the "01BFC0" in
 // "h# 01BFC0 constant parcels-offset". Returns TRUE and sets *Value on match.
-STATIC BOOLEAN
+static BOOLEAN
 BootFindChrpHexConstant (
     IN const UINT8* Data,
     IN UINTN        Size,
@@ -1054,7 +1054,7 @@ BootFindChrpHexConstant (
     OUT UINT32*     Value
     )
 {
-    STATIC const CHAR8 Token[] = "constant ";
+    static const CHAR8 Token[] = "constant ";
     UINTN NameLen = 0;
     UINTN I;
 
@@ -1125,7 +1125,7 @@ BootFindChrpHexConstant (
 // The decoder is not reentrant in this single-threaded boot path.
 static UINT8 g_LzssDict[0x1000];
 
-STATIC VOID
+static VOID
 BootLzssDecode (
     IN const UINT8* Src,
     IN UINTN        Size,
@@ -1174,7 +1174,7 @@ BootLzssDecode (
 
 // Walk the 'prcl' parcel chain and expand the 'rom ' parcel (LZSS) into the
 // flat ROM image buffer Dest.
-STATIC EFI_STATUS
+static EFI_STATUS
 BootDecodeParcels (
     IN const UINT8* Parcels,
     IN UINTN        ParcelsSize,
@@ -1232,7 +1232,7 @@ BootDecodeParcels (
 // and *OutSize is the mapped size; the caller owns it and should free the
 // original compressed file buffer. Returns FALSE if the image is not a CHRP
 // file or cannot be decoded.
-STATIC BOOLEAN
+static BOOLEAN
 BootDecodeChrpRom (
     IN  const UINT8* Buffer,
     IN  UINTN        Size,
@@ -1240,7 +1240,7 @@ BootDecodeChrpRom (
     OUT UINTN*       OutSize
     )
 {
-    STATIC const UINT8 ChrpBoot[11] = { '<', 'C', 'H', 'R', 'P', '-',
+    static const UINT8 ChrpBoot[11] = { '<', 'C', 'H', 'R', 'P', '-',
                                         'B', 'O', 'O', 'T', '>' };
     UINT32 ParcelsOffset = 0;
     UINT32 ParcelsSize = 0;
@@ -1335,7 +1335,7 @@ PpcLoadSystemRom (
 // (e.g. "Power Mac G4 Install:System Folder:Mac OS ROM"), so it is located by
 // a whole-catalog search rather than a fixed path. Used as a fallback when
 // the boot volume has no ROM file.
-STATIC EFI_STATUS
+static EFI_STATUS
 BootLoadHfsRomToPages (
     OUT VOID**  Buffer,
     OUT UINTN*  Size
@@ -1470,12 +1470,32 @@ PpcInstallSystemRom (
     // 0xFFC00000..0xFFFFFFFF on real hardware. New World dispatch tables
     // hold 0xFFC4xxxx pointers that must resolve here. Same host buffer
     // => both views stay consistent.
+    //
+    // SEEDING (session 5): mirror the image across ALL FOUR 4 MB windows
+    // of the 0xFF half (FF0/FF4/FF8/FFC). Unrelocated table entries in the
+    // image encode ROM offsets as 0xFFxxxxxx words; Apple's loader rebases
+    // them, but any entry we missed then reads as an address in FF0-FFB
+    // and faults. With every window mapped, such entries resolve directly
+    // (VA & 0x3FFFFF == offset within window), exactly like classic 24-bit
+    // ROM mirroring. The FFC window keeps its existing linear semantics.
     if (g_BootContext.RomType == PPC_ROM_TYPE_NEW_WORLD && Size == 0x00400000u) {
         EFI_STATUS AliasStatus =
             PpcAddGuestMemoryRegion(Buffer, 0xFFC00000u, (UINT32)Size,
                                     FALSE);
         Print(L"ROM alias installed: %d bytes at guest 0xFFC00000 (%r)\n",
               (UINT64)Size, AliasStatus);
+        {
+            static const UINT32 ExtraWindows[3] =
+                { 0xFF000000u, 0xFF400000u, 0xFF800000u };
+            UINTN W;
+            for (W = 0; W < 3; W++) {
+                // Read-only: stray frame allocations from broken-stack eras
+                // must not corrupt the shared ROM host buffer.
+                EFI_STATUS S2 = PpcAddGuestMemoryRegion(
+                    Buffer, ExtraWindows[W], (UINT32)Size, TRUE);
+                Print(L"ROM alias window %08x (%r)\n", ExtraWindows[W], S2);
+            }
+        }
 
         // SheepShaver-equivalent boot-structure patches
         // (rom_patches.cpp: patch_nanokernel_boot):
@@ -1547,7 +1567,7 @@ PpcInstallDemoRom (
     // lwz r4, 0(r3)      ; r4 = ROM[0] = 'ROM1'
     // addi r5, r4, 1     ; r5 = 'ROM1' + 1
     // stw r5, 0(r1)      ; store to guest RAM via r1
-    STATIC const UINT32 DemoProgram[4] = {
+    static const UINT32 DemoProgram[4] = {
         0x3C60FFF0,
         0x80830000,
         0x38A40001,
@@ -1796,7 +1816,7 @@ PpcSetupBootEnvironment (
 
 // Write a big-endian 32-bit word into the ROM host buffer (the same backing
 // the interpreter's CpuRead16 reads, so the patch is immediately visible).
-STATIC VOID
+static VOID
 RomPatchWriteWord32 (
     IN UINT8*  Rom,
     IN UINT32  Offset,
@@ -1809,6 +1829,85 @@ RomPatchWriteWord32 (
     Rom[Offset + 3] = (UINT8)Value;
 }
 
+// Read a big-endian 32-bit word from the ROM host buffer.
+static UINT32
+RomPatchReadWord32 (
+    IN UINT8*  Rom,
+    IN UINT32  Offset
+    )
+{
+    return ((UINT32)Rom[Offset + 0] << 24) |
+           ((UINT32)Rom[Offset + 1] << 16) |
+           ((UINT32)Rom[Offset + 2] << 8)  |
+            (UINT32)Rom[Offset + 3];
+}
+
+// Relocate the ROM's 68K jump tables (SheepShaver rom_patches.cpp
+// "Relocate jump tables ($2000..)"). The New World image stores table
+// entries as 0xFFxxxxxx words encoding a ROM-relative offset; Apple's own
+// boot loader rebases them to absolute addresses before the nanokernel
+// uses them. We ship no such loader, so every entry must be rewritten here:
+//   while entry looks like 0xFFxxxxxx -> entry = (entry & 0x3FFFFF) + RomBase
+//   skip zero padding between blocks
+//   stop when the next block header does not match.
+// Header pattern (LEA 14(A5),A1 ; MOVE.L A0,(A1) ; RTS) marks each table;
+// entries begin 16 bytes after the header start.
+static VOID
+RomRelocateJumpTables (
+    IN UINT8*  Rom,
+    IN UINT32  Size,
+    IN UINT32  RomBase
+    )
+{
+    static const UINT8 JumpTabHdr[10] =
+        {0x41,0xFA,0x00,0x0E, 0x21,0xC8,0x20,0x10, 0x4E,0x75};
+    UINT32 Off;
+    UINTN TotalFixed = 0;
+    UINTN Tables = 0;
+
+    for (Off = 0; Off + 20 <= Size; Off += 2) {
+        UINTN K;
+        for (K = 0; K < sizeof(JumpTabHdr); K++) {
+            if (Rom[Off + K] != JumpTabHdr[K]) break;
+        }
+        if (K != sizeof(JumpTabHdr)) {
+            continue;
+        }
+        {
+            UINT32 Lp = Off + 16;
+            UINTN Fixed = 0;
+            Tables++;
+            for (;;) {
+                // Rebase contiguous run of 0xFFxxxxxx entries.
+                while (Lp + 4 <= Size &&
+                       (RomPatchReadWord32(Rom, Lp) & 0xFF000000u)
+                           == 0xFF000000u) {
+                    RomPatchWriteWord32(
+                        Rom, Lp,
+                        (RomPatchReadWord32(Rom, Lp) & 0x003FFFFFu) + RomBase);
+                    Fixed++;
+                    Lp += 4;
+                }
+                // Skip zero padding between blocks.
+                while (Lp + 4 <= Size && RomPatchReadWord32(Rom, Lp) == 0) {
+                    Lp += 4;
+                }
+                // Continue only if the next block reuses the same header.
+                if (Lp + 4 > Size ||
+                    RomPatchReadWord32(Rom, Lp) != 0x41FA000Eu) {
+                    break;
+                }
+                Lp += 4;
+            }
+            TotalFixed += Fixed;
+            Print(L"  jump-table relocated @ROM+0x%08x (%d entries)\n",
+                  Off, (UINT32)Fixed);
+        }
+    }
+    Print(L"  jump-table relocation: %d tables, %d entries rebased to "
+          L"%08x\n", (UINT32)Tables, (UINT32)TotalFixed, RomBase);
+}
+
 // Install one 27-word 68K emulator-entry routine (SheepShaver's
 // emulator-start/MixedMode/Reset/FC1E/FE0A/FE0F fragments). The routines are
 // identical except for the `lwz r10,<offset>(r1)` word that picks the
@@ -1816,7 +1915,7 @@ RomPatchWriteWord32 (
 // final word: the emulator-start fragment (trap 0, ROM + 0x36f900) branches
 // to the injected 68K DR-emulator entry (RomWriteEmulatorEntryRoutine), the
 // others keep the plain `blr`.
-STATIC VOID
+static VOID
 RomWriteEmulStartRoutine (
     IN UINT8*  Rom,
     IN UINT32  Offset,
@@ -1872,7 +1971,7 @@ RomWriteEmulStartRoutine (
 // shared tail's bgtctr/bgelr three-way jump), so the first dispatch must go
 // through the ROM's own fetch/rlwimi/mtlr/bgelr sequence rather than a
 // hand-rolled bctr.
-STATIC VOID
+static VOID
 RomWriteEmulatorEntryRoutine (
     IN UINT8*  Rom,
     IN UINT32  Offset
@@ -1934,7 +2033,7 @@ RomWriteEmulatorEntryRoutine (
 // (CTR = dispatch entry, LR = return into the state machine). It sets cr2.GE
 // so the glue's `bgelr cr2` returns into the state machine, then bctr's to the
 // dispatch entry.
-STATIC VOID
+static VOID
 RomWriteEmulatorDispatchHelper (
     IN UINT8*  Rom,
     IN UINT32  Offset
@@ -1959,7 +2058,7 @@ RomWriteEmulatorDispatchHelper (
 // 0x40b6c648 bctrl) calls it as a function and afterwards merges r5 into r29
 // (rlwimi r29,r5,3), so a plain blr -- leaving r5 as the next ext word loaded
 // at 0x40b6c644 -- reproduces the threaded flow exactly.
-STATIC VOID
+static VOID
 RomWriteEmulatorClassHelper (
     IN UINT8*  Rom,
     IN UINT32  Offset
@@ -1997,7 +2096,7 @@ RomWriteEmulatorClassHelper (
 // offsets belong here once identified. This function validates the page
 // is reachable and snapshots its initial contents so the profile output
 // can be compared against the pre-boot state.
-STATIC VOID
+static VOID
 BootSeedKernelDataHardware (
     VOID
     )
@@ -2058,7 +2157,7 @@ BootSeedKernelDataHardware (
 #define POWERPC_BLR  0x4E800020u
 
 // Peek a big-endian word from the host-side ROM image without modifying it.
-STATIC UINT32
+static UINT32
 RomPeekWord32 (
     IN UINT8* Rom,
     IN UINT32 Offset
@@ -2071,7 +2170,7 @@ RomPeekWord32 (
 }
 
 // Find a byte pattern inside [Lo, Hi) of the flat ROM image; 0 if absent.
-STATIC UINT32
+static UINT32
 RomFindBytes (
     IN UINT8*       Rom,
     IN const UINT8* Pat,
@@ -2089,7 +2188,7 @@ RomFindBytes (
     return 0;
 }
 
-STATIC UINTN
+static UINTN
 BootPatchNkBootSequence (
     IN UINT8* Rom
     )
@@ -2224,7 +2323,7 @@ BootPatchNkBootSequence (
     return Applied;
 }
 
-STATIC EFI_STATUS
+static EFI_STATUS
 PpcPatchNewWorldRom (
     VOID
     )
@@ -2254,6 +2353,13 @@ PpcPatchNewWorldRom (
                         RomBase + PPC_NEW_WORLD_ROM_LA_EMULCODE_BASE - PPC_NEW_WORLD_ROM_GUEST_BASE);
     RomPatchWriteWord32(Rom, Struct + 0x360, 0x00000000); // physical RAM base
     RomPatchWriteWord32(Rom, Struct + 0xFD8, RomBase + 0x2A); // 68K reset vector
+
+    // Relocate the ROM's 68K jump tables (see RomRelocateJumpTables): the
+    // image ships entries as 0xFFxxxxxx ROM-relative words that Apple's
+    // loader rebases; without it, NK thunk dispatchers read unmapped
+    // 0xFFxxxxxx addresses and propagate sentinel garbage into every
+    // downstream MixedMode call.
+    RomRelocateJumpTables(Rom, g_BootContext.RomSize, RomBase);
 
     // 68K boot HWInfo gate. On real hardware the Open Firmware trampoline
     // builds the IRP's HWInfo record and signs it with 'Hnfo' before the
@@ -2603,7 +2709,7 @@ PpcRunBootSelfTest (
 // System files & drivers (classic Mac OS System Folder support)
 // ---------------------------------------------------------------------------
 
-STATIC VOID
+static VOID
 BootFillSystemFolderInfo (
     OUT PPC_SYSTEM_FOLDER_INFO* Info
     )
@@ -2627,7 +2733,7 @@ BootFillSystemFolderInfo (
 // Fall back to the attached Mac OS disc when the boot volume has no System
 // Folder: mount the disc's HFS/HFS+ volume (via the in-emulator reader) and
 // record the presence of System / Finder / Extensions / Mac OS ROM.
-STATIC VOID
+static VOID
 BootLocateSystemFolderHfs (
     VOID
     )

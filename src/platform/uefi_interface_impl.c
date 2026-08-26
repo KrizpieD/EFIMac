@@ -12,7 +12,7 @@ typedef struct {
 } PPC_UEFI_CONTEXT;
 
 // Global UEFI context
-STATIC PPC_UEFI_CONTEXT g_UefiContext = {0};
+static PPC_UEFI_CONTEXT g_UefiContext = {0};
 
 EFI_STATUS
 PpcInitializeUefiInterface (

@@ -20,44 +20,44 @@
 #define HFS_ROOT_CNID 2         // root directory id
 
 // Big-endian field accessors
-STATIC UINT16 HfsU16 (const UINT8* P) { return (UINT16)((P[0] << 8) | P[1]); }
-STATIC UINT32 HfsU32 (const UINT8* P) {
+static UINT16 HfsU16 (const UINT8* P) { return (UINT16)((P[0] << 8) | P[1]); }
+static UINT32 HfsU32 (const UINT8* P) {
     return ((UINT32)P[0] << 24) | ((UINT32)P[1] << 16) | ((UINT32)P[2] << 8) | P[3];
 }
-STATIC UINT64 HfsU64 (const UINT8* P) {
+static UINT64 HfsU64 (const UINT8* P) {
     return ((UINT64)HfsU32(P) << 32) | HfsU32(P + 4);
 }
 
 // ---------------------------------------------------------------------------
 // Mounted volume state
 // ---------------------------------------------------------------------------
-STATIC PPC_HFS_VOLUME_INFO g_HfsVolume = {0};
-STATIC BOOLEAN             g_HfsMounted = FALSE;
+static PPC_HFS_VOLUME_INFO g_HfsVolume = {0};
+static BOOLEAN             g_HfsMounted = FALSE;
 
 // Device backing the mounted volume
-STATIC UINTN  g_HfsDeviceIndex    = 0;
-STATIC UINTN  g_HfsMediaBlockSize = 512;
-STATIC UINT64 g_HfsDeviceBytes    = 0;
+static UINTN  g_HfsDeviceIndex    = 0;
+static UINTN  g_HfsMediaBlockSize = 512;
+static UINT64 g_HfsDeviceBytes    = 0;
 
 // Boot device pinned by the setup menu (PPC_HFS_AUTO_DEVICE = auto-detect).
-STATIC UINT32 g_HfsPreferredDevice = PPC_HFS_AUTO_DEVICE;
+static UINT32 g_HfsPreferredDevice = PPC_HFS_AUTO_DEVICE;
 
 // Classic HFS: byte offset of the first allocation block (drAlBlSt * 512).
-STATIC UINTN  g_HfsAllocBlockStart = 0;
+static UINTN  g_HfsAllocBlockStart = 0;
 
 // Catalog arrays (page-backed; HFS files can exceed pool limits)
-STATIC PPC_HFS_ENTRY* g_HfsDirs  = NULL;
-STATIC PPC_HFS_ENTRY* g_HfsFiles = NULL;
-STATIC UINTN          g_HfsDirCount  = 0;
-STATIC UINTN          g_HfsFileCount = 0;
+static PPC_HFS_ENTRY* g_HfsDirs  = NULL;
+static PPC_HFS_ENTRY* g_HfsFiles = NULL;
+static UINTN          g_HfsDirCount  = 0;
+static UINTN          g_HfsFileCount = 0;
 
 // In-memory B-tree files
-STATIC UINT8* g_CatData     = NULL;
-STATIC UINTN  g_CatSize     = 0;
-STATIC UINTN  g_CatNodeSize = 512;
-STATIC UINT8* g_XofData     = NULL;
-STATIC UINTN  g_XofSize     = 0;
-STATIC UINTN  g_XofNodeSize = 512;
+static UINT8* g_CatData     = NULL;
+static UINTN  g_CatSize     = 0;
+static UINTN  g_CatNodeSize = 512;
+static UINT8* g_XofData     = NULL;
+static UINTN  g_XofSize     = 0;
+static UINTN  g_XofNodeSize = 512;
 
 // Classic HFS extents-overflow index (data fork, fktype 0)
 typedef struct {
@@ -66,13 +66,13 @@ typedef struct {
     UINT32 Blocks[3];
     UINT32 Counts[3];
 } HFS_OVF_ENTRY;
-STATIC HFS_OVF_ENTRY g_HfsOvf[PPC_HFS_MAX_OVF];
-STATIC UINTN         g_HfsOvfCount = 0;
+static HFS_OVF_ENTRY g_HfsOvf[PPC_HFS_MAX_OVF];
+static UINTN         g_HfsOvfCount = 0;
 
 // ---------------------------------------------------------------------------
 // Memory / device helpers
 // ---------------------------------------------------------------------------
-STATIC EFI_STATUS
+static EFI_STATUS
 HfsAllocBytes (
     IN  UINTN Size,
     OUT VOID** Out
@@ -100,7 +100,7 @@ HfsAllocBytes (
     return EFI_SUCCESS;
 }
 
-STATIC VOID
+static VOID
 HfsFreeBytes (
     IN UINTN Size,
     IN VOID* P
@@ -120,7 +120,7 @@ HfsFreeBytes (
 // Read Size bytes at byte Offset from the mounted device into Buffer. Reads
 // whole media blocks and copies the byte range when the request is not
 // block-aligned (ReadBlocks requires buffer sizes to be block multiples).
-STATIC EFI_STATUS
+static EFI_STATUS
 HfsDeviceReadBytes (
     IN  UINTN  Offset,
     IN  UINTN  Size,
@@ -163,7 +163,7 @@ HfsDeviceReadBytes (
 // Volume detection
 // ---------------------------------------------------------------------------
 // Validate the classic HFS MDB at Base+1024 (offsets match hfs_read.py).
-STATIC BOOLEAN
+static BOOLEAN
 HfsMdbFieldsClassic (
     IN  UINTN  Base,
     OUT UINTN* OutSize,
@@ -206,7 +206,7 @@ HfsMdbFieldsClassic (
 }
 
 // Validate the HFS+ volume header at Base+1024 (hfsplus_vh offsets).
-STATIC BOOLEAN
+static BOOLEAN
 HfsMdbFieldsPlus (
     IN  UINTN  Base,
     OUT UINTN* OutSize
@@ -241,7 +241,7 @@ HfsMdbFieldsPlus (
 }
 
 // Locate a classic HFS volume via an Apple Partition Map scan.
-STATIC BOOLEAN
+static BOOLEAN
 HfsDetectApm (
     OUT UINTN* Base,
     OUT UINTN* Size
@@ -292,7 +292,7 @@ HfsDetectApm (
 // Full 2048-byte-boundary MDB scan; picks the largest plausible volume so
 // discs whose HFS volume lives outside the declared partitions (e.g. the
 // "Mac OS 8.1HD" volume on the retail 8.1 CD) are found.
-STATIC BOOLEAN
+static BOOLEAN
 HfsDetectScan (
     OUT UINTN* Base,
     OUT UINTN* Size,
@@ -385,7 +385,7 @@ HfsDetectScan (
 // ---------------------------------------------------------------------------
 // B-tree parsing (shared classic/HFS+ node walking)
 // ---------------------------------------------------------------------------
-STATIC UINT16
+static UINT16
 HfsNodeRecOffset (
     IN UINT8* Node,
     IN UINTN  NodeSize,
@@ -396,7 +396,7 @@ HfsNodeRecOffset (
 }
 
 // Decode a classic HFS name (single-byte MacRoman/Latin-1) into CHAR16.
-STATIC VOID
+static VOID
 HfsNameLatin1 (
     OUT CHAR16* Dst,
     IN  const UINT8* Src,
@@ -412,7 +412,7 @@ HfsNameLatin1 (
 }
 
 // Decode an HFS+ UTF-16BE name into CHAR16.
-STATIC VOID
+static VOID
 HfsNameUtf16 (
     OUT CHAR16* Dst,
     IN  const UINT8* Src,
@@ -428,7 +428,7 @@ HfsNameUtf16 (
 }
 
 // Case-insensitive ASCII CHAR16 compare.
-STATIC INTN
+static INTN
 HfsStriCmp (
     IN const CHAR16* A,
     IN const CHAR16* B
@@ -454,7 +454,7 @@ HfsStriCmp (
 // ---------------------------------------------------------------------------
 // Classic HFS catalog + extents overflow build
 // ---------------------------------------------------------------------------
-STATIC INTN
+static INTN
 HfsOvfCompare (
     IN const HFS_OVF_ENTRY* A,
     IN const HFS_OVF_ENTRY* B
@@ -469,7 +469,7 @@ HfsOvfCompare (
     return 0;
 }
 
-STATIC VOID
+static VOID
 HfsOvfSort (VOID)
 {
     for (UINTN I = 1; I < g_HfsOvfCount; I++) {
@@ -483,7 +483,7 @@ HfsOvfSort (VOID)
     }
 }
 
-STATIC EFI_STATUS
+static EFI_STATUS
 HfsBuildClassicCatalog (
     VOID
     )
@@ -601,7 +601,7 @@ HfsBuildClassicCatalog (
 // ---------------------------------------------------------------------------
 // HFS+ catalog build
 // ---------------------------------------------------------------------------
-STATIC EFI_STATUS
+static EFI_STATUS
 HfsBuildPlusCatalog (
     VOID
     )
@@ -672,7 +672,7 @@ HfsBuildPlusCatalog (
 // ---------------------------------------------------------------------------
 // Load a B-tree file (catalog or extents overflow) into memory and parse its
 // header node.
-STATIC EFI_STATUS
+static EFI_STATUS
 HfsLoadBTreeFile (
     IN  UINTN  Base,
     IN  UINTN  AllocBlockSize,
@@ -734,7 +734,7 @@ PpcHfsSetDeviceIndex (
 // Try to find an HFS/HFS+ volume on one enumerated block device. When found,
 // g_HfsDeviceIndex / g_HfsMediaBlockSize / g_HfsDeviceBytes are set and the
 // volume byte offset is returned.
-STATIC
+static
 BOOLEAN
 HfsDetectDevice (
     IN  UINTN  Index,
@@ -1120,7 +1120,7 @@ PpcHfsGetEntryById (
 // on install discs it lives inside the disc's install-image System Folder
 // (e.g. "Power Mac G4 Install:System Folder:Mac OS ROM"), so a path-based
 // lookup is not enough: search the whole catalog.
-STATIC const CHAR16 PPC_HFS_MAC_OS_ROM_NAME[] = L"Mac OS ROM";
+static const CHAR16 PPC_HFS_MAC_OS_ROM_NAME[] = L"Mac OS ROM";
 
 EFI_STATUS
 PpcHfsFindMacOsRom (
@@ -1233,7 +1233,7 @@ PpcHfsOpenPath (
 // Classic HFS: walk the file's extent records, spilling into the sorted
 // extents-overflow records when the first three are exhausted. Mirrors
 // hfs_read.py's read_file().
-STATIC EFI_STATUS
+static EFI_STATUS
 HfsReadFileClassic (
     IN  PPC_HFS_ENTRY* Entry,
     OUT VOID*          Buffer,
@@ -1312,7 +1312,7 @@ HfsReadFileClassic (
 }
 
 // HFS+: the catalog record carries up to eight extents directly.
-STATIC EFI_STATUS
+static EFI_STATUS
 HfsReadFilePlus (
     IN  PPC_HFS_ENTRY* Entry,
     OUT VOID*          Buffer,
@@ -1381,10 +1381,10 @@ PpcHfsReadFile (
 // ---------------------------------------------------------------------------
 // Self-test
 // ---------------------------------------------------------------------------
-STATIC UINTN g_HfsTestPass = 0;
-STATIC UINTN g_HfsTestFail = 0;
+static UINTN g_HfsTestPass = 0;
+static UINTN g_HfsTestFail = 0;
 
-STATIC VOID
+static VOID
 HfsCheck (
     IN BOOLEAN Ok,
     IN CHAR16* Name

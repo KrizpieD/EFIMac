@@ -16,14 +16,14 @@
 #include "platform/uefi_interface.h"
 
 // NVRAM variable that stores the saved configuration.
-STATIC EFI_GUID g_UiConfigGuid = PPC_CONFIG_VARIABLE_GUID;
+static EFI_GUID g_UiConfigGuid = PPC_CONFIG_VARIABLE_GUID;
 
 // The UEFI scan code for Enter (gnu-efi's eficon.h stops at SCAN_ESC).
 #define UI_SCAN_ENTER   0x000D
 
 // ASCII "Macintosh" face shown during the boot countdown: the classic
 // compact-Mac silhouette with a smiling screen and a floppy drive slot.
-STATIC CONST CHAR16* UiMacFace[] = {
+static CONST CHAR16* UiMacFace[] = {
     L"              .----------------------------------.",
     L"             /                                    \\",
     L"            |   .----------------------------.     |",
@@ -45,7 +45,7 @@ STATIC CONST CHAR16* UiMacFace[] = {
 
 // ---------------------------- console helpers ----------------------------
 
-STATIC
+static
 VOID
 UiSetAttr (
     IN UINTN Attr
@@ -56,7 +56,7 @@ UiSetAttr (
     }
 }
 
-STATIC
+static
 VOID
 UiConsoleSize (
     OUT UINTN* Columns,
@@ -76,7 +76,7 @@ UiConsoleSize (
     }
 }
 
-STATIC
+static
 VOID
 UiDrawCentered (
     IN UINTN         Row,
@@ -93,7 +93,7 @@ UiDrawCentered (
     }
 }
 
-STATIC
+static
 VOID
 UiDrawCenteredPrint (
     IN UINTN         Row,
@@ -109,7 +109,7 @@ UiDrawCenteredPrint (
     UiDrawCentered(Row, Buf);
 }
 
-STATIC
+static
 CONST CHAR16*
 UiVideoResolution (
     IN UINT32 Mode
@@ -126,7 +126,7 @@ UiVideoResolution (
 
 // -------------------------- configuration storage --------------------------
 
-STATIC
+static
 UINT32
 UiConfigChecksum (
     IN const PPC_CONFIG* Config
@@ -374,7 +374,7 @@ typedef enum {
     UI_ROW_COUNT
 } UI_ROW;
 
-STATIC CONST CHAR16* UiRowLabels[UI_ROW_COUNT] = {
+static CONST CHAR16* UiRowLabels[UI_ROW_COUNT] = {
     L"Boot device",
     L"Memory size",
     L"Video mode",
@@ -390,7 +390,7 @@ STATIC CONST CHAR16* UiRowLabels[UI_ROW_COUNT] = {
 
 // ------------------------------ row helpers --------------------------------
 
-STATIC
+static
 UINTN
 UiBootDeviceCount (
     VOID
@@ -403,7 +403,7 @@ UiBootDeviceCount (
     return 1 + Bio.DeviceCount;   // "Auto" + one choice per device
 }
 
-STATIC
+static
 UINTN
 UiBootDeviceChoice (
     IN const PPC_CONFIG* Config
@@ -415,7 +415,7 @@ UiBootDeviceChoice (
     return 1 + Config->BootDeviceIndex;
 }
 
-STATIC
+static
 VOID
 UiBootDeviceSelect (
     IN OUT PPC_CONFIG* Config,
@@ -427,7 +427,7 @@ UiBootDeviceSelect (
         : (Choice - 1);
 }
 
-STATIC
+static
 VOID
 UiBootDeviceLabel (
     IN UINTN   Choice,
@@ -454,7 +454,7 @@ UiBootDeviceLabel (
                   (UINTN)(Dev.BlockCount * Dev.BlockSize / 1024 / 1024));
 }
 
-STATIC
+static
 UINTN
 UiRowChoiceCount (
     IN UI_ROW Row
@@ -472,7 +472,7 @@ UiRowChoiceCount (
     }
 }
 
-STATIC
+static
 UINTN
 UiRowChoice (
     IN UI_ROW         Row,
@@ -517,7 +517,7 @@ UiRowChoice (
     }
 }
 
-STATIC
+static
 VOID
 UiRowCycle (
     IN OUT PPC_CONFIG* Config,
@@ -565,7 +565,7 @@ UiRowCycle (
     }
 }
 
-STATIC
+static
 VOID
 UiRowValue (
     IN UI_ROW            Row,
@@ -611,7 +611,7 @@ UiRowValue (
 
 // ------------------------------ menu drawing --------------------------------
 
-STATIC
+static
 VOID
 UiMenuDrawRow (
     IN UINTN         Row,

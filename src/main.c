@@ -19,7 +19,7 @@ UINT32 _fltused = 0;
 // True if the GOP pixel at (X,Y) holds exactly the R/G/B channels of the
 // given guest color (big-endian 0xRRGGBB00), placed according to the GOP
 // pixel format (byte-exact, so channel-position bugs are caught).
-STATIC
+static
 BOOLEAN
 GopPixelMatches (
   IN UINT8* GopBase,
@@ -41,7 +41,7 @@ GopPixelMatches (
 }
 
 // True if every visible pixel of the GOP framebuffer matches the guest color.
-STATIC
+static
 BOOLEAN
 GopFrameIsSolid (
   IN UINT8* GopBase,
@@ -63,7 +63,7 @@ GopFrameIsSolid (
 }
 
 // Short label for an installed ROM type.
-STATIC
+static
 CHAR16*
 BootRomTypeName (
   IN UINT32 RomType
