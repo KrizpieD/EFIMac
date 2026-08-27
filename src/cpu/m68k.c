@@ -4222,47 +4222,29 @@ M68kExecuteFromPPC (
         }
     }
 
-    // VBL interrupt injection: when the VIA tick has fired but a level-1
-    // interrupt vector is installed and the CPU is ready to take it, push
-    // the exception frame. The InInterrupt guard prevents nesting. Flags
-    // are only consumed when actually injected; otherwise they are ORed
-    // back so a later batch can still deliver them.
+    // VBL processing (EMUL_OP style): when the VIA tick has fired,
+    // process the VBL entirely in C instead of raising a 68K exception.
+    // This avoids the corrupted exception frame caused by M68kSyncFromPPC
+    // overwriting SR with a stale PPC r25 value.  The VIA is acknowledged
+    // by writing the VBL flag to $900, and any pending timers are fired.
     {
         static UINTN VblCount = 0;
-        static UINTN VblDenyCount = 0;
-        BOOLEAN Injected = FALSE;
         UINT32 Flags = EmulOpGetAndClearInterruptFlags ();
         if ((Flags & INTFLAG_VIA) != 0 &&
-            !g_M68kInInterrupt &&
-            !g_M68kContext.Halted &&
-            (g_M68kContext.SR & 0x0700) < 0x0100) {
-            UINT32 Vec = M68kReadLong (0x64);  // level-1 vector
-            if (Vec != 0 && Vec != 0xFFFFFFFFu) {
-                VblCount++;
-                if (VblCount < 16) {
-                    Print (L"  VBL #%d inject -> 0x%08x SR=%04x\n",
-                           (UINT32)VblCount, Vec, g_M68kContext.SR);
-                }
-                Injected = TRUE;
-                M68kRaiseException (M68K_VEC_LEVEL1);  // 0x64 = level-1 ext int vector
+            !g_M68kContext.Halted) {
+            VblCount++;
+            if (VblCount < 16) {
+                Print (L"  VBL #%d EMUL_OP PC=%08x SR=%04x\n",
+                       (UINT32)VblCount,
+                       g_M68kContext.PC, g_M68kContext.SR);
             }
+            // Acknowledge VBL: write 1 to the VBL-pending flag at $900.
+            M68kWriteLong (0x900, 1);
         }
-        if (!Injected && (Flags & INTFLAG_VIA) != 0) {
-            VblDenyCount++;
-            if (VblDenyCount <= 16) {
-                Print (L"  VBL-DENY #%d Flags=%08x InInt=%d Halted=%d "
-                       L"SR=%04x IPL=%d Vec@64=%08x PC=%08x\n",
-                       (UINT32)VblDenyCount, Flags,
-                       (int)g_M68kInInterrupt,
-                       (int)g_M68kContext.Halted,
-                       g_M68kContext.SR,
-                       (int)((g_M68kContext.SR >> 8) & 7),
-                       M68kReadLong (0x64),
-                       g_M68kContext.PC);
-            }
-        }
-        if (!Injected && Flags != 0) {
-            EmulOpSignalInterrupt (Flags);     // keep pending for later
+        if (Flags != 0 && !(Flags & INTFLAG_VIA)) {
+            // Non-VIA flags (e.g. timer) still get re-signaled for
+            // later processing by the timer hook above.
+            EmulOpSignalInterrupt (Flags & ~INTFLAG_VIA);
         }
     }
     // ---- END PHASE C batch-start hooks ---------------------------------
@@ -5215,6 +5197,10 @@ M68kExecuteFromPPC (
                 Print (L"\n");
                 M68kTraceFlush ();
             }
+            // BRA$ (0x60FE) at 0x408047AE is the correct68K idle loop.
+            // Do NOT modify it. VBL is processed in C (EMUL_OP style)
+            // and the park mechanism (IPL clear, DEC arm, clock advance)
+            // handles the wake cycle.
             // Park: stop executing until something wakes us. If the
             // environment never wakes us, the run ends quietly instead of
             // burning 200M instructions of console noise.
@@ -5243,18 +5229,24 @@ M68kExecuteFromPPC (
             }
             // Install a minimal 68K exception vector table if the NK's
             // own vector-install stage was bypassed by our synthetic walk.
-            // The level-1 vector at 0x64 must be non-zero for VBL
-            // injection to work (M68kRaiseException reads it).
             {
                 static BOOLEAN VecsInstalled = FALSE;
                 if (!VecsInstalled && M68kReadLong (0x64) == 0) {
                     VecsInstalled = TRUE;
-                    // Minimal RTE stub at 0x400; all unhandled
-                    // exceptions jump here and return immediately.
+
+                    // RTE stub at 0x400 for unhandled exceptions.
                     M68kWriteWord (0x400, 0x4E73u);   // RTE
-                    // Level-1 (VBL/VIA) -> stub
+
+                    // VBL is now processed entirely in C (EMUL_OP style)
+                    // instead of via a 68K exception handler.  The C code
+                    // writes the VBL flag to $900 and fires timers without
+                    // touching the 68K exception frame.  Vector 0x64
+                    // points to the RTE stub for safety (should never be
+                    // called for VBL in normal operation).
+                    //
+                    // Level-1 (VBL/VIA) -> RTE stub at 0x400
                     M68kWriteLong (0x64, 0x400);
-                    // Level-2..7 -> stub
+                    // Level-2..7 -> RTE stub
                     M68kWriteLong (0x68, 0x400);
                     M68kWriteLong (0x6C, 0x400);
                     M68kWriteLong (0x70, 0x400);
@@ -5271,7 +5263,8 @@ M68kExecuteFromPPC (
                     }}
                     // A-line trap (0xB0) -> stub (Mac OS toolbox entry)
                     M68kWriteLong (0xB0, 0x400);
-                    Print (L"  synth: installed 68K exception vector table\n");
+                    Print (L"  synth: installed 68K exception vector table "
+                           L"(VBL in C via EMUL_OP)\n");
                 }
             }
             // Arm the decrementer on behalf of the NK scheduler: this
