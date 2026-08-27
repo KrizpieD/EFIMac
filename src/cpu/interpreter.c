@@ -11,6 +11,22 @@
 PPC_CPU_CONTEXT g_PpcContext = {0};
 
 // ---------------------------------------------------------------------------
+// PPC-native pivot switch (see ARCHITECTURE.md "Architectural Reference").
+//
+// The 68K DR emulator is PPC code owned by the OS; DingusPPC and SheepShaver
+// run it on the host CPU via the ROM's own PPC opcode-translation table and
+// only intercept the escape/trap vectors. EFIMac instead intercepts the DR
+// emulator's common dispatch entry (PC 0x40B67C60) and executes every 68K
+// instruction through a hand-rolled C interpreter (m68k.c), which has been
+// carried by heuristics for weeks.
+//
+// Setting USE_PPC_NATIVE_DR=1 lets the ROM's own PPC opcode table drive the
+// 68K emulator (the de-hijack), and only seeds/keeps the trap/device escapes.
+// Default is 0 = current C-68K behaviour, so the baseline is unchanged until
+// the PPC environment (translation, KernelData/hardware seeds) is complete.
+#define USE_PPC_NATIVE_DR 0
+
+// ---------------------------------------------------------------------------
 // Instruction field extraction (bit 0 = most significant bit of the word)
 // ---------------------------------------------------------------------------
 #define OP(w)      ((w) >> 26)
@@ -4303,6 +4319,49 @@ PpcExecuteBlock (
     return EFI_SUCCESS;
 }
 
+// ---------------------------------------------------------------------------
+// 68K MOVEQ software-function emulation (ed.v[0x800]).
+// The ROM's own PPC DR emulator handles most of the MOVEQ table natively as
+// `addic. rD,r0,signext(imm8)` thunks, but a few entries route through the
+// unseeded ed.v[0x800] software-function slot. Two different dispatch sites
+// load that slot with `lwz r0,0x800(r31)` (0x40BBF8D0 and 0x40B9FFF8); both
+// fall into the r6=0x10 trampoline (0x40B6D750) which, because ed.v[0x800] is
+// NULL, ends up branching to address 0. Emulate the MOVEQ the slot's native
+// thunk would perform. r8..r15 = 68K d0..d7 and r24 points just past the
+// 1-word MOVEQ at both sites.
+static BOOLEAN
+EmulSoftFnMoveq (
+    OUT UINT32* Next
+    )
+{
+    UINT16 Op, Rd;
+    INT32 Imm;
+    UINT32 Ca;
+
+    // If the slot has been seeded natively (pivot in progress), the ROM's own
+    // dispatch handles it; do not shadow it.
+    if (CpuRead32(0x0000B800) != 0) {
+        return FALSE;
+    }
+    Op = CpuRead16(g_PpcContext.Gpr[24] - 2);
+    if ((Op & 0xF000) != 0x7000) {
+        return FALSE;
+    }
+    Imm = (INT32)(INT8)(Op & 0xFF);
+    Rd  = 8 + ((Op >> 9) & 7);                 // r8..r15 = d0..d7
+    g_PpcContext.Gpr[Rd] = PpcDoAdd(0, Imm, 0, &Ca, NULL);
+    PpcSetXerCarry(Ca);
+    PpcSetCr0FromResult(g_PpcContext.Gpr[Rd]);
+    g_PpcContext.Gpr[27] = 0;
+    g_PpcContext.Gpr[29] = 0x40B80000;
+    *Next = 0x40B67C60;
+    Print(L"  MOVEQ-HOOK op=0x%04x imm=%d d%u=0x%08x r24=0x%08x CR=0x%08x -> 0x40b67c60\n",
+          Op, Imm, (Op >> 9) & 7, g_PpcContext.Gpr[Rd],
+          g_PpcContext.Gpr[24], g_PpcContext.Cr);
+    return TRUE;
+}
+
+// ---------------------------------------------------------------------------
 // Continuous guest execution harness. Runs up to MaxInstructions of real
 // guest code from the current PC, delivering pending exceptions through the
 // CPU vector mechanism so interrupt/syscall handlers run like on hardware.
@@ -4484,6 +4543,9 @@ UINTN TbProbe = 0;
         // When the PPC DR-emulator enters its common dispatch at 0x40B67C60,
         // intercept and execute the 68K instruction natively via the C
         // interpreter, completely replacing the PPC-based opcode table.
+        // USE_PPC_NATIVE_DR disables this intercept so the ROM's own PPC
+        // opcode-translation table drives the 68K emulator (the pivot).
+#if !USE_PPC_NATIVE_DR
         if (Current == 0x40B67C60) {
             // On real hardware the PPC nanokernel preempts emulated 68K
             // code asynchronously (decrementer tick). Without this, any 68K
@@ -4514,6 +4576,7 @@ UINTN TbProbe = 0;
             Next = 0x40B67C60;
             Hooked = 1;
         }
+#endif
         if (Current == 0x40B6CA84 && Instr == 0x4E800421) {
             // Tail's `bctrl` (software fn ed.v[0x80C]). 68K MOVE #<imm>,SR
             // (0x46FC) routes here via entry[0x46FC] -> 0x40B6C570 bnsl cr2
@@ -4568,31 +4631,14 @@ UINTN TbProbe = 0;
                       Param, Resume, g_PpcContext.Cr);
             }
         }
-        if (Current == 0x40BBF8D0 && Instr == 0x80BF0800) {
-            // entry[0x7F1A] = 68K MOVEQ #imm,Dn (software fn ed.v[0x800],
-            // the r6=0x10 trampoline at 0x40B6D750). The ROM implements the
-            // MOVEQ table natively as `addic. rD,r0,signext(imm8)` thunks but
-            // routes this one entry through the unseeded ed.v[0x800] slot.
-            // Emulate the same addic. the native thunk would have executed,
-            // leave r24 pointing at the next 68K opcode, and resume the DR
-            // loop. (r24 is already past the 1-word MOVEQ at this point.)
-            if (CpuRead32(0x0000B800) == 0) {
-                UINT16 Op = CpuRead16(g_PpcContext.Gpr[24] - 2);
-                if ((Op & 0xF000) == 0x7000) {
-                    UINT32 Ca;
-                    INT32 Imm = (INT32)(INT8)(Op & 0xFF);
-                    UINT32 Rd = 8 + ((Op >> 9) & 7);   // r8..r15 = d0..d7
-                    g_PpcContext.Gpr[Rd] = PpcDoAdd(0, Imm, 0, &Ca, NULL);
-                    PpcSetXerCarry(Ca);
-                    PpcSetCr0FromResult(g_PpcContext.Gpr[Rd]);
-                    g_PpcContext.Gpr[27] = 0;
-                    g_PpcContext.Gpr[29] = 0x40B80000;
-                    Next = 0x40B67C60;
-                    Hooked = 1;
-                    Print(L"  MOVEQ-HOOK op=0x%04x imm=%d d%u=0x%08x r24=0x%08x CR=0x%08x -> 0x40b67c60\n",
-                          Op, Imm, (Op >> 9) & 7, g_PpcContext.Gpr[Rd],
-                          g_PpcContext.Gpr[24], g_PpcContext.Cr);
-                }
+        if ((Current == 0x40BBF8D0 || Current == 0x40B9FFF8) && Instr == 0x80BF0800) {
+            // Both dispatch sites load the (currently unseeded) ed.v[0x800]
+            // software function with `lwz r0,0x800(r31)`. Handle the MOVEQ
+            // case natively; other opcodes routed to this slot (the 0x3xxx
+            // MOVE-with-extension-word family) fall through and must be
+            // seeded once the software-fn ABI is implemented (see TODO B.4).
+            if (EmulSoftFnMoveq(&Next)) {
+                Hooked = 1;
             }
         }
         if (Hooked) {
@@ -5521,6 +5567,12 @@ UINTN TbProbe = 0;
             if (LogUnsupported) {
                 UINTN I;
                 CHAR16 Mn[16];
+                {
+                    CHAR16 StopMn[16];
+                    PpcDecodeInstruction(Instr, StopMn, sizeof(StopMn));
+                    Print(L"GUEST STOP at PC=0x%08x inst=0x%08x (%s): %r\n",
+                          g_PpcContext.Pc, Instr, StopMn, Status);
+                }
                 Print(L"--- last %d instructions before stop ---\n", TailCount);
                 for (I = 0; I < TailCount; I++) {
                     UINTN Idx = (TailStart + TailCount - 1 - I) % 4096;
@@ -5530,12 +5582,6 @@ UINTN TbProbe = 0;
                           TailR24[Idx], TailR27[Idx], TailR7[Idx], TailR5[Idx],
                           TailR15[Idx], TailR16[Idx], TailCr[Idx],
                           TailR28[Idx], TailLr[Idx]);
-                }
-                {
-                    CHAR16 StopMn[16];
-                    PpcDecodeInstruction(Instr, StopMn, sizeof(StopMn));
-                    Print(L"GUEST STOP at PC=0x%08x inst=0x%08x (%s): %r\n",
-                          g_PpcContext.Pc, Instr, StopMn, Status);
                 }
                 Print(L"  MSR=0x%08x CR=0x%08x LR=0x%08x CTR=0x%08x SRR0=0x%08x SRR1=0x%08x\n",
                       g_PpcContext.Msr, g_PpcContext.Cr, g_PpcContext.Lr,

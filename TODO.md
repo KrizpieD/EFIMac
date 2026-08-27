@@ -9,12 +9,19 @@ the whole path. **Phase A (nanokernel boot) is complete**: the New World ROM
 boots through the warm handoff path with a clean environment — contiguous
 guest RAM bank at 0, emulated SCC output device, gated PMDT injection,
 harmonized area merges, and SheepShaver-style neutralization of eleven NK
-hardware-init sites. The native 68K interpreter executes guest code through
-NK handoff, DR-callbacks and the embedded decompressor. The remaining work to
-the desktop is Phase B/C: completing 68K interpreter coverage for the Toolbox
-boot path (current stop point: a spin on the XLM mailbox at 0x408005F2 during
-early DR-emulator setup), EMUL_OP device handlers, and Mac hardware register
-emulation wired to UEFI protocols.
+hardware-init sites.
+
+**Architectural correction (2026-08, DingusPPC review):** the next phase was
+previously scoped as almost-entirely 68K work (a hand-rolled `m68k.c`
+interpreter, EMUL_OP handlers, 68K hardware registers). That was the wrong
+frame — see ARCHITECTURE.md "Architectural Reference". DingusPPC and even the
+project's own SheepShaver model run the nanokernel's **PPC** DR emulator on the
+host CPU; there is no need to boot through a C 68K interpreter. The corrected
+**PPC-native pivot** is on the critical path: restore the OS's own PPC DR
+emulator (stop the `0x40B67C60` hijack) and complete the PPC environment it
+needs — real translation (BAT/alias), the missing 601-era opcodes the DR
+emulator uses, and the hardware/KernelData seeds. The 68K interpreter remains
+only as a later legacy-runtime fallback for the Classic app layer.
 
 ### Verified end-to-end (Windows host, QEMU + OVMF)
 
@@ -369,10 +376,80 @@ the early Toolbox/DR-callback stages.
 - **Spinlock entry diagnostics**: one-shot dump of lock header, node chain,
   SPRGs and the last 48 PCs when the recursive-spinlock walk is entered.
 
-### Phase B: Complete 68K Interpreter
+### Phase B: PPC-Native Pivot — RUN THE OS's OWN DR EMULATOR (critical path)
 
-The native 68K interpreter handles basic opcodes but needs expansion for the
-ROM's Toolbox code to execute.
+> **This replaces the previous "Phase B/C: Complete the 68K interpreter" as the
+> critical path.** Rationale in ARCHITECTURE.md "Architectural Reference":
+> DingusPPC/SheepShaver run the nanokernel's PPC DR emulator on the host; the C
+> 68K interpreter was a workaround for an unfinished PPC environment.
+
+#### B.1 PPC opcodes — status
+- [x] `extsb`/`extsh` (XO 954/922) — implemented (`interpreter.c:4207,4212`).
+- [x] `divs`/`div` and other 601 X-ops — implemented (`interpreter.c:3812`;
+  `XO_DIVWU/DIVW` at 4073,4115).
+- [ ] **But** verify the DR emulator no longer hits any `X-op: Unsupported`
+  stop with the *hijack removed* (the C-68K path may have been masking PPC
+  gaps). Run until the first stop, add each opcode the ROM's own emulator
+  needs that is still unhandled.
+
+#### B.2 Current stall is a PPC-boot-env gap, not opcodes (Session 16)
+The interpreter no longer dies on a missing opcode; the boot reaches the NK
+**scheduler**, then loops in a **park/wake/VBL/park cycle**: the 68K parks at
+`BRA$` (`0x408047AE`), the PPC DEC fires (`VECDISP vector=0x900`), the NK
+scheduler (`SCHED[3]/[4]`, `PC=0x40B22F18`) only ever re-selects the single
+idle task (`curTask=0x9CE0`) and returns to the 68K dispatch entry `0x40B67C60`.
+The NK never completes task/address-space/driver setup because its environment
+is incomplete. This is the same root cause the pivot targets: finish the PPC
+side (translation, hardware/KernelData seeds, devices) instead of papering over
+it with C-68K heuristics ("self-healing" SPR, scrub short-circuits, PC-probes).
+
+#### B.3 PPC translation the nanokernel expects
+- [ ] Decide and implement the boot-time translation model. The nanokernel
+  reads SDR1/BATs and walks page tables (Session A notes); either implement
+  real BAT + SDR1 page-table translation in the interpreter, or a correct
+  flat alias that satisfies the NK's probes without the current
+  SPINLOCK/PMDT/merge surgical patches. DingusPPC (`cpu/ppcmmu.cpp`) is the
+  reference.
+- [ ] Replace the ~dozen `BootPatchNkBootSequence` neutralizations that exist
+  only because translation was absent, with a working translate step where
+  possible. (Keep the ones SheepShaver also applies.)
+
+#### B.4 Restore the OS's own DR emulator
+- [x] Add `USE_PPC_NATIVE_DR` switch in `interpreter.c`; it removes the
+  `0x40B67C60` `M68kExecuteFromPPC` intercept so the ROM's own PPC opcode
+  table drives the 68K emulator. **Verified (2026-08, QEMU/9.2.2):** with the
+  switch ON the ROM's own PPC DR-emulator/translator executes natively and
+  drives 68K fetch/decode (PC runs through the `0x40B6xx` compiler, `bcctr`,
+  `mtspr`, `rlwimi` sequences with `r24`=68K PC advancing past each 68K
+  instruction), past "Nanokernel replaced. Returning to boot proc". So the
+  de-hijack is viable; the PPC opcode table is essentially functional.
+- [ ] The native run still trips the **unseeded software-function vectors**
+  `ed.v[0x800..0x834]`. Investigated under QEMU: there are **two** dispatch
+  sites loading `ed.v[0x800]` via `lwz r0,0x800(r31)` — `0x40BBF8D0` (MOVEQ,
+  handled by `EmulSoftFnMoveq`, refactored out of the inline hook) and
+  `0x40B9FFF8` (the 68K **`0x3xxx MOVE` family with EA extension word**, e.g.
+  opcode `0x3FFF`; the slot reads NULL so the 0x40B6D750 trampoline
+  `mtspr LR,r5; addi r6,r0,0x10; blrl` branches to PC 0 and the run stops
+  "GUEST STOP at PC=0x00000000 inst=0x00000001"). `ed.v[0x800]` is a general
+  software function that must parse MOVE EA extension words, not just MOVEQ.
+- [ ] Seed `ed.v[0x800..0x834]` with **native PPC handlers** (implement the
+  MOVE-with-extension / MOVE-SR / RESET / 4E7B ABI) so BOTH dispatch sites
+  work and the per-site C hooks can be retired. SheepShaver instead redirects
+  the ROM's trap table (`rom_patches.cpp patch_68k_emul`, `twi` at 0x36e600 →
+  0x36f900/0x36fa00, EMUL_OP escapes) — cross-check which approach the DR
+  emulator actually needs for `ed.v[0x800]`.
+- [ ] Drive the boot with hardware/KernelData + device-register emulation
+  wired to UEFI (the former Phase C/D work, now framed as PPC-side).
+
+#### B.5 Validation matrix (see "Validation Matrix" section)
+- [ ] Boot New World 9.2.2, Mac OS 8.1, System 7.5.3, and the `mac_roms` Old
+  World ROMs (7100/G3) under QEMU. "Boots" = reaches the OS's own idle loop /
+  window server with no `X-op: Unsupported` stop, not just NK handoff.
+
+### Phase B-Legacy: Complete 68K Interpreter (Classic runtime, AFTER the desktop)
+
+Deprioritized by the PPC-native pivot. The native 68K interpreter handles basic
+opcodes but needs expansion for the ROM's Toolbox code to execute.
 
 #### B.1 Additional opcodes (priority order for boot)
 - [ ] Bit manipulation: BTST/BSET/BCLR/BCHG (register and memory)
@@ -592,3 +669,31 @@ The ROM is patched so all code runs in flat memory (no MMU, no BAT). Device I/O
 is intercepted through EMUL_OP trap dispatch. This avoids the need for hardware
 register emulation at the register level — instead, Toolbox calls are redirected
 to host-side C implementations backed by UEFI protocols.
+
+### Revising the SheepShaver model (DingusPPC gold-standard review, 2026-08)
+The 68K "DR emulator" is PPC code owned by the OS; even SheepShaver runs it as
+PPC and does **not** reimplement a 68K CPU. EFIMac's prior pivot to a hand-rolled
+C 68K interpreter (Session 12, `m68k.c`) was a workaround for an unfinished PPC
+boot environment, not a real requirement. Correction (see ARCHITECTURE.md
+"Architectural Reference"): **run PPC** — restore the OS's own DR emulator and
+complete the PPC environment (translation, missing 601 opcodes, hardware/KernelData
+seeds). The C 68K interpreter is only a later legacy-runtime fallback for the
+Classic app layer, not the boot engine.
+
+## Validation Matrix
+
+"Success" is not booting a single disc. The build must be exercised against every
+combination below, because the three operating systems and the two ROM families
+exercise different firmware paths:
+
+| Target | Disc/OS | ROM family | What it stresses |
+|--------|---------|-----------|------------------|
+| New World 9.2.2 | `mac_discs/Apple Mac OS 9.2.2 [PowerMac G4].7z` | New World `Mac OS ROM` | nanokernel warm path, 68K DR-emulator handoff |
+| Mac OS 8.1   | `mac_discs/MacOS 8 (…8.1…)(1998).iso` | New World `Mac OS ROM` | the earliest New World OS; 8.5± Toolbox |
+| System 7.5.3 | `mac_discs/System7_5_3.img` | Old World | classic 68K ROM bootstrap (needs a local Old World ROM) |
+| Old World ROM | `mac_roms/1995-01 - … Power Mac 7100 (newer).ROM` | Old World dump | classic `0xFFF00000` reset-vector boot |
+| Old World ROM | `mac_roms/1997-11 - … Power Mac G3 desktop.ROM` | Old World dump | later Old World / 603+ boot |
+
+To run an Old World ROM, place the file on the ESP at `\System\MacOS\ROM` (see
+`run-qemu-windows.ps1 -OldWorldRom`). This replaces the single-9.2.2 benchmark
+that masked the PPC-vs-68K category mismatch.

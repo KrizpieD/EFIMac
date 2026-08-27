@@ -157,8 +157,67 @@ See [BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md) for the clang/lld-link
 GNU-EFI cross-build (Windows git-bash script or macOS `make`) and
 [USER_GUIDE.md](USER_GUIDE.md) for the QEMU/OVMF boot and disc attachment.
 
+## Architectural Reference: DingusPPC and the PPC-Native Correction
+
+The original plan modeled this project on SheepShaver's **paravirtualization**
+(see "SheepShaver Style Paravirtualization" below). An end-to-end review against
+**DingusPPC** — the current gold-standard classic-PowerPC emulator — has driven
+a fundamental correction to the boot strategy.
+
+### What DingusPPC establishes
+
+- **DingusPPC is pure PowerPC.** It has *no* 68K interpreter. Its `cpu/` tree is
+  entirely PowerPC, and it implements a **real MMU** (BATs + SDR1 page tables).
+- On **New World** machines, Mac OS 8.5/9 boots almost entirely on PPC. The 68K
+  "DR emulator" (the Toolbox 68K emulator) is itself **PPC code the OS keeps in
+  its `Mac OS ROM`**; the host CPU runs it natively as PPC. It is *not* a
+  separate component the host must supply.
+- DingusPPC loads the guest's own 1 MiB `Mac OS ROM` (`tbxi`) directly at
+  `0xFFF00000` and lets the nanokernel + DR emulator run as PPC. Its
+  fully-working desktop machines are Old World; the classic 68K Toolbox layer is
+  served by the OS's own emulator running on the PPC core.
+
+### The correction
+
+EFIMac's early pivot (Phase B/C, Session 12) wrote a hand-rolled **C 68K
+interpreter** (`src/cpu/m68k.c`) and *hijacked* the nanokernel's 68K DR-emulator
+dispatch (`PpcRunGuest` interceptor at guest `0x40B67C60`) to run it instead of
+the OS's own PPC DR emulator. The rationale was "the ROM's built-in PPC DR
+emulator crashes because internal structures are not fully set up." That is a
+**PPC boot-environment gap**, not a reason to reimplement the 68K CPU.
+
+The consequence has been weeks of symptom-patching: stack-scanning return-address
+"self-healing", scrub short-circuits, wedges/escapes/rescues, dozens of
+PC-address-specific probes, and ~200 one-off Python tools — all fighting a battle
+that a correct PPC environment should make unnecessary.
+
+**The corrected direction (PPC-native pivot):**
+
+1. **Stop replacing the OS's own DR emulator.** Remove / neutralise the
+   `0x40B67C60` 68K-dispatch hijack and let the nanokernel's PPC DR emulator run
+   like on real hardware and under DingusPPC.
+2. **Complete the PPC environment** so that emulator survives: implement the
+   PPC **translation model** the nanokernel expects (real BAT/SDR1 or a
+   correct flat alias — the missing 601-era opcodes `extsb`/`extsh`/`divs`
+   that Session 10/11 hit are now implemented; the remaining block is
+   translation, hardware/KernelData seeds and device registers), so the NK
+   scheduler can finish task/address-space/driver setup instead of idling in
+   the park/wake/VBL loop at `BRA$` (Session 16). These are genuine
+   PPC-environment gaps, not 68K problems.
+3. Treat the C 68K interpreter as a **legacy runtime-only fallback** (for the
+   Classic 68K app layer after the desktop is reached), not as the boot engine.
+
+Directly actionable: the DR-emulator opcodes that once stalled the interpreter
+(`extsb`/`extsh` XO 954/922, `divs`/`divw` and the 601 X-ops) have since been
+implemented; the boot now reaches the NK scheduler and idles in a
+park/wake/VBL cycle (Session 16) still because the *environment* is incomplete —
+translation, hardware/KernelData seeds, and device registers. Finishing those
+PPC-side pieces is the path, not more C-68K heuristic patching.
+
 ## Open Work
 
-See [TODO.md](TODO.md). The short list: continuous guest execution, MMU and
-exception delivery to real firmware, Mac device register emulation in the guest
-map, Old World ROM boot testing with System 7, and New World ROM execution.
+See [TODO.md](TODO.md). Short list, in order: (1) finish the PPC-native pivot —
+restore the OS's own DR emulator and complete the PPC environment needed to run
+it (translation, KernelData/hardware seeds, device registers); (2) validate
+across the new matrix (New World 9.2.2, Mac OS 8.1, and the `mac_roms` Old World
+ROMs); (3) only later, legacy 68K runtime support for the Classic app layer.

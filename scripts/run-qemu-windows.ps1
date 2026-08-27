@@ -2,6 +2,18 @@
 # Usage (PowerShell):
 #   .\scripts\run-qemu-windows.ps1                      # no Mac disc attached
 #   .\scripts\run-qemu-windows.ps1 -MacDisc mac_discs\System7_5_3.img
+#   .\scripts\run-qemu-windows.ps1 -MacDisc mac_discs\System7_5_3.img `
+#       -OldWorldRom "mac_roms\1997-11 - 79D68D63 - Power Mac G3 desktop.ROM"
+#   .\scripts\run-qemu-windows.ps1 -MacDisc mac_discs\MacOS 8 (...8.1...).iso
+#
+# Validation matrix targets (see TODO.md "Validation Matrix"):
+#   Mac OS 9.2.2  -MacDisc mac_discs\Apple Mac OS 9.2.2 [PowerMac G4].7z  (New World)
+#   Mac OS 8.1    -MacDisc mac_discs\MacOS 8 (...8.1...).iso             (New World)
+#   System 7.5.3  -MacDisc mac_discs\System7_5_3.img  + -OldWorldRom      (Old World)
+#   Old World ROM -OldWorldRom mac_roms\...Power Mac 7100 (newer).ROM     (Old World)
+# To attach an Old World ROM dump, pass -OldWorldRom; it is staged onto the ESP
+# at \System\MacOS\ROM (the bootlayer's first-priority ROM source for Old World).
+#
 # Prereqs: chocolatey llvm + qemu; OVMF_CODE_4M.fd / OVMF_VARS_4M.fd unpacked
 # from the Debian ovmf package into $env:TEMP\opencode\ovmf (see BUILD_INSTRUCTIONS.md).
 param(
@@ -9,6 +21,7 @@ param(
     [string]$Esp   = "$env:TEMP\opencode\esp",
     [string]$Ovmf  = "$env:TEMP\opencode\ovmf",
     [string]$MacDisc = "",
+    [string]$OldWorldRom = "",
     [int]$Seconds  = 25
 )
 
@@ -24,6 +37,14 @@ $BootOutErr = "$BootOut.err"
 
 # Stage the EFI image as the default boot target.
 Copy-Item -Force $Efi (Join-Path $Esp "EFI\BOOT\BOOTX64.EFI")
+
+# Stage an Old World ROM dump at \System\MacOS\ROM (first-priority ROM source).
+if ($OldWorldRom -ne "") {
+    $OldWorldRom = (Resolve-Path $OldWorldRom).Path
+    New-Item -ItemType Directory -Force -Path (Join-Path $Esp "System\MacOS") | Out-Null
+    Copy-Item -Force $OldWorldRom (Join-Path $Esp "System\MacOS\ROM")
+    Write-Output "Staged Old World ROM: $OldWorldRom -> esp\System\MacOS\ROM"
+}
 
 # OVMF: code is read-only; vars is a writable copy of OVMF_VARS_4M.fd.
 $Vars = Join-Path $Ovmf "vars.fd"
