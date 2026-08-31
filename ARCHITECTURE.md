@@ -214,6 +214,35 @@ park/wake/VBL cycle (Session 16) still because the *environment* is incomplete �
 translation, hardware/KernelData seeds, and device registers. Finishing those
 PPC-side pieces is the path, not more C-68K heuristic patching.
 
+### Staged PPC DR bootstrap — reverse-engineered DR mechanics (2026-08-31)
+
+The chosen direction (user-selected) is the **Staged PPC DR bootstrap**: let the
+guest ROM's own PPC DR emulator run the 68K boot stub, then chase and fix each
+PPC-side gap the DR throws, rather than boot through a C-68K interpreter. C-68K
+is fully removed. Reverse-engineering of the ROM's DR (guest `0x40B60000` region)
+produced these locked-in facts used by the fixes:
+
+- **DR ABI (cold start).** Enter the DR at `0x40B6E964` with `r31=0xB000` (memory
+  base gd), `r29=0x40B80000`, `r30=0x40B60000`, `lowmem[0]=0xA000`,
+  `lowmem[4]=0x4080002A`. DR interface registers: `r24`=68K PC, `r27`=prefetched
+  opcode, `r25`=SR (0x27), `r23`=0.
+- **r28 ABI (new).** `r28` is the DR's host-supplied memory-base register for its
+  PC-relative effective-address operator. The DR body never writes r28 (after
+  cold init `addi r28,r0,0` @0x40B6E9BC); the correct value is **gd = 0xB000**.
+- **PC-relative EA handler.** ed.v[0] = `0x40B6D780` enters the PC-relative
+  EA/branch handler. It backs `r24` up to the referring instruction's extension
+  word, then reads the *reference PC* from `[r28 + (r6&~7)]` = `[0xB010]` via
+  `lwzx r24,r28,r7` @0x40B6D7D8, then adds the displacement (so `LEA (8,PC),A6`
+  resolves when A6's ref PC is seeded; confirmed A6=0xC6). The DR never writes
+  that slot, so it is 0 by default — our REFSLOT patch seeds `[0xB010]=r24` just
+  before the lwzx.
+- **DR 68000 core limit: `0x60FF` (68020 BRA.L).** The embedded DR is a 68000
+  core and has no 32-bit branch displacement support, so it spins at the boot
+  stub's `0x60FF` (68K PC `0x408000C0`). Fixed by redirecting, at the DR
+  dispatch-home range (`0x40B67A00-0x40B67C80`) when the DR settles on a ROM
+  `0x60FF`, `r24` to `PC+2+d32` exactly as 68020 would. Log-verified the DR then
+  reaches the A-line trap dispatch at `0x4080AA10`.
+
 ## Open Work
 
 See [TODO.md](TODO.md). Short list, in order: (1) finish the PPC-native pivot —

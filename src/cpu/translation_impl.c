@@ -531,7 +531,22 @@ PpcHandleException (
     if (ExceptionType != PPC_EXCEPTION_SYSTEM_CALL) {
         g_PpcContext.Srr0 = ExceptionAddress;
     }
+    // Real hardware saves MSR to SRR1, then ORs in the exception-cause bits.
+    // For a trap (`twi`/`tw`, raised as PPC_EXCEPTION_TRAP) the PowerPC
+    // Program-exception cause is SRR1[14] = 0x00020000 (these are the "Trap
+    // type" bits 0x00020000..0x00080000 for trap/privileged/FP). DingusPPC
+    // mirrors this: SRR1 = (MSR & 0x0000FF73) | Exc_Cause::TRAP where
+    // Exc_Cause::TRAP = 1 << (31-14) = 0x00020000 (ppcexceptions.cpp:116,
+    // ppcemu.h:342). The NanoKernel's `twi r31,k` KCall dispatcher relies on
+    // this: handler 0x40B14700 does `mtcrf 0xff, r11` (r11 = SRR1) then
+    // `bne cr3, fault` -- cr3.EQ == SRR1 bit 17, which is exactly the Trap
+    // cause bit. Without it SRR1 = MSR = 0x0000D032 has cr3.EQ clear and the
+    // ROM routes a valid emulator KCall (index 0) to the fault/exception path
+    // instead of KCallTbl[0] = 0x40B13BF8 (the DR-emulator entry).
     g_PpcContext.Srr1 = g_PpcContext.Msr;
+    if (ExceptionType == PPC_EXCEPTION_TRAP) {
+        g_PpcContext.Srr1 |= 0x00020000u;  // SRR1[14]: program-exception "trap" cause
+    }
     g_PpcContext.Msr &= ~(PPC_MSR_EE | PPC_MSR_RI);
 
     // On real hardware the low-memory vector area (0x100..0xFFF) holds small

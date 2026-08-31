@@ -1923,6 +1923,11 @@ RomRelocateJumpTables (
           L"%08x\n", (UINT32)Tables, (UINT32)TotalFixed, RomBase);
 }
 
+// ---------------------------------------------------------------------------
+// FAITHFUL HANDOFF (DingusPPC-faithful, 2026-08): the four SheepShaver handoff
+// builders below (RomWriteEmulStartRoutine, RomWriteEmulatorEntryRoutine,
+// RomWriteEmulatorDispatchHelper, RomWriteEmulatorClassHelper) are retired.
+#if 0 // FAITHFUL handoff builders retired
 // Install one 27-word 68K emulator-entry routine (SheepShaver's
 // emulator-start/MixedMode/Reset/FC1E/FE0A/FE0F fragments). The routines are
 // identical except for the `lwz r10,<offset>(r1)` word that picks the
@@ -2094,6 +2099,7 @@ RomWriteEmulatorClassHelper (
         RomPatchWriteWord32(Rom, Offset + I * 4, Words[I]);
     }
 }
+#endif // FAITHFUL handoff builders retired
 
 // PHASE A.5: KernelData hardware-field provisioning.
 //
@@ -2215,13 +2221,6 @@ BootPatchNkBootSequence (
                                      0x39,0x01,0x04,0x20};
     static const UINT8 PatPvr2[]  = {0x7e,0xff,0x42,0xa6,0x56,0xf7,0x84,0x3e};
     static const UINT8 PatPvr4[]  = {0x7d,0x3f,0x42,0xa6,0x55,0x29,0x84,0x3e};
-    static const UINT8 PatSdr1[]  = {0x7d,0x19,0x02,0xa6,0x55,0x16,0x81,0xde};
-    static const UINT8 PatPgtb[]  = {0x36,0xd6,0xff,0xfc,0x7e,0xe8,0xb1,0x2e,
-                                     0x41,0x81,0xff,0xf8};
-    static const UINT8 PatPmdt[]  = {0x97,0xfd,0x00,0x04,0x3b,0xff,0x10,0x00,
-                                     0x4b,0xff,0xff,0xdc};
-    static const UINT8 PatSrl2[]  = {0x83,0xa1,0x05,0xe8,0x57,0x7c,0x3e,0x78,
-                                     0x7f,0xbd,0xe0,0x2e};
     static const UINT8 PatPmck[]  = {0x7e,0x58,0xeb,0xa6,0x7e,0x53,0x90,0xf8,
                                      0x7e,0x78,0xea,0xa6};
 
@@ -2263,52 +2262,17 @@ BootPatchNkBootSequence (
         Print(L"  NKPATCH pvr4 @0x%x\n", Base);
     }
 
-    // Don't read SDR1: replace the pair with fixed page-table base/size
-    // values (lis r8,0xdead / lis r22,0x001f / nop).
-    Base = RomFindBytes(Rom, PatSdr1, sizeof(PatSdr1), 0x310000, 0x320000);
-    if (Base != 0) {
-        RomPatchWriteWord32(Rom, Base + 0, 0x3D00DEAD);
-        RomPatchWriteWord32(Rom, Base + 4, 0x3EC0001F);
-        RomPatchWriteWord32(Rom, Base + 8, POWERPC_NOP);
-        Applied++;
-        Print(L"  NKPATCH sdr1 @0x%x\n", Base);
-    } else {
-        Print(L"  NKPATCH sdr1: pattern NOT found\n");
-    }
-
-    // Don't clear page table / don't tlbie: NOP both.
-    Base = RomFindBytes(Rom, PatPgtb, sizeof(PatPgtb), 0x310000, 0x320000);
-    if (Base != 0) {
-        RomPatchWriteWord32(Rom, Base + 4, POWERPC_NOP);
-        RomPatchWriteWord32(Rom, Base + 12, POWERPC_NOP);
-        Applied++;
-        Print(L"  NKPATCH pgtb-clear/tlbie @0x%x(+4,+12)\n", Base);
-    } else {
-        Print(L"  NKPATCH pgtb-clear: pattern NOT found\n");
-    }
-
-    // PHASE A.2: don't create the RAM descriptor table (the NK's PMDT
-    // builder). It would describe physical memory this guest map cannot
-    // back; skipping it leaves the table empty so the interpreter's gated
-    // PMDTINJECT provides a correct one instead.
-    Base = RomFindBytes(Rom, PatPmdt, sizeof(PatPmdt), 0x310000, 0x320000);
-    if (Base != 0) {
-        RomPatchWriteWord32(Rom, Base, POWERPC_NOP);
-        Applied++;
-        Print(L"  NKPATCH desc-create(PMDT builder) @0x%x\n", Base);
-    } else {
-        Print(L"  NKPATCH desc-create: pattern NOT found\n");
-    }
-
-    // Don't mess with SRs: make the second SR-load helper return at once.
-    Base = RomFindBytes(Rom, PatSrl2, sizeof(PatSrl2), 0x310000, 0x320000);
-    if (Base != 0) {
-        RomPatchWriteWord32(Rom, Base, POWERPC_BLR);
-        Applied++;
-        Print(L"  NKPATCH sr-load2 -> blr @0x%x\n", Base);
-    } else {
-        Print(L"  NKPATCH sr-load2: pattern NOT found\n");
-    }
+    // ---------------------------------------------------------------------
+    // FAITHFUL MMU BOOT (DingusPPC-faithful, 2026-08): the four MMU-related
+    // neutralizations that SheepShaver's patch_nanokernel_boot() applies here
+    // (SDR1 read, page-table clear/tlbie, PMDT/RAM-descriptor builder, and
+    // the final SR-load helper) are REMOVED so the nanokernel arms its own
+    // real translation (SDR1 + page table + BATs + MSR[IR]/[DR]) and the
+    // interpreter's full PPC MMU engages. Only the CPU-identity/feature
+    // probes (PVR, SPRG3, PM SPRs) remain neutralized — those burn answers
+    // the interpreter must feed and are unrelated to address translation.
+    // ---------------------------------------------------------------------
+    // (Faithful path: the NK's MMU arming sites below are left untouched.)
 
     // Don't check performance monitor: NOP every mtspr/mfspr pair for the
     // PM SPRs (952 mmcr0 .. 959 sda) inside the probe block.
@@ -2346,7 +2310,6 @@ PpcPatchNewWorldRom (
     UINT8* Rom     = (UINT8*)g_BootContext.RomHostBuffer;
     UINT32 RomBase = (UINT32)g_BootContext.RomAddress;
     UINT32 Struct  = PPC_NEW_WORLD_ROM_BOOT_STRUCT_OFFSET;
-    UINT32 TrapBase = 0;
     UINT32 I;
 
     if (Rom == NULL ||
@@ -2396,6 +2359,7 @@ PpcPatchNewWorldRom (
 
     // Locate the `twui r31,0..2` kernel-trap table (SheepShaver's
     // find_rom_data range; verified at ROM + 0x36e8c0 in the standard image).
+#if 0 // FAITHFUL: trap-table redirect retired; TrapBase no longer needed.
     {
         static const UINT8 TwiPattern[12] =
             {0x0F,0xFF,0x00,0x00, 0x0F,0xFF,0x00,0x01, 0x0F,0xFF,0x00,0x02};
@@ -2413,7 +2377,17 @@ PpcPatchNewWorldRom (
             return EFI_NOT_FOUND;
         }
     }
-
+#endif
+    // ---------------------------------------------------------------------
+    // FAITHFUL HANDOFF (DingusPPC-faithful, 2026-08): the SheepShaver handoff
+    // scaffolding below is REMOVED so the ROM keeps its ORIGINAL content and
+    // the OS reaches its natural DR handoff via the real `twi r31,k` kernel-
+    // trap / exception path (the injected trap-table redirect, entry routines,
+    // fake 68K DR-context builders, and EMUL_OP markers are all retired). The
+    // clean ROM holds `twi r31,0..15` constants at 0x36E8C0 and NOPs at
+    // 0x36F700/0x36F900; those sites must not be overwritten.
+    // ---------------------------------------------------------------------
+#if 0 // FAITHFUL: trap-table redirect + injected entry routines retired
     // Rewrite the 16-word trap table as branches to the entry routines:
     // trap 0 -> emulator start, 1 -> Mixed Mode, 2 -> Reset/FC1E, 3 -> FE0A,
     // 4 -> (interrupt, ILLEGAL), 5 -> FE0F, 6..15 -> ILLEGAL.
@@ -2447,6 +2421,7 @@ PpcPatchNewWorldRom (
     RomWriteEmulatorEntryRoutine(Rom, 0x36F700);
     RomWriteEmulatorDispatchHelper(Rom, 0x36F7C0);
     RomWriteEmulatorClassHelper(Rom, 0x36F7D0);
+#endif // FAITHFUL handoff retired
 
     // The ROM's control-flow dispatch glue bakes `rlwimi r29,r24,0x14,0xb,0xb`
     // (0x531DA2D6) into every branch/jmp path: it copies the low bit of the
@@ -2469,6 +2444,7 @@ PpcPatchNewWorldRom (
         Print(L"68K emulator: neutralised %u rlwimi dispatch-bit-20 words\n", Count);
     }
 
+#if 0 // FAITHFUL: EMUL_OP marker scaffolding retired
     // Overwrite the opcode-table slots for the EMUL_OP extended opcodes
     // (0xFE40..0xFE40+OP_MAX+2) with POWERPC_EMUL_OP markers ("addi r0,r0,n")
     // followed by `b 0x366084` (re-enter the DR emulator loop). The
@@ -2487,6 +2463,7 @@ PpcPatchNewWorldRom (
             RomPatchWriteWord32(Rom, Entry + 28 + I * 8, 0x4BF66E68 - I * 8);
         }
     }
+#endif // FAITHFUL: EMUL_OP markers retired
 
     // XLM ("eXtra Low Memory") globals the entry routines read; they sit above
     // the 0x0-0x1800 low-memory area the nanokernel zeroes during its boot.
@@ -2518,10 +2495,36 @@ PpcPatchNewWorldRom (
     // PHASE A.5: validate the KernelData page and snapshot its state.
     BootSeedKernelDataHardware();
 
-    Print(L"68K emulator patched: LA_EmulatorCode 0x%08x LA_DispatchTable 0x%08x "
-          L"trap table at ROM+0x%x -> emulator start 0x%08x\n",
-          RomBase + 0x360000, RomBase + 0x380000, TrapBase,
-          RomBase + 0x36F900);
+    Print(L"68K emulator (FAITHFUL): LA_EmulatorCode 0x%08x LA_DispatchTable 0x%08x "
+          L"trap table kept at ROM+0x36E8C0 (natural twi path)\n",
+          RomBase + 0x360000, RomBase + 0x380000);
+
+    // Boot-proc warm-reboot KCall function id. After the nanokernel replaces
+    // itself it "returns to the boot proc"; the boot-proc tail at ROM+0x3126E8
+    // then issues `li r3,0xff / mtlr r4 / blrl` into the twi kernel-trap table.
+    // The trap dispatches to the 0x700 KCall handler (KCallTbl[0] at 0x40B13BF8)
+    // which branches on r3: r3==0 is the DR-emulator scheduler entry
+    // (0x40B13C38 -> 0x40B12CB0), while r3=0xff resolves to the soft-interrupt
+    // path (0x40B12AB4) that returns to 0x40B126F4, re-entering the boot lock
+    // and re-running NK init -- the spurious warm-reboot loop. On real hardware
+    // the cold-launch path (InitEmulator, Init.s) enters the trap table with
+    // r3==0, so the emulator is launched through the r3==0 branch. Reproduce
+    // that faithful state: devirtuate the tail's own function id 0xff -> 0 so
+    // the KCall dispatches to the DR-emulator scheduler instead of returning.
+    {
+        UINT32 BootTailOff = 0x3126E8; // ROM+0x3126E8 == guest 0x40B126E8
+        UINT32 TailWord = (UINT32)Rom[BootTailOff] << 24 |
+                          (UINT32)Rom[BootTailOff + 1] << 16 |
+                          (UINT32)Rom[BootTailOff + 2] << 8 |
+                          (UINT32)Rom[BootTailOff + 3];
+        if ((TailWord & 0xFFFF0000u) == 0x38600000u) { // li r3,<simm16>
+            UINT32 NewWord = (TailWord & 0xFFFF0000u) | 0x0000;
+            RomPatchWriteWord32(Rom, BootTailOff, NewWord);
+            Print(L"68K emulator: boot-proc tail KCall id 0xff->0 at ROM+0x3126E8 "
+                  L"(li r3,0) to take DR-emulator scheduler r3==0 path\n");
+        }
+    }
+
     return EFI_SUCCESS;
 }
 

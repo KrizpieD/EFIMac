@@ -5216,15 +5216,19 @@ M68kExecuteFromPPC (
                 UINT32 A5 = g_M68kContext.A[5];
                 if (!GammaUnwound && A5 >= 0x00010000u && A5 < 0x00040000u) {
                     GammaUnwound = TRUE;
-                    Print (L"  synth: unwind gamma stage -> 7A2C "
-                           L"(sp=%08x a5=%08x)\n",
-                           g_M68kContext.Supervisor ? g_M68kContext.SSP
-                                                    : g_M68kContext.A[7],
-                           A5);
-                    g_M68kContext.PC = 0x40807A2Cu;
-                    M68kWriteAn (7, A5);
-                    g_M68kDebugSteps = 2000;   // trace the resumed flow
-                    break;
+                    // DISARMED (2026-08-30): the synthetic gamma/palette
+                    // unwind was built for the retired SheepShaver-style
+                    // synthetic dispatch, where the gamma handler terminated
+                    // at this self-loop by design. In the faithful DR/NK boot
+                    // the same PC 0x408047AE is reached legitimately as the
+                    // 68K boot's handler-walk return-park (stack holds the
+                    // walker's real return address, e.g. 0x40807A74), and
+                    // teleporting to 0x40807A2C REWOUND the live boot back
+                    // to 0x4080012C (ROM restart). Observe only now.
+                    Print (L"  synth: NOT unwinding gamma stage (a5=%08x "
+                           L"sp=%08x) - park is legit DR boot wait\n",
+                           A5, g_M68kContext.Supervisor ? g_M68kContext.SSP
+                                                        : g_M68kContext.A[7]);
                 }
             }
             // Install a minimal 68K exception vector table if the NK's

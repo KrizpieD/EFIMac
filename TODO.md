@@ -46,6 +46,235 @@ only as a later legacy-runtime fallback for the Classic app layer.
 
 ### Recent work
 
+- **STAGED PPC DR BOOTSTRAP, PHASE 1 (2026-08-31): the ROM's own PPC DR now
+  runs the 68K boot stub past the `0x60FF` branches into the A-line trap
+  dispatch.** Direction chosen by user: run the guest `Mac OS ROM`'s embedded
+  PPC DR emulator (DingusPPC model) instead of the removed C-68K interpreter.
+  C-68K fully removed (interpreter.c/main.c/Makefile). Key reverse-engineered
+  facts locked in: (a) **r28 ABI** — `r28` = the DR's memory base register =
+  gd = `0xB000` (DR never writes it after cold init `addi r28,r0,0` @0x40B6E9BC).
+  (b) The DR's PC-relative EA/branch handler (ed.v[0]=0x40B6D780) reads the
+  current instruction's reference PC from `[r28 + (r6&~7)]` = `[0xB010]` via
+  `lwzx r24,r28,r7` @0x40B6D7D8; the DR never seeds that slot, so it was 0 and
+  every PC-relative computed off address 0. FIX: seed `[0xB010]=r24` just
+  before the lwzx (REFSLOT), which made `LEA (8,PC),A6` resolve (A6=0xC6).
+  (c) **0x60FF (68020 BRA.L) is un-executable by the 68000-core DR** — no 32-bit
+  displacement support; the DR spun at 68K PC 0x408000C0. FIX: at the DR
+  dispatch-home range (0x40B67A00-0x40B67C80) with `g_DrYieldSeen`, if r24 (68K
+  PC) points at a ROM `0x60FF`, redirect r24 = PC+2+d32 exactly as 68020 would.
+  Log-verified: `DR-BRA.L[1] redirect 0x60FF@0x408000C0 d32=0x0000A94E ->
+  0x4080AA10` — the DR reaches the A-line trap dispatch region 0x4080AA10, which
+  walks its handler table and stores a ROM pointer to low-RAM vector `0x0008`
+  (`LEA $0008,A0; MOVE.L D0,(A0)` / `41F8 0008; 2080`) before returning to PC 0.
+  NEXT: the DR then reads/jmps through the low RAM vector at 0x0008/0x0004 (0
+  after first store) — resolve why the A-line chain lands on PC 0 (vector fetch
+  not yet fed), and complete the entry-table walk (the `60FF xxxx 00D0` /
+  `00B8`/`0116` targets at 0xAA30/0xAA70 lead the chain). `DR-BRA.L` fires once
+  per 0x60FF with one-shot-per-PC tracking cap 64; probes DR68K-LOW, DR-LOWSTATE,
+  Y80 left in for the trace until the A-line/vector gap is fixed. Related tools:
+  `tool_scripts/dis_m68k.py` (new, minimal; decode helpers still stubs),
+  `tool_scripts/dis_ppc.py` (mature). See ARCHITECTURE.md r28-ABI note.
+
+- **"PURE-PPC PROBE" (2026-08-30): removing the 68K feed = rfi into PC 0.**
+  Gated the three 68K hand-feed sites behind `g_FeedBoot68K` (save-site
+  ECB68KPATCH substitution; the rfi SRR0OVR override; the [B2C4]=0x4080002A
+  seed), ran with it FALSE. Result: operations identical through the
+  handoff (`RETTASK@0x40B24518 r24(68Kpc)=0xFFFFFFFF SRR0=0x00000000`),
+  then `rfi -> PC=0x00000000` → `GUEST STOP ... (reserved): Unsupported` —
+  i.e., ZERO 68K execution (68K W2/BccL/NKHEAP/DEADLOOP all absent) and the
+  PPC dies at the emulator task-switch restore (MRETTASK epilogue lwz-chain
+  @0x40B24500-0x40B24524 pulls regs from ECB; the 68K task context was
+  never created so [ECB+0x1C4]=0xFFFFFFFF and resume SRR0=0). CONCLUSION:
+  on real G3/G4 new-world hardware the ROM's 68K BootROM section runs
+  FIRST and is what creates the DR emulator-task context that the NK's
+  RETTASK returns into; Mac OS 9's new-world boot is 68K-first by design
+  (loader + emulator handshake are 68K ROM code) — a pure-PPC boot is
+  Mac OS X/PPC-BootX territory, not OS 9's ROM path. The feed we provide is
+  plumbing for that "create my own context" step, not fake scaffolding.
+  `g_FeedBoot68K` left in source (default TRUE); flip to FALSE to re-run
+  the probe. Pre-handoff CreateArea PANIC (22 hits) unaffected/separate.
+- **TRACE RESULT: "why no OS task queues" — answered with data
+  (2026-08-30).** With the gamma-unwind synthetic escape DISARMED (it was
+  teleporting the live boot back to 0x4080012C / ROM restart whenever the
+  68K boot's handler-walk hit its table-return park 0x408047AE `60FE`),
+  the post-park run now terminates cleanly in a coherent IDLE CYCLE:
+  (a) `SCHED[1]/[2] @0x40B22F18` per tick shows curTask=0x00009CE0 ready
+  (st16=1), the dead-list empty (`KDP-0x2E8=0x00000000:0x00066514`), ECB
+  task table (0x00066940/0x66B30) single-entry; (b) the DEC handler saves
+  the 68K task each tick (`ECBPCWATCH [B2C4] <- 0x408047AE @0x40B238F0`)
+  then rfis back to DR dispatch; (c) `PROGRESS` marker PCs all sit inside
+  the tick/scheduler (0x40B22ECC/0x40B238B4/0x40B13D40/0x40B244A8 with
+  LR=0x40B13204/0x40B13258/0x40B24478 = the 0x900-handler body) while the
+  TB advances ~0x4C0000 ticks — the PPC side is ONLY doing
+  save/schedule/restore, nothing else. **CONCLUSION: no OS-load task is
+  ever queued because the 68K boot legitimately parks at 0x408047AE
+  (stack holds its real walker return 0x40807A74; IPL=0; `BRA *`/`STOP`
+  wait) and NOTHING delivers the 68K interrupt/event that would wake it —
+  m68k.c has no 68K exception/interrupt machinery (TODO B-Legacy B.2) and
+  the NK posts nothing (ed.v[0x800..0x8FF] stays empty; vector table at
+  0x0 was 0 and is now our RTE-stub-only). The 68K boot's continuation is
+  gated on the exact "event delivery" the DR/NK contract requires and the
+  emulator cannot yet supply. Disasm proof of the park: its entry
+  0x40804640 `movem.l d0-d7/a0-a7,$c30.w; cmpi.l #$5a932bc7,$db0.w; bne
+  $408047ae` — the $DB0 ctx-magic check (bootloader reseeded it: "reseeded
+  ctx-save magic @0xDB0=0x5A932BC7") decides service-vs-park; the wait
+  tables 0x4080478C/0x40804828/0x4080482C are `lea,p;dc.w 0x60ff;dc.l
+  ptr` handler records ending in the `60fe` terminator executed as idle.
+  NEXT (needs green-light): implement 68K exception/interrupt delivery in
+  m68k.c (vector fetch from low RAM, SR/PC frame on SSP, level 1 VBL/time
+  source) so the park actually wakes, or seed/verify what ed.v event the
+  NK would post.
+- **FAITHFUL 68K OS BOOT LIVES (2026-08-30): the boot now crosses the DR
+  handoff and runs the ROM's 68K boot code until its OS idle wait.**
+  Log-verified end-to-end (180s QEMU run, 9.2.2 disc): **single** NK init
+  ("Hello ... multitasking NanoKernel" once) -> **single** handoff
+  ("Nanokernel replaced. Returning to boot proc") -> BOOTTAIL -> EMUTRAP ->
+  no EMUSTART/EMUL_OP scaffolding -> 68K dispatch. Sequence that got here:
+  (1) EMUTRAP block now seeds `[B2C4]=0x4080002A` **unconditionally** (the
+  old `g_Ecb68kPcSeeded==0` gate-plus-flag never produced the seed in the
+  built binary's run — flag read 0 everywhere yet the guarded block didn't
+  fire; unknowable stale-build/counter semantics — removed). (2) The memory-
+  layer patch in `CpuWrite32` (`ECB68KPATCH`) is now **unconditional**:
+  first `0xFFFFFFFF` write to `[B2C4]` -> `0x4080002A` (no flag, no
+  `g_Ecb68kPcSeeded`); fired at the save `stw r24,0x1C4(r6)` @0x40B238F0.
+  (3) `SRR0OVR` retargeted from the flag to the **genuine emulator resume**:
+  fires only when `Srr0==0 && r24==0x4080002A` at the `rfi` @0x40B24524
+  (removed the `g_Ecb68kPcSeeded` gate and the r24=0xFFFFFFFF safety net).
+  Resulting chain (log 21-25 / indent): RETTASK r24(68Kpc)=0x4080002A ->
+  rfi -> `SRR0OVR -> resume PC 0x40B67C60` -> DR dispatch -> `M68kExecuteFromPPC`
+  at PC 0x4080002A (`CANARY FLIP #1`) -> **68K interpreter runs the ROM
+  boot prologue** (MOVEM/RESET/LEA at 0x408000B6+, `BccL` 0x60FF branches,
+  dead-branch/data tables at `60fe` sentinels) -> jumps into boot continuation
+  at 0x4080AA10/0x4080AA20 -> NK 68K boot region 0x40804656-0x40804756 with
+  `LINE A stub` KCall dispatch (sel 0x38/0x15/0x06/0x05/0x04/0x1F) hitting
+  the existing vmk shims (`nkpoll`/`nkfill`/`nkiter`, `NKHEAP-SEED`,
+  `68K MEMCPY`, LINE-A `0xA...` opcodes) -> then **idle parks at
+  0x408047AE (`60FE` = `BRA.S *`)**. That park is ROM table data, not code —
+  but the ROM *executes* it as a deliberate wait (disassembled
+  `0x40804780..`: handler table of `60ff <ptr>` entries + `60fe` terminator,
+  `LOW-SP` style stack now real: SP=0x00002D730). - **Per-tick round trip
+  confirmed as the NORMAL NK schedule/68K-task cycle**: PPC DEC vector 0x900
+  handler @0x40B13200 does `bl 0x40b238ac` (68K ctx SAVE = the `[B2C4]`
+  store routine this session patched!) -> `bl 0x40b12700` (scheduler) ->
+  `bl 0x40b22eac` -> `bl 0x40b2391c` (68K ctx RESTORE) -> rfi -> DR dispatch
+  -> one 68K instr -> next tick. The log interleaves `VECDISP 0x900` /
+  `DBG rfi` / `SS[n]` @0x408047AE ~1865x/180s — the machine is idle; the
+  scheduler only ever re-selects the single idle task. **New frontier: NO
+  task is queued to load/run Mac OS** (no second EMUTRAP re-entry, no
+  boot-device/softfn/dr access; PPC side also idles). Both sides wait for an
+  OS-load event that nothing produces — the 68K boot finished its self-init
+  and is parked; real DR hardware has the PPC NK continue driver/disk init
+  from the same scheduler. Next step proposal (see options): instrument what
+  would ENQUEUE the loader/first task on the PPC tick path (why `SCHED`
+  never runs anything but the idle task), or extend the run + throttle the
+  1865-line/tick `VECDISP`/`DBG rfi`/`SS` probes so a longer boot is readable.
+  Note: `g_Ecb68kPcSeeded` now prints as seed=97 at SRR0OVR (file-scope static
+  aliasing another data item — cosmetic; nothing functional reads it anymore).
+  Also the pre-handoff NK "CreateArea placed at or above/below" PANICDUMP at
+  0x40B272E0/0x40B272F8 (msg @0x40B1FD86) STILL appears EARLY (lines
+  ~1225-3148, before the handoff) every run — non-fatal, disappears from the
+  post-handoff flow; handle as separate workstream.
+- **FAITHFUL-HANDOFF continued (2026-08-28, later): the 0x9000 AREA panic is
+  OVERCOME — new blocker CORRECTED to the NK idle task, NOT a debugger halt.**
+  Fresh QEMU run with all existing instrumentation shows the boot now crosses
+  the previously-fatal `0x9000` area overlap: the NK creates areas `0x7440`
+  (0x9000-0x9FFF) and `0x7380` (all-memory 0-0xFF0FFF), hits the overlap during
+  `convertPMDTsToAreas`, enters the nanodebugger ("NanoKernel debugger ...
+  Resuming at - wish me luck"), AUTORESUME feeds 'g' at the prompt
+  `0x40B2751C` (fired 3x), and the boot continues: MERGE handles the dup,
+  "Nanokernel replaced. Returning to boot proc", then a SECOND kernel-init pass
+  ("Hello from the replacement multitasking NanoKernel" again, "Physical RAM
+  size", "Created motherboard coherence group", "NKCreateAddressSpaceSub",
+  "Created syst[em]"). The scheduler then selects the IDLE TASK: disassembly of
+  0x40B24334..0x40B24524 shows the scheduler context-restore does `rfi @0x40B24524`
+  straight to SRR0=0x40B24F04 (the idle-task entry that loads the ASCII
+  task-name strings and busy-idles), and the `bne cr1,0x40b244c4` at 0x40B244B8
+  SKIPS the nanodebugger because `[r1-0xb50]` is non-zero — so 0x40B24F48 is
+  the NORMAL NK idle busy-loop, NOT a debugger wait. It fires `sc r0=0x2E`
+  (->vec 0xC00->handler 0x40B14AC0, which routes non-[-1,-2,-3] numbers to the
+  generic dispatcher 0x40B13D40 returning 0xFFFF8D9A) and `twui r31,5`
+  (TO=0x1F always traps ->vec 0x700->handler 0x40B14700) purely as a periodic
+  idle animation; the return value is irrelevant (both sc-return paths just
+  set up another ~10M-iteration delay). Therefore servicing `sc 0x2E` CANNOT
+  resume it — the idle task has no work. Physical-RAM finding from DingusPPC
+  review confirms the input map is NOT wrong (real hardware maps contiguous RAM
+  from 0 incl. 0x9000; NK carves natively; DingusPPC has zero caller-structure/
+  VMLogicalPages injection — that's EFIMac/SheepShaver paravirtualization).
+  The REAL question is why NO other task is runnable and why the boot proc
+  re-runs a SECOND NK init after "Returning to boot proc" — the NK should be
+  launching the 68K DR emulator task / OS driver, not idling. NEXT: trace why
+  the boot proc's return triggers a second NK init and why the DR-emulator task
+  is never created/run (this is the true divergence, not the idle loop).
+- **FAITHFUL-HANDOFF / real-HW cr3 contract (2026-08-29): ROOT CAUSE of the
+  0x700 trap misroute is CONFIRMED against authoritative NanoKernel source.**
+  Cloned elliotnunn/NanoKernel; `SoftInts.s` (KCall dispatcher) is the exact
+  source ancestor of our ROM handler `0x40B14700`. Real contract:
+  `kcall_index = SRR0 XOR EmuTrapTableLogical`, valid 0..15, then
+  `KCallTbl[index]` via `add r8,r8,r1; lwz r10,0x5f0(r8); mtlr r10;
+  mr r10,r12(SPRG2=LR); blr`. Our success path 0x40B14820 matches
+  SoftInts.s:243-252 VERBATIM (incl. `0xe40` call-counts, `0x5f0` KCallTbl,
+  `mr r10,r12`, `rlwimi r7,r7,0x1b,0x1a,0x1a` = MSR[SE]); fault path
+  0x40B14844 matches SoftInts.s:292-295 (the `rlwinm r8,r11,17,28,29;
+  addi r8,r8,0x4b3; rlwnm` "clever bit hacking" → Exception). So index=0
+  (boot-tail `twui r31,0`) is a VALID KCall whose sole obstruction is the
+  v2 gate at 0x40B14710: `bne cr3, 0x40b14844` after `mtcrf 0xff, r11`
+  at 0x40B14708, where r11 = SRR1 (dispatcher 0x40b13d40 ==
+  LoadInterruptRegisters: r10=SRR0, r11=SRR1, r12=SPRG2=LR, r13=CR).
+  Boot tail (0x40B126E0 `mtspr 0x1b [SRR1]=MSR=0x0000D032`; 0x40B126E4 rfi;
+  0x40B126F0 blrl→trap_table) delivers SRR1=0x0000D032 whose cr3 (value
+  bits 16-19) = 0 → cr3.EQ clear → `bne cr3` faults to 0x40B14844 instead
+  of dispatching to KCallTbl[0]=0x40B13BF8 (the DR-emulator/MK entry).
+  CONCLUSION: to dispatch, the interrupted MSR (SRR1) at the emulator KCall
+  trap must carry cr3.EQ (value bit 17 = 0x00020000). NEXT: make the boot
+  tail / KCall context set cr3.EQ in SRR1 (0x0000D032 | 0x00020000 =
+  0x0002D032) so the v2 handler falls through to 0x40B14820 → jump to
+  0x40B13BF8, then confirm the second NK-init disappears and the DR emulator
+  boots (watch for EMUSTART / KCallTbl[0] jump at 0x40B13BF8).
+  (PROGINT[1] handler-entry r11=0x00030000, r12=0x00000227 are the
+  interrupted values; dispatcher overwrites r11 with SRR1 after the `bl`.)
+- **FAITHFUL-HANDOFF / DINGUS FIX APPLIED + VERIFIED (2026-08-29): the trap
+  dispatch now WORKS.** DingusPPC confirmed the real mechanism: for a `twi`
+  program exception the emulator ORs the trap cause into SRR1 —
+  `SRR1 = (MSR & 0x0000FF73) | Exc_Cause::TRAP` where
+  `Exc_Cause::TRAP = 1 << (31-14) = 0x00020000` (ppcexceptions.cpp:116,
+  ppcemu.h:341-342). That 0x00020000 bit = value bit 17 = cr3.EQ, exactly the
+  bit the ROM's `0x40B14700` dispatcher gates on (`mtcrf 0xff, r11` →
+  `bne cr3, 0x40b14844`). EFIMac was copying raw MSR into SRR1
+  (translation_impl.c:534) with NO trap bit → cr3.EQ clear → faults. FIXED:
+  `PpcHandleException` now ORs `0x00020000u` into SRR1 for
+  `PPC_EXCEPTION_TRAP` (translation_impl.c). Verified live: PROGINT shows
+  SRR1/r11 = 0x0002D032 (was 0x0000D032); `bne cr3` NOT taken; handler walks
+  0x40B1470C→…→0x40B14820 success path; `lwz r10,0x5f0(r8)` loads
+  r10=0x40B13BF8=KCallTbl[0]; CALLTBL@0x40B13BF8 entered; boot proceeds past
+  the old fault point into the NK boot proc. REMAINING: the boot still
+  re-runs the NK init (4x "Hello replacement") and spins in the nanodebugger
+  (AUTORESUME 'g' loop) with boot-proc PC=0x40B27530 r1=0x00000000 (NULL
+  stack in the nanodebugger terminal loop) and caller 0x40B12818 repeatedly
+  hitting TERMENTRY 0x40B272F8. Next step: the trap handoff is correct; the
+  next divergence is the boot proc's nanodebugger/self-restart loop
+  (0x40B127A8 spinlock → 0x40B12818 → TERMENTRY), NOT the 0x700 dispatch.
+- **FAITHFUL-HANDOFF followup (2026-08-28): NK panic root-caused to an
+  AREA-list duplicate, NOT a device-register gap.** After retiring the
+  SheepShaver handoff, the faithful boot now progresses correctly through
+  the Zilog-8530 SCC console I/O (EFIMac's SCC device at 0x20000 already
+  works: status [base+2], data [base+6]) and the "PMDT -> areas" memory
+  init, then PANICS at the NK fault handler 0x40B272E0 (full SRR0/SRR1/
+  DAR/DSISR/XER/CR/PVR save-context). Disassembly + runtime watches
+  (AREASKIP/KDP dumps) show: the caller loop 0x40B1F61C does
+  `bl 0x40b1fbec` (AREA normalize/commit); on `r9 != 0`
+  (error `-0x7272` = "rr" skipped) it `bnel 0x40b1f380 -> b 0x40b272e0`
+  (panic). Root condition: the NK first places area 0x7440 covering
+  0x9000-0x9FFF (size 0x1000), then the all-memory area 0x7380
+  (flags 0xE00C, start 0/end 0xFF0FFF) is subdivided and one sub-range
+  resolves to the SAME 0x9000-0x9FFF -> duplicate/overlap -> the area
+  walk rejects it as fatal (`beq cr7`/overlap checks, CR7=LT). CONCLUSION:
+  the 0x9000 low-memory page is listed twice in the physical-memory map/
+  PMDT EFIMac seeds, so `convertPMDTsToAreas` double-creates it. This is a
+  SEEDING bug (double-count of the 0x9000 low-memory page), not missing
+  device register emulation. NEXT: trace BMAP/PMDT seeding to stop the
+  0x9000 double-count, then drive past the panic to real MMU arming and the
+  OS DR handoff. (Session left ARESKIP/panic-descriptor instr in
+  interpreter.c for the followup.)
 - **Phase B/C session 8 (2026-08-25 cont.7): method-1 bisection EXECUTED,
   verdict definitive.** Escalated watches until the 0x7F4085 continuation
   value's origin was unambiguous: it is NEVER stored by 68K code
@@ -424,22 +653,190 @@ it with C-68K heuristics ("self-healing" SPR, scrub short-circuits, PC-probes).
   instruction), past "Nanokernel replaced. Returning to boot proc". So the
   de-hijack is viable; the PPC opcode table is essentially functional.
 - [ ] The native run still trips the **unseeded software-function vectors**
-  `ed.v[0x800..0x834]`. Investigated under QEMU: there are **two** dispatch
-  sites loading `ed.v[0x800]` via `lwz r0,0x800(r31)` — `0x40BBF8D0` (MOVEQ,
-  handled by `EmulSoftFnMoveq`, refactored out of the inline hook) and
-  `0x40B9FFF8` (the 68K **`0x3xxx MOVE` family with EA extension word**, e.g.
-  opcode `0x3FFF`; the slot reads NULL so the 0x40B6D750 trampoline
-  `mtspr LR,r5; addi r6,r0,0x10; blrl` branches to PC 0 and the run stops
-  "GUEST STOP at PC=0x00000000 inst=0x00000001"). `ed.v[0x800]` is a general
-  software function that must parse MOVE EA extension words, not just MOVEQ.
-- [ ] Seed `ed.v[0x800..0x834]` with **native PPC handlers** (implement the
-  MOVE-with-extension / MOVE-SR / RESET / 4E7B ABI) so BOTH dispatch sites
-  work and the per-site C hooks can be retired. SheepShaver instead redirects
-  the ROM's trap table (`rom_patches.cpp patch_68k_emul`, `twi` at 0x36e600 →
-  0x36f900/0x36fa00, EMUL_OP escapes) — cross-check which approach the DR
-  emulator actually needs for `ed.v[0x800]`.
+  `ed.v[0x800..0x834]`. Investigated under QEMU (session 17-18): there are
+  MANY such slots, each backed by a small trampoline block at
+  `0x40B6D7xx` (`mtspr LR,r5; addi r6,r0,OFF; blrl`, r5 = the slot value,
+  NULL ⇒ `blrl` branches to address 0 → "GUEST STOP at PC=0"). Sites seen:
+  `0x40BBF8D0`/`0x40B9FFF8` (MOVEQ 0x7F1A + 0x3xxx MOVE → `ed.v[0x800]`),
+  `0x40BFFFF8` (→ `ed.v[0x808]`, r27=0xFFFF9760), plus the already-hooked
+  `0x40B6CA84` (bctrl → `ed.v[0x80C]` MOVE-SR), `0x40BA7380` (`0x828` RESET),
+  `0x40BA73D8` (`0x87C` 4E7B). A generic trampoline escape
+  (`EmulSoftFnViaCInterp`) now routes a NULL-slot `blrl` to the C 68K
+  interpreter for one opcode + resumes the DR dispatch; MOVEQ advances
+  correctly but multi-word instructions do NOT: the DR **pre-consumes the EA
+  extension word(s) before dispatching**, so `r24-2` points at the extension
+  (or data), not the opcode — C re-decode mis-frames (e.g. 0x3FFF decodes to
+  an invalid mode-7/reg-7 EA and PC does not advance; 0xFFFF illegal words
+   also stall). The software-fn ABI (what r24/r27/r28 hold on dispatch) must be
+   reverse-engineered from the ROM before a faithful re-execution is possible.
+- [ ] **DingusPPC-derived pivot direction (2026-08, session 18):** DingusPPC
+   does NOT reimplement the DR and does NOT seed ed.v[] in C — it runs the
+   whole PPC + MacOS-68K stack faithfully, and the OS's own DR emulator
+   installs `ed.v[0x800..0x834]` during its **setup/init routine**. EFIMac's
+   injected emulator entry (`RomWriteEmulatorEntryRoutine`, bootloader_impl.c
+   ~1990-2003+ → jumps into the DR-loop body at 0x40B66080) **bypasses that
+   init routine**, so the slots stay NULL and the native DR crashes on first
+   software-function use. So instead of per-dispatch-site C escapes, the
+   faithful fix is to **run the OS's DR init routine so it seeds the slots**
+   (the NK emulator-handoff path: `jump68k` caller → `bctr` to a KernelData
+   `[KDP+0x1184]` init-routine pointer, with `r3=EmulatorData`, `r4=opcode
+   table`). ⚠ Exact KDP offsets (0x1184/0x119c) and the caller (claimed file
+   0x312400) are NOT yet verified against the *running patched* ROM — the flat
+   `macosrom_flat.bin` does NOT match the running image (confirmed: trampoline
+   bytes at the claimed file offsets are not the live `0x7CA803A6 …`), so the
+    handoff addresses must be captured live from the running patched image
+    before implementing.
+  - **Live capture session (B.20, native mode):** re-ran `USE_PPC_NATIVE_DR=1`
+    with a SOFTFN-slot dump added to the 0x40B6D740 trampoline intercept. Trace
+    confirms a **second distinct software-function family**: crash at
+    `PC=0x40B6D758 0x4E800021 bclr -> 0x00000000` with `r5=0 r27=0x0808`, i.e.
+    the unseeded **`ed.v[0x808]`** slot (trampoline `addi r6,r0,0x10` at
+    0x40B6D754), NOT `[0x800]`. The 0x800 family (7 escapes: MOVEQ 0x7F1A,
+    MOVE-ext 0x3FFF, LINE-F 0xFFFF) fires first, then a distinct 0x808 dispatch
+    crashes because `EmulSoftFnViaCInterp` returns FALSE (its op guard) and the
+    native `blrl` branches to slot NULL → PC 0. Confirms the C-escape is
+    per-family whack-a-mole: 0x800 MOVEQ/MOVE-ext, 0x808 (r27=0x808), 0x80C
+    MOVE-SR, 0x828 RESET, 0x87C 4E7B each route DIFFERENT instruction classes
+    to DIFFERENT trampoline offsets, and the multi-word EA pre-consumption
+    framing (extension word already consumed ⇒ `r24-2` mis-points) makes generic
+    C re-decode unreliable. Only the faithful DR-init seeding or a full ABI
+    reverse-engineering converges; per-slot patching does not.
+  - **Faithful-seeding investigation (B.21):** disassembled the CLEAN ROM
+    (`rom_flat_4mb.bin`, confirmed it MATCHES the running patched image at the
+    DR region — `0x36D750=0x7CA803A6/0x36D754=0x38C00010/0x36D758=0x4E800021`
+    equal the live trace) and ran a live `EDV-SEED` write-watch on guest
+    0xB800..0x8FF. Results are decisive:
+    1. The stubs (0x40B6D750 `mtlr r5; li r6,0x10; blrl`, 0x40B6D760 token
+       0x2C, 0x40B6D770 `lwz r5,0x804(r31)`) are reached **only by indirect
+       dispatch** (no direct branch callers) — `r5` comes from `lwz r5,0x800/
+       0x808(r31)` (sites 0x40B84040 / 0x40BFFFF8), i.e. **ed.v[0x800]/[0x808]
+       are loaded but never seeded** → `mtlr r5`=0 → `blrl` → PC 0.
+    2. The ROM contains **ZERO `stw`/store instructions with 0x600..0x900
+       offsets anywhere** and **no run of consecutive pointers into the
+       emulator region** — so the ROM does NOT fill `ed.v[0x800..]` by any
+       literal store or pointer-table copy reachable in this boot.
+    3. The live EDV-SEED watch shows the ONLY writes to 0xB800..0x8FF are
+       **EFIMac's own bootloader** seeding 0xB814/0xB818 (its helpers). The
+       DR's software-fn init never runs.
+    4. **SheepShaver never runs the DR init or seeds ed.v either** — its
+       `patch_68k_emul` (ss_src rom_patches.cpp:1057) patches the `twi` trap
+       table → 0x36f900 emulator-start + installs EMUL_OP markers at 0x380000,
+       intercepting the DR's dispatch entirely. EFIMac already mirrors this
+       (PpcPatchNewWorldRom 0x380000 EMUL_OP markers + RomWriteEmulStartRoutine).
+    5. The actual crash opcode (`r24-2=0x4080E206` = `0x0808`) sits in a run of
+       repeating `0x0808`/`0x0308` preceded by `0xFFFF` at 0x4080E1xx — a
+       **data/parameter region, not executable 68K code**, i.e. the DR has
+       **desynced into data**, not a genuine standalone software-function fault.
+    ⇒ The "faithful DR-init seeding" direction is NOT viable as specified: the
+     ROM never seeds the slots, and the reference (SheepShaver) uses EMUL_OP
+     interception, not native seeding. The converging paths are (a) SheepShaver-
+     faithful EMUL_OP routing already 90% present in EFIMac, or (b) fixing the
+     DR desync/framing at the software-function dispatch.
+  - **DingusPPC-authoritative answer (B.21):** examined the DingusPPC tree
+    (`$env:TEMP\opencode\dingusppc`) — it is a **pure PPC system emulator**:
+    ZERO references to `EMUL_OP`, `EDPPtr`/`EmulatorData`, `OP_MAX`, `jump68k`,
+    or any software-function / DR interception, and no 68K CPU. **DingusPPC does
+    NOT seed ed.v by hand and does NOT intercept the DR.** It runs the Mac ROM's
+    own 68K DR emulator *completely unmodified* inside its full PPC emulator; the
+    DR software functions run natively (generated PPC) and ed.v is seeded by the
+    ROM's own boot code. ⇒ The "ROM never seeds ed.v" B.21 finding is a *symptom
+    of an incomplete PPC boot environment* (translation/BAT/SDR1, KernelData,
+    code-region layout, hardware seeds), NOT an absent routine. Consequently the
+    B.21 options (a)/(b) — EFIMac/SR's EMUL_OP interception and C-escapes — are
+    **the SheepShaver path, NOT the DingusPPC path**, and the 90%-present EMUL_OP
+    machinery is precisely what makes EFIMac non-faithful. The DingusPPC-faithful
+    direction (also the user's chosen anchor) is instead:
+    **complete the PPC boot environment so the OS's OWN DR setup runs and seeds
+    ed.v (and the DR's code/data region) naturally** — no host-side interposition.
+- [ ] **DIRECTION (DingusPPC-faithful, per B.21): complete the PPC boot
+   environment (BAT/SDR1 translation, KernelData + hardware/device seeds, the
+   emulator code/data-region layout the DR expects) so the OS's own DR setup
+   executes and seeds ed.v/software-functions unmodified.** Treat the SheepShaver-
+   style EMUL_OP/trap rewrites and C-escapes as diagnostic scaffolding to be
+   retired once the environment is faithful — not as the final architecture
+   (DingusPPC uses none of them).
 - [ ] Drive the boot with hardware/KernelData + device-register emulation
   wired to UEFI (the former Phase C/D work, now framed as PPC-side).
+
+#### PPC MMU enablement (2026-08) — foundation DONE, arming in progress
+- [x] **Full PPC 32-bit MMU foundation** (DingusPPC-faithful, `interpreter.c/h`):
+  - `PPC_BAT_ENTRY Bat[16]` (0-7 IBAT, 8-15 DBAT: `hi_mask/bepi/phys_hi/access/prot`)
+    + `Sdr1` + `Sr[16]` in `g_PpcContext`; `Spr[]` holds raw BAT/SDR1/SR values.
+  - `PpcUpdateBat` = exact mirror of `ppc_ibat_update`/`ppc_dbat_update`
+    (`bl=(upper>>2)&0x7FF; hi_mask=~((bl<<17)|0x1FFFF); phys_hi=lower&mask; bepi=upper&mask`).
+  - `PpcTranslateEffective` = mirror of `ppc_block_address_translation` + SDR1
+    `page_address_translation` (primary+secondary PTEG hash walk,
+    `pa=(pte_word2&0xFFFFF000)|(la&0xFFF)`), gated on MSR[IR]/MSR[DR].
+  - mtspr/mfspr for SDR1 (25) + BAT SPRs 528-551; mtsr/mfsr/mtsrin/mfsrin mirror `Sr[]`.
+  - DR-gated data wrapper (`PpcMmuReadByte/WriteByte` = `g_ReadByte/WriteByte`),
+    IR-gated `PpcFetchInstruction` (reads via untranslated physical layer),
+    `PpcReadPhys32` (PTE walk) bypasses translation.
+  - No `MmuEnabled` switch — translation gated purely on real MSR[IR]/[DR]
+    (per user: don't maintain a redundant flat path).
+  - **Baseline verified GREEN** with foundation in (`TERMENTRY[1]`, `Nanokernel
+    replaced`, `EMUSTART MSR=0xD032` IR=DR=1, no GUEST STOP): at IR=DR=1 with no
+    MMU state armed, every translation misses and falls through to flat.
+- [ ] **Enablement diagnosis (instrumented):** NK DOES program real MMU state via
+  the new handlers — SRs (VSID loop `mtsr` at 0x40B23FA8, values 0x2xxxxxxx) and
+  BATs (`mtdbatu/mtdbatl DBAT3/IBAT3` at 0x40B26B14, pairs 528-551) — but by the
+  emulator handoff they are **all cleared** (final `mtsr 0..15` at 0x40B288C8
+  write 0; BAT-clear helper at 0x40B2658C wipes DBAT3/IBAT3), and **SDR1 is NEVER
+  written** (0 mtspr-SDR1 events). SDR1 write sites exist (0x40B10604, 0x40B10C68,
+  0x40B10D48, 0x40B1A314, 0x40B24BEC, 0x40B26EE4). The 0x40B26C20-0x40B26EEC
+  region is the NK memory-map/descriptor + SDR1 arming code.
+- [x] **Removed the four Phase A MMU neutralizations** (DingusPPC-faithful,
+  2026-08): deleted the `PatSdr1`/`PatPgtb`/`PatPmdt`/`PatSrl2` pattern-match
+  patches from `BootPatchNkBootSequence` (was SheepShaver `patch_nanokernel_boot`
+  cloning); kept the CPU-identity/feature probes (PVR/SPRG3/PM SPRs, unrelated to
+  translation). Boot **stayed GREEN** (`TERMENTRY`/`Nanokernel replaced`/
+  `EMUSTART`, no GUEST STOP) — the MMU patches weren't load-bearing for reaching
+  the DR.
+- [ ] **ROOT CAUSE (confirmed): the NK never arms real translation because the
+  boot is shunted through the fake SheepShaver handoff FIRST.** With the MMU
+  patches removed there are STILL 0 SDR1 writes, and the log shows **no natural
+  rfi-HANDOFF** (`SRR0==0x13F` never fires) — the flow jumps straight to the
+  injected `EMUSTART@0x40B6F900` fragment. `PpcPatchNewWorldRom` overwrites trap-0
+  (`RomWriteEmulStartRoutine` @ 0x36F900-0x36FD00) and installs the hand-built 68K
+  DR context (`RomWriteEmulatorEntryRoutine` @ 0x36F700 → `b` 0x40B66080:
+  sets r1=0x2600, r8-r23=d0-a6=0, r24=0x40800028, r25=0x27, r29=0x40B80000,
+  r31=KDP+0x1000) into the DR-loop body, bypassing the OS DR's own handoff. This
+  is exactly the SheepShaver scaffolding to retire: **the faithful transition is
+  not a patch reversal but removing the EMUSTART/emulator-entry/EMUL_OP handoff
+  and letting the OS reach its own DR entry after the NK completes its real MMU
+  arming — a boot-flow re-architecture.**
+- [ ] **Faithful handoff (boot-flow re-architecture):** stop directing the boot
+  through `RomWriteEmulStartRoutine`/`RomWriteEmulatorEntryRoutine`/EMUL_OP
+  markers; let the NK complete its memory-map/descriptor build + SDR1/page-table
+  arming under the interpreter MMU, then reach the OS's natural DR handoff so it
+  computes ed.v/software-function slots itself. Highest-risk; likely to de-green
+  the SheepShaver boot for an extended period; several decision points.
+
+#### FAITHFUL HANDOFF - DONE + CURRENT BLOCKER (2026-08)
+- [x] **Retired the SheepShaver handoff scaffolding** (DingusPPC-faithful):
+  `#if 0` the injected trap-table redirect, `RomWriteEmulStartRoutine`
+  trap-0 fragments (0x36F900-0x36FD00), the fake 68K DR-context builders
+  (`RomWriteEmulatorEntryRoutine` 0x36F700, `RomWriteEmulatorDispatchHelper`
+  0x36F7C0, `RomWriteEmulatorClassHelper` 0x36F7D0), and the EMUL_OP marker
+  table overwrite, plus the now-dead `PatSdr1/PatPgtb/PatPmdt/PatSrl2` MMU
+  neutralizations. ROM keeps its ORIGINAL content (trap table = `twi r31,0..N`
+  constants @ 0x36E8C0; 0x36F700/0x36F900 = NOPs). Build clean `-Werror`.
+- [x] **Faithful boot now engages** (verified in QEMU log): boots from the NK
+  entry `0x40B10000`, prints "Hello from the replacement multitasking
+  NanoKernel", **NO EMUSTART**, and runs its REAL MMU-arming/descriptor code.
+- [ ] **CURRENT BLOCKER - NK device-register spin-wait.** After the NK boot
+  banner the flow spins in an infinite loop around `0x40B267F0..0x40B28A88`.
+  This is NOT an interpreter bug: `0x40B26858` (`lbz r30,2(r28); eieio;
+  andi. r30,r30,4; beq`) and `0x40B268D4` (`lbz; andi. r30,r30,1; beq`) are
+  **I/O register spin-waits** (with `mtmsr`/`isync`/`eieio` barriers) polling a
+  device register at `r28+2` for status bits. `r28` is a device base pulled via
+  `lwz r28,-0x900(r1)`/`-0x1000(r30)`; observed values `0x00020000`/`0x2000B000`.
+  The register reads back 0 because the device is NOT emulated => the wait never
+  terminates. ⇒ **The faithful boot now reaches the NK hardware-device init;
+  the next frontier is DingusPPC-style DEVICE-REGISTER emulation (interrupt
+  controller / host bridge / VIA) so the NK's handshake spin-waits complete.**
+  Next: identify the device at `r28` (decode the ring `lwz r28,-0x900(r1)` +
+  the `-0x1000(r30)` page skip in the 0x40B28A74 helper), then emulate the
+  status bits the NK polls (bit 4 @ +2, bit 1 @ +2) and any related handshakes.
 
 #### B.5 Validation matrix (see "Validation Matrix" section)
 - [ ] Boot New World 9.2.2, Mac OS 8.1, System 7.5.3, and the `mac_roms` Old
