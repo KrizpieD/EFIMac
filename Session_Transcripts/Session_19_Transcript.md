@@ -2,672 +2,7 @@
 
 **Session ID:** ses_faefa1df4ffeiLw3nS8MigOWPo
 **Created:** 8/30/2026, 12:55:35 AM
-**Updated:** 8/31/2026, 11:54:29 AM
-
----
-
-## Assistant (Build · Big Pickle · 46.8s)
-
-I now understand the DR's dispatch. At 0x40B6D7D8 it does `lwzx r24, r28, r7` where `r7 = r6 & ~0x7`. So for the branch dispatch, `r6` is the branch register index, and `[r28 + r7]` is the destination 68K PC loaded from the emulator's data store.
-
-The issue is that the DR reads the branch destination from `[gd + r7]`, not from the PC-relative displacement. This means the DR handles `0x60FF` (BRA.L) by treating it as a **68000-style** branch where the operand is a register or EA that yields the target — and that EA is invalid/zero.
-
-Actually — this is the key realization. The DR (DingusPPC's 68K emulator) is a **68000** core. The base 68000 `BRA` opcode is `0x6000` (16-bit displacement). `0x60FF` is `BRA` with condition `1111` (which is invalid on 68000 — it's `Trap`? No). Actually on 68000, `0x60xx` BRA uses bits 4-7 for condition, with `0xFF` = BRA + full byte. But the DreemBox/Apple `0x60FF` is being used as the Apple extension for `BRA.L` (32-bit).
-
-Wait, let me reconsider. In the Apple 68K firmware, `0x60FF` specifically means **BRA.L** (long 32-bit displacement), which is a 68020 instruction. The DR is a 68000 core that doesn't implement the 68020 extendable-displacement set. When it encounters `0x60FF`, it misinterprets it (takes the `1111` condition as invalid / or reads a bogus EA), computes a target from `[gd + index]`, which is zero.
-
-So the root cause is: **the DR lacks 68020 BRA.L (0x60FF) support**. The Apple Mac OS ROM's 68K boot code uses `0x60FF BRA.L`, which the DR doesn't handle.
-
-This is a significant finding. The fix options:
-
-1. **Patch the ROM's 68K boot code** to replace `0x60FF` (BRA.L) sequences with equivalent 68000-compatible code (e.g., `JMP` to an address, or compute with `MOVE.L #target,PC`-equivalent via `LEA`+`JMP (An)`). But patching the boot stub changes semantics.
-
-2. **Add a DR-side patch for the 0x60FF case**: intercept when the DR is about to decode 0x60FF and emulate the BRA.L manually (read the 4-byte disp from the 68K PC and set r24). This is the "staged" approach — add a small PPC-side handler for the 0x60FF opcode class.
-
-3. **Understand why the DR reads `[gd+index]`** — maybe it's not that the DR lacks BRA.L, but that the DR *always* computes branch targets via `[gd+index]` and the index for the branch destination needs to be pre-set. Let me reconsider.
-
-Looking at the dispatch sequence at 0x40B6D7CC-0x40B6D7F4:
-```
-sthu r4, -8(r1)          ; push
-stw  r24, 2(r1)          ; store current 68K PC to stack frame
-rlwinm r7, r6, 0, 0x14, 0x1d   ; r7 = r6 & ~7
-lwzx r24, r28, r7        ; r24 = [r28 + r7]  <-- new 68K PC
-sth  r6, 6(r1)           ; store opcode to stack
-lha  r27, 0(r24)         ; pre-fetch opcode at new PC
-mtcrf 1, r24            
-rlwimi r29, r27, 3, 0xd, 0x1c   ; build dispatch index
-mtctr r29
-lhau r27, 2(r24)         ; advance PC by 2 and pre-fetch next opcode
-...
-```
-
-So `r6` holds the *branch opcode*, and `r7 = r6 & ~7`. `[r28 + r7]` is a **branch target table** indexed by opcode bits! This is the 68000 `JMP (n,PC)` style — no. On a real 68000, a `JMP`/`BRA` computes PC = PC + disp. But Apple's ROM uses `0x60FF` as a custom trap-style opcode...
-
-Wait — I bet this is not a plain `BRA.L` at all. Let me reconsider what `0x60FF` means here. In Apple's 68K firmware, `0x60FF` at the start of these 12-byte boot entries is likely a **PC-relative jump where the target is stored in the branch table at `[r28+0xFF&~7]`**. No, that doesn't make sense either.
-
-Let me reconsider. `r6` here = 0x2C (from `li r6,0x2c` at 0x40B6D764 in the `blrl` sequence; actually the `mtlr r5; li r6,0x2c; blrl` at 0x40B6D760-0x40B6D768). Hmm, wait — the trace showed at Y80[40] the DR is at 0x40B6D754 (`li r6,0x10`). And the entry handoff: after `blrl` returns, `lr` was `r5` (the return address). 
-
-Actually the `r6` values 0x10, 0x2C, 0x28 seen at 0x40B6D754-0x40B6D77C are **the original opcodes being passed through**, not indices. Look:
-- 0x40B6D754: `li r6,0x10` then `blrl` (call handler at mtlr target)
-- 0x40B6D760: `li r6,0x2c` then `blrl`
-- 0x40B6D770: `li r6,0x28` then `blrl`
-
-These are loading small constants into r6 and calling. These are likely **secondary dispatch values**, not the 68K opcode. Hmm.
-
-I think I'm overanalyzing the micro-architecture. The essential finding stands:
-
-**The 68K boot program branches to 0x00000000 because the DR computes the BRA.L-style branch target incorrectly. Low RAM is all zeros.**
-
-Rather than reverse-engineer the full DR branch machinery, the pragmatic staged fix is a **PPC-side patch for the 0x60FF BRA.L opcode**: when the DR's `r24` (68K PC) points at a `0x60FF` word in ROM, manually emulate BRA.L by reading the 4-byte signed displacement and setting the new 68K PC. But the D52 directive is "focus on the PPC side" and "run the ROM's own DR" — patching in PPC handlers for specific opcodes is arguably within scope (the yield patches already do this).
-
-But first I need to confirm precisely: is the DR mis-executing because it lacks 68020 BRA.L? Let me verify what a genuine 68000 DR does with `0x60FF`. In the standard 68K DR decoder, opcode `0x60FF`:
-- Bits 15-12 = 0110 (BRA)
-- Condition bits 11-8 = 1111
-- For BRA (condition 0000), the 8-bit displacement at bits 7-0 = 0xFF means the 8-bit disp is -1, BUT on 68020 the full 0x60FF (disp byte = 0xFF) signals a 16-bit displacement follows. On **68000**, disp byte 0xFF is just -1 (no extension).
-
-The DR is a 68000 core, so `0x60FF` = `BRA.B -1` → infinite loop back to itself. But the trace shows it jumped to 0x0000, not looping. So it's not treating it as BRA.B.
-
-Given the trace: r24 went 0xC0 (where 0x60FF is) → 0x00000000. That's not BRA.B -1. So the DR really does the `lwzx r24,[r28+idx]` re-load, computing target from a table/by index → 0.
-
-I think the cleanest interpretation: the DR uses `0x60FF` as a **68020-style `BRA.L`**, reads the 32-bit displacement, and the displacement read fails / the DR's extendable-opcode support is incomplete, yielding 0.
-
-Given the uncertainty and the depth here, and per the instruction to "stop and ask for clarification if unsure," this is a natural point to consult the user. But I have enough to propose a concrete, well-scoped next step. Let me present findings and ask how they want to proceed.
-
-Actually, let me first verify one more thing that could decisively distinguish the two hypotheses — check whether the DR even has a `0x70xx`/extendable-opcode path by looking at whether there's special handling. But more usefully: the DRBOOT flow reached this `0x60FF` via `LEA (8,PC),A6` then immediately `4DFA` at 0xBC... wait no. Let me re-examine: is the code at 0xBC really the bootstrap, or is the DR just executing garbage because the resume point was wrong?
-
-Trace from Y80:
-- r24=0xBE (r27=0x0008): so 0xBC..0xBE = `4DFA 0008` = `LEA (8,PC),A6`. A6 = 0xBE+2+8 = 0xC8. ✓ (table start is 0xC6/C8 area)
-- r24=0xC0 (r27=0x60FF): `60FF` = the "BRA.L" 
-- then r24→0x0000
-
-So the DR correctly decoded `4DFA 0008` (LEA). It reached 0xC0. This matches a REAL boot entry structure. So the resume point (0x40B67B60 dispatch) is actually **correct** — the DR is executing the real 68K boot code. The only failure is the `0x60FF` branch computation.
-
-So we've progressed: the resume is correct; the DR just can't do `0x60FF`. This is now a well-defined single gap. 
-
-The fix: **patch the guest ROM's 68K boot stub** to not use `0x60FF`, OR **patch the DR's `0x60FF` handling in PPC**. 
-
-Actually, the simplest and most faithful to "run the ROM's own DR": since `0x60FF <d32>` is `BRA.L`, and the DR is a 68000 core that treats `0x60xx` as `BRA.B/0x00` (8-bit disp), I can check: for a 68000 `BRA`, opcode `0x6000`, 8-bit disp = 0x00 → `BRA -1`? No, disp 0x00 → +0.
-
-Hmm, but the DR went to 0x0000 explicitly. Let me just check what the DR does with the displacement by reading the actual handler for the 0x60xx class. Let me trace a plain `0x6000` if possible, or examine the conditional branch handler.
-
-Given the time invested and that the user offered to let me ask questions, let me consolidate: I'll present the finding (the DR fails on the 68020 `BRA.L` `0x60FF`, jumping to 0 because it can't read the 32-bit displacement) and propose concrete next steps. But I should confirm the DR's intended handling of 0x60FF before proposing the patch strategy. Let me examine the 0x60xx handler path in the DR.
-
-
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "$env:ROM_FLAT = \"$env:TEMP\\opencode\\rom_flat_4mb.bin\"\n# The dispatch loop and where a 0x6000/BRA class handler lives. Look at 0x40B6D114 area referenced by 'b 0x40b6d114' at the tail of branch dispatch.\npython tool_scripts/dis_ppc.py 0x40B6D0A0 0x40B6D160 2>&1 | Select-Object -Last 90"
-}
-```
-
-**Output:**
-```
-0x40b6d0a0:  lwz r27, 0(r24)
-0x40b6d0a4:  ori r4, r30, 0x5808
-0x40b6d0a8:  rlwimi r4, r27, 4, 0x19, 0x1b
-0x40b6d0ac:  mtctr r4
-0x40b6d0b0:  ori r4, r30, 0x5708
-0x40b6d0b4:  rlwimi r4, r27, 0x14, 0x19, 0x1b
-0x40b6d0b8:  mtlr r4
-0x40b6d0bc:  lhau r27, 4(r24)
-0x40b6d0c0:  bctr 
-0x40b6d0c4:  mtctr r3
-
-```
-
----
-
-## Assistant (Build · Big Pickle · 3.8s)
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "$env:ROM_FLAT = \"$env:TEMP\\opencode\\rom_flat_4mb.bin\"\n# Look at the tail of the dispatch: 0x40b6d114 (branch target) and the main dispatch 0x40b60c00\npython tool_scripts/dis_ppc.py 0x40B6D100 0x40B6D160 2>&1 | Select-Object -Last 40\necho \"========= main dispatch 0x40b60c00 =========\"\npython tool_scripts/dis_ppc.py 0x40B60C00 0x40B60C40 2>&1 | Select-Object -Last 30"
-}
-```
-
-**Output:**
-```
-0x40b6d100:  ori r4, r4, 0x80
-========= main dispatch 0x40b60c00 =========
-0x40b60c00:  lhau r27, 2(r24)
-0x40b60c04:  slwi r4, r4, 0x18
-0x40b60c08:  rlwimi r29, r27, 3, 0xd, 0x1c
-0x40b60c0c:  mtlr r29
-0x40b60c10:  lhau r27, 2(r24)
-0x40b60c14:  rlwimi r8, r4, 8, 0x18, 0x1f
-
-```
-
----
-
-## Assistant (Build · Big Pickle · 9.9s)
-
-I have enough understanding of the DR's dispatch. The crux is confirmed: the DR reads branch targets from `[r28 + (opcode & ~7)]` — a branch-target table for the 68000 class, and for the `0x60FF` Apple-style BRA.L it produces target 0.
-
-Let me confirm where the `0x60xx` (BRA family) is supposed to get its displacement by finding the branch handler that isn't a table-lookup. Let me look at what `r6` and `[r28+idx]` actually are. Actually, I realize the crux: the DR is DingusPPC's PurePPC "68k emulator" which — per the Objective — uses a **table-driven branch mechanism** (`lwzx r24, r28, r7`) where `r28` is a second emulator data base and `r7` indexes a jump table. The `0x60FF` — Apple's long-branch — is not in that table, so it reads a wild 0 entry.
-
-This is exactly the type of "first DR-thrown gap" we were chasing. The staged fix options:
-
-1. **Seed the DR's branch table** at `[r28 + 0x2C]`-style slots so that `0x60FF` branches land on correct ROM addresses. But r28 base/layout needs mapping, and it reads `[r28+(opcode)&~7]` — for opcode 0x60FF that's `[r28+0xC8]`? No: `r6` was the value passed. Let me figure out what `r6` is at the branch step.
-
-Actually, let me stop reverse-engineering and directly instrument: patch the PPC loop to print r6, r7, r28, and `[r28+r7]` right before the DR does `lwzx r24,r28,r7` at 0x40B6D7D8 for the 0x60FF case. That will tell me exactly what index/table produces 0.
-
-But there's a subtlety: my Y80 probe already shows the BEFORE state (r24=0xC0, r27=0x60FF) right before this handler runs. I can add a targeted probe that, when Current==0x40B6D7D8 and r27==0x60FF, prints r6/r7/r28/r29 and the table slot.
-
-Let me add that probe and rerun.
-
-
-
-**Tool: grep**
-
-**Input:**
-```json
-{
-  "pattern": "g_DrPostYieldWindow|Dr68KLast|Dr68KLowProbed",
-  "include": "*.c"
-}
-```
-
-**Output:**
-```
-Found 12 matches
-C:\Users\clayc\Desktop\New folder (2)\EFIMac\src\cpu\interpreter.c:
-  Line 881: static UINT32 g_DrPostYieldWindow = 0;
-
-  Line 3301:                 g_DrPostYieldWindow = 1;
-
-  Line 4719:     static UINT32 Dr68KLowProbed = 0;
-
-  Line 4720:     static UINT32 Dr68KLast = 0;
-
-  Line 5733:         if (Dr68KLowProbed == 0 && g_DrYieldSeen && g_DrBootPcSeeded &&
-
-  Line 5736:             if (Dr68KLast >= 0x40800000 && Pc24 < 0x40000000) {
-
-  Line 5738:                 Dr68KLowProbed = 1;
-
-  Line 5753:             Dr68KLast = Pc24;
-
-  Line 5759:         if (g_DrPostYieldWindow && g_DrPostYieldWindow < 6000 &&
-
-  Line 5761:             g_DrPostYieldWindow++;
-
-  Line 5762:             if ((g_DrPostYieldWindow & 3) == 0) {
-
-  Line 5764:                       g_DrPostYieldWindow, Current, g_PpcContext.Gpr[24],
-
-```
-
----
-
-## Assistant (Build · Big Pickle · 4.6s)
-
-I'll add a targeted probe at 0x40B6D7D8 (the `lwzx r24,r28,r7`) to dump the branch-table index state for the 0x60FF case. Let me view the current Y80 block and insert after it.
-
-
-
-**Tool: read**
-
-**Input:**
-```json
-{
-  "filePath": "C:\\Users\\clayc\\Desktop\\New folder (2)\\EFIMac\\src\\cpu\\interpreter.c",
-  "limit": 16,
-  "offset": 5758
-}
-```
-
-**Output:**
-```
-<path>C:\Users\clayc\Desktop\New folder (2)\EFIMac\src\cpu\interpreter.c</path>
-<type>file</type>
-<content>
-5758:         // and can be matched against the ROM bytes at the 68K PC. Bounded.
-5759:         if (g_DrPostYieldWindow && g_DrPostYieldWindow < 6000 &&
-5760:             (Current >= 0x40B67A00 && Current < 0x40B82000)) {
-5761:             g_DrPostYieldWindow++;
-5762:             if ((g_DrPostYieldWindow & 3) == 0) {
-5763:                 Print(L"  Y80[%u] PPC=0x%08x r24(68Kpc)=0x%08x r27=0x%04x r1=0x%08x\n",
-5764:                       g_DrPostYieldWindow, Current, g_PpcContext.Gpr[24],
-5765:                       g_PpcContext.Gpr[27] & 0xFFFF, g_PpcContext.Gpr[1]);
-5766:             }
-5767:         }
-5768:         if (Current == 0x40B235DC && CpuRead32(0xAF2C) == 0) {
-5769:             // Serial-poll timer period [KDP+0xF2C]: nothing in the ROM ever
-5770:             // initializes it and RAM starts zeroed, so the poll deadline
-5771:             // never advances and the timer service livelocks. Seed a sane
-5772:             // interval (800K TB ticks -> 400K per rearm). KDP is fixed at
-5773:             // 0xA000. Idempotent: re-seeds if something zeroes it again.
-
-(Showing lines 5758-5773 of 6495. Use offset=5774 to continue.)
-</content>
-```
-
----
-
-## Assistant (Build · Big Pickle · 26.4s)
-
-**Tool: edit**
-
-**Input:**
-```json
-{
-  "filePath": "C:\\Users\\clayc\\Desktop\\New folder (2)\\EFIMac\\src\\cpu\\interpreter.c",
-  "oldString": "        if (Current == 0x40B235DC && CpuRead32(0xAF2C) == 0) {",
-  "newString": "        // DR 0x60FF (BRA.L) branch-target probe: the DR computes branch/PC\n        // targets at 0x40B6D7D8 via `lwzx r24, r28, r7` (a table indexed by\n        // r7 = r6 & ~7). For the Apple ROM's 0x60FF A-line/pc-relative entries\n        // we want to see exactly which index/table slot feeds the target so we\n        // can tell WHY it returns 0 (0x00000000). Single shot, then resume.\n        if (DrBrProbe == 0 && Current == 0x40B6D7D8 &&\n            (GprR27 & 0xFFFF) == 0x60FF) {\n            DrBrProbe = 1;\n            Print(L\"  DR-BR[1] r6=0x%08x r7=0x%08x r28=0x%08x \"\n                  L\"r24(68Kpc/pre)=0x%08x slot=%08x\\n\",\n                  GprR6, GprR7, GprR28, g_PpcContext.Gpr[24],\n                  CpuRead32(GprR28 + (UINTN)(GprR6 & ~7u)));\n        }\n        if (Current == 0x40B235DC && CpuRead32(0xAF2C) == 0) {"
-}
-```
-
-**Output:**
-```
-Edit applied successfully.
-```
-
----
-
-## Assistant (Build · Big Pickle · 9.2s)
-
-I need to add the helper macros/statics for GprR6/GprR7/GprR28 and DrBrProbe. Let me check how the existing probes reference registers (e.g., they use `g_PpcContext.Gpr[23]`). Let me add the static and use explicit references. Let me fix the edit to use explicit array indexing:
-
-
-
-**Tool: edit**
-
-**Input:**
-```json
-{
-  "filePath": "C:\\Users\\clayc\\Desktop\\New folder (2)\\EFIMac\\src\\cpu\\interpreter.c",
-  "newString": "        // DR 0x60FF (BRA.L) branch-target probe: the DR computes branch/PC\n        // targets at 0x40B6D7D8 via `lwzx r24, r28, r7` (a table indexed by\n        // r7 = r6 & ~7). For the Apple ROM's 0x60FF A-line/pc-relative entries\n        // we want to see exactly which index/table slot feeds the target so we\n        // can tell WHY it returns 0 (0x00000000). Single shot, then resume.\n        if (DrBrProbe == 0 && Current == 0x40B6D7D8 &&\n            (g_PpcContext.Gpr[27] & 0xFFFF) == 0x60FF) {\n            DrBrProbe = 1;\n            Print(L\"  DR-BR[1] r6=0x%08x r7=0x%08x r28=0x%08x \"\n                  L\"r24(68Kpc/pre)=0x%08x slot=%08x\\n\",\n                  g_PpcContext.Gpr[6] & 0xFFFFFFFF,\n                  g_PpcContext.Gpr[7] & 0xFFFFFFFF,\n                  g_PpcContext.Gpr[28] & 0xFFFFFFFF,\n                  g_PpcContext.Gpr[24],\n                  CpuRead32(g_PpcContext.Gpr[28] +\n                            (UINTN)(g_PpcContext.Gpr[6] & ~7u)));\n        }\n        if (Current == 0x40B235DC && CpuRead32(0xAF2C) == 0) {",
-  "oldString": "        // DR 0x60FF (BRA.L) branch-target probe: the DR computes branch/PC\n        // targets at 0x40B6D7D8 via `lwzx r24, r28, r7` (a table indexed by\n        // r7 = r6 & ~7). For the Apple ROM's 0x60FF A-line/pc-relative entries\n        // we want to see exactly which index/table slot feeds the target so we\n        // can tell WHY it returns 0 (0x00000000). Single shot, then resume.\n        if (DrBrProbe == 0 && Current == 0x40B6D7D8 &&\n            (GprR27 & 0xFFFF) == 0x60FF) {\n            DrBrProbe = 1;\n            Print(L\"  DR-BR[1] r6=0x%08x r7=0x%08x r28=0x%08x \"\n                  L\"r24(68Kpc/pre)=0x%08x slot=%08x\\n\",\n                  GprR6, GprR7, GprR28, g_PpcContext.Gpr[24],\n                  CpuRead32(GprR28 + (UINTN)(GprR6 & ~7u)));\n        }\n        if (Current == 0x40B235DC && CpuRead32(0xAF2C) == 0) {"
-}
-```
-
-**Output:**
-```
-Edit applied successfully.
-```
-
----
-
-## Assistant (Build · Big Pickle · 2.4s)
-
-Now add the `DrBrProbe` static near Dr68KLast:
-
-
-
-**Tool: read**
-
-**Input:**
-```json
-{
-  "filePath": "C:\\Users\\clayc\\Desktop\\New folder (2)\\EFIMac\\src\\cpu\\interpreter.c",
-  "limit": 6,
-  "offset": 4715
-}
-```
-
-**Output:**
-```
-<path>C:\Users\clayc\Desktop\New folder (2)\EFIMac\src\cpu\interpreter.c</path>
-<type>file</type>
-<content>
-4715:     static UINT32 PmdArrDump = 0;
-4716:     static UINT32 MergeTraced = 0;
-4717:     static UINT32 PmdFixed = 0;
-4718:     static UINT32 BootTailProbed = 0;
-4719:     static UINT32 Dr68KLowProbed = 0;
-4720:     static UINT32 Dr68KLast = 0;
-
-(Showing lines 4715-4720 of 6512. Use offset=4721 to continue.)
-</content>
-```
-
----
-
-## Assistant (Build · Big Pickle · 2.6s)
-
-**Tool: edit**
-
-**Input:**
-```json
-{
-  "filePath": "C:\\Users\\clayc\\Desktop\\New folder (2)\\EFIMac\\src\\cpu\\interpreter.c",
-  "oldString": "    static UINT32 Dr68KLowProbed = 0;\n    static UINT32 Dr68KLast = 0;",
-  "newString": "    static UINT32 Dr68KLowProbed = 0;\n    static UINT32 Dr68KLast = 0;\n    static UINT32 DrBrProbe = 0;"
-}
-```
-
-**Output:**
-```
-Edit applied successfully.
-```
-
----
-
-## Assistant (Build · Big Pickle · 4.7s)
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "& \"C:\\Program Files\\Git\\bin\\bash.exe\" scripts/build-windows.sh 2>&1 | Select-Object -Last 1",
-  "timeout": 120000
-}
-```
-
-**Output:**
-```
-Built: build/EFI-Mac-Emulator.efi
-
-```
-
----
-
-## Assistant (Build · Big Pickle · 115.0s)
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "./scripts/run-qemu-windows.ps1 -MacDisc \"$env:TEMP\\opencode\\mac_disc\\Mac_OS_9.2.2.iso\" -Seconds 110 2>&1 | Select-Object -Last 1\n$l = Get-Content \"$env:TEMP\\opencode\\boot_out.txt\"\n$y = ($l | Select-String \"DR-BR\" | Select-Object -First 1)\nif ($y) { $i=$y.LineNumber; $l[($i-6)..([Math]::Min($i+6,$l.Count-1))] } else { \"no DR-BR probe\"; $l | Select-String \"DR68K-LOW\" | Select-Object -First 1 }",
-  "timeout": 180000
-}
-```
-
-**Output:**
-```
-Boot log: C:\Users\clayc\AppData\Local\Temp\opencode\boot_out.txt
-no DR-BR probe
-
-  [7mDR68K-LOW[0m[1] [0m[7m[0mexec=107194 [0m[7m[0mPPC=0x40B6D7D8 [0m[7m[0mr24(68Kpc)=0x00000000 [0m[7m[0mr27=0x60FF [0m[7m[0mr23=0x00000000 [0m[7m[0mr29=0x40B80040 [0m
-[7m[0mr31=0x0000B000 [0m[7m[0mr1=0x00009FF8 [0m[7m[0mLR=0x40B6D7CC [0m[7m[0mCTR=0x40B658B0[0m
-
-
-```
-
----
-
-## Assistant (Build · Big Pickle · 11.1s)
-
-The probe wasn't triggered because `Current == 0x40B6D7D8` but by the time the per-instruction loop checks `Current`, the instruction has ALREADY executed (r24 is now 0). Also, at 0x40B6D7D8, `r27` may not be 0x60FF anymore (the prefetch was consumed). The `lwzx r24,r28,r7` at 0x40B6D7D8 sets r24=0 — directive order says we're focusing on the PPC side and chasing the first DR gap.
-
-The DR68K-LOW shows: at PPC=0x40B6D7D8, after executing `lwzx r24,r28,r7`, r24=0x00000000. The `r7` index into the branch table resulted in target 0.
-
-I understand the state before this: r24 was 0x408000C0 (68K PC where 0x60FF is), r27=0x60FF, r6/r7 were set as the branch index. The `lwzx r24, r28, r7` loaded `[r28 + r7]` = 0. So the branch-target table slot is zero.
-
-Given the difficulty of precisely instrumenting (the per-instruction probe runs post-execution), let me take a different, higher-signal approach. The r6/r7/r28 values need to be captured *before* the field for r24 is clobbered. r6/r7/r28 are NOT clobbered by `lwzx r24,...`, so I can still read them. Let me change the probe to fire when `Dr68KLowProbed` triggers (that already catches the 0xC0→0 transition at the DR68K-LOW point, which is exactly 0x40B6D7D8) OR add a dedicated probe on the NEXT instruction with the same Current but reading r6/r7/r28 (unclobbered) + the stale r24=0.
-
-Actually simpler: change the Y80/handoff probe. When `Current == 0x40B6D7D8`, r6, r7, r28 are intact. Let me just add a probe that fires once on `Current == 0x40B6D7D8` regardless of r27 (post-exec r24=0 is fine, I want r6/r7/r28 and the slot).
-
-Let me change the condition to drop the r27 check and fire on first visiting 0x40B6D7D8.
-
-
-
-**Tool: edit**
-
-**Input:**
-```json
-{
-  "filePath": "C:\\Users\\clayc\\Desktop\\New folder (2)\\EFIMac\\src\\cpu\\interpreter.c",
-  "newString": "        if (DrBrProbe == 0 && Current == 0x40B6D7D8 &&\n            g_DrYieldSeen) {\n            DrBrProbe = 1;\n            Print(L\"  DR-BR[1] r6=0x%08x r7=0x%08x r28=0x%08x \"\n                  L\"r24(68Kpc/post)=0x%08x slot=0x%08x\\n\",\n                  g_PpcContext.Gpr[6] & 0xFFFFFFFF,\n                  g_PpcContext.Gpr[7] & 0xFFFFFFFF,\n                  g_PpcContext.Gpr[28] & 0xFFFFFFFF,\n                  g_PpcContext.Gpr[24],\n                  CpuRead32(g_PpcContext.Gpr[28] +\n                            (UINTN)(g_PpcContext.Gpr[6] & ~7u)));\n        }",
-  "oldString": "        if (DrBrProbe == 0 && Current == 0x40B6D7D8 &&\n            (g_PpcContext.Gpr[27] & 0xFFFF) == 0x60FF) {\n            DrBrProbe = 1;\n            Print(L\"  DR-BR[1] r6=0x%08x r7=0x%08x r28=0x%08x \"\n                  L\"r24(68Kpc/pre)=0x%08x slot=%08x\\n\",\n                  g_PpcContext.Gpr[6] & 0xFFFFFFFF,\n                  g_PpcContext.Gpr[7] & 0xFFFFFFFF,\n                  g_PpcContext.Gpr[28] & 0xFFFFFFFF,\n                  g_PpcContext.Gpr[24],\n                  CpuRead32(g_PpcContext.Gpr[28] +\n                            (UINTN)(g_PpcContext.Gpr[6] & ~7u)));\n        }"
-}
-```
-
-**Output:**
-```
-Edit applied successfully.
-```
-
----
-
-## Assistant (Build · Big Pickle · 100.0s)
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "& \"C:\\Program Files\\Git\\bin\\bash.exe\" scripts/build-windows.sh 2>&1 | Select-Object -Last 1\n./scripts/run-qemu-windows.ps1 -MacDisc \"$env:TEMP\\opencode\\mac_disc\\Mac_OS_9.2.2.iso\" -Seconds 95 2>&1 | Select-Object -Last 1\n$l = Get-Content \"$env:TEMP\\opencode\\boot_out.txt\"\n$l | Select-String \"DR-BR\" | Select-Object -First 1",
-  "timeout": 170000
-}
-```
-
-**Output:**
-```
-Built: build/EFI-Mac-Emulator.efi
-Boot log: C:\Users\clayc\AppData\Local\Temp\opencode\boot_out.txt
-
-```
-
----
-
-## Assistant (Build · Big Pickle · 11.0s)
-
-No DR-BR printed even though `Current == 0x40B6D7D8` was visited (the DR68K-LOW fired at that exact PC). The issue: `g_DrYieldSeen` may not be set, OR the probe placement is after this branch fires and `DrBrProbe` static isn't seen at that point, OR the per-instruction probe region this code sits in isn't reached.
-
-Wait — the DR68K-LOW probe fires at `Current == 0x40B6D7D8` (it says PPC=0x40B6D7D8) and `g_DrYieldSeen` IS used there (`g_DrYieldSeen && g_DrBootPcSeeded`) and it fired. So g_DrYieldSeen is set. My new probe also requires `Current == 0x40B6D7D8` and `g_DrYieldSeen`. It should fire. But it didn't print.
-
-The difference: the DR68K-LOW condition is in the same `if` chain region. Let me check placement — maybe my probe's `Current == 0x40B6D7D8` is in the Y80 block's if and combined oddly. Let me check it didn't get shadowed or that the g_DrPostYieldWindow decrement... Actually the probe is independent. Let me verify the probe code path is actually reached — maybe the `if` is nested inside a scope that short-circuits.
-
-Let me look at where I inserted it relative to the loop and whether a preceding `if (Dr68KLowProbed==0 ...) { ... break; }` already broke out before reaching my probe. The DR68K-LOW probe does `break` after dumping! So the loop breaks before my probe line executes. That's why DR-BR never prints — the `break` at the end of DR68K-LOW aborts iteration before reaching my probe.
-
-Let me move my probe BEFORE the DR68K-LOW block, or remove the `break`. Better: place the DR-BR probe earlier in the loop (before DR68K-LOW). Let me relocate it to just after the Y80 block but ensure ordering. Actually Y80 block is before DR68K-LOW too. Let me move my probe to before the Y80 block or merge conditions.
-
-Simplest: change the DR68K-LOW to not break, OR move the DR-BR probe before the DR68K-LOW block. Let me move it up.The `break` at the end of DR68K-LOW squashes my probe from running. Let me move the DR-BR probe before the DR68K-LOW block:
-
-
-
-**Tool: read**
-
-**Input:**
-```json
-{
-  "filePath": "C:\\Users\\clayc\\Desktop\\New folder (2)\\EFIMac\\src\\cpu\\interpreter.c",
-  "limit": 28,
-  "offset": 5759
-}
-```
-
-**Output:**
-```
-<path>C:\Users\clayc\Desktop\New folder (2)\EFIMac\src\cpu\interpreter.c</path>
-<type>file</type>
-<content>
-5759:         // and can be matched against the ROM bytes at the 68K PC. Bounded.
-5760:         if (g_DrPostYieldWindow && g_DrPostYieldWindow < 6000 &&
-5761:             (Current >= 0x40B67A00 && Current < 0x40B82000)) {
-5762:             g_DrPostYieldWindow++;
-5763:             if ((g_DrPostYieldWindow & 3) == 0) {
-5764:                 Print(L"  Y80[%u] PPC=0x%08x r24(68Kpc)=0x%08x r27=0x%04x r1=0x%08x\n",
-5765:                       g_DrPostYieldWindow, Current, g_PpcContext.Gpr[24],
-5766:                       g_PpcContext.Gpr[27] & 0xFFFF, g_PpcContext.Gpr[1]);
-5767:             }
-5768:         }
-5769:         // DR 0x60FF (BRA.L) branch-target probe: the DR computes branch/PC
-5770:         // targets at 0x40B6D7D8 via `lwzx r24, r28, r7` (a table indexed by
-5771:         // r7 = r6 & ~7). For the Apple ROM's 0x60FF A-line/pc-relative entries
-5772:         // we want to see exactly which index/table slot feeds the target so we
-5773:         // can tell WHY it returns 0 (0x00000000). Single shot, then resume.
-5774:         if (DrBrProbe == 0 && Current == 0x40B6D7D8 &&
-5775:             g_DrYieldSeen) {
-5776:             DrBrProbe = 1;
-5777:             Print(L"  DR-BR[1] r6=0x%08x r7=0x%08x r28=0x%08x "
-5778:                   L"r24(68Kpc/post)=0x%08x slot=0x%08x\n",
-5779:                   g_PpcContext.Gpr[6] & 0xFFFFFFFF,
-5780:                   g_PpcContext.Gpr[7] & 0xFFFFFFFF,
-5781:                   g_PpcContext.Gpr[28] & 0xFFFFFFFF,
-5782:                   g_PpcContext.Gpr[24],
-5783:                   CpuRead32(g_PpcContext.Gpr[28] +
-5784:                             (UINTN)(g_PpcContext.Gpr[6] & ~7u)));
-5785:         }
-5786:         if (Current == 0x40B235DC && CpuRead32(0xAF2C) == 0) {
-
-(Showing lines 5759-5786 of 6513. Use offset=5787 to continue.)
-</content>
-```
-
----
-
-## Assistant (Build · Big Pickle · 4.4s)
-
-The Y80 block uses `g_DrPostYieldWindow` which is fine. The DR68K-LOW block is at line ~5733, BEFORE line 5760. Since 5733 < 5760, the DR68K-LOW `break` fires first. I need to place DR-BR before line 5733. Let me move the DR-BR probe up, right after the Y80 in a position before DR68K-LOW. Actually Y80 (5760) is after DR68K-LOW (5733). Let me just insert DR-BR right before the DR68K-LOW block.
-
-Let me find the exact DR68K-LOW block start:
-
-
-
-**Tool: read**
-
-**Input:**
-```json
-{
-  "filePath": "C:\\Users\\clayc\\Desktop\\New folder (2)\\EFIMac\\src\\cpu\\interpreter.c",
-  "limit": 14,
-  "offset": 5743
-}
-```
-
-**Output:**
-```
-<path>C:\Users\clayc\Desktop\New folder (2)\EFIMac\src\cpu\interpreter.c</path>
-<type>file</type>
-<content>
-5743:                       g_PpcContext.Gpr[23], g_PpcContext.Gpr[29],
-5744:                       g_PpcContext.Gpr[31], g_PpcContext.Gpr[1],
-5745:                       g_PpcContext.Lr, g_PpcContext.Ctr);
-5746:                 for (A = 0x00000000u; A < 0x00002000u; A += 16) {
-5747:                     Print(L"  LOW[0x%08x] %08x %08x %08x %08x\n",
-5748:                           A, CpuRead32(A), CpuRead32(A + 4),
-5749:                           CpuRead32(A + 8), CpuRead32(A + 12));
-5750:                 }
-5751:                 Print(L"  DR68K-LOW: stopping for inspection\n");
-5752:                 break;
-5753:             }
-5754:             Dr68KLast = Pc24;
-5755:         }
-5756:         // Post-yield 68K stream trace: right after the DRYIELD-RESUME, print
-
-(Showing lines 5743-5756 of 6513. Use offset=5757 to continue.)
-</content>
-```
-
----
-
-## Assistant (Build · Big Pickle · 3.6s)
-
-I'll move the DR-BR probe to before the DR68K-LOW block. Let me delete it from its current position and insert before the DR68K-LOW `if` (which is just above 5733). Let me view 5727-5733:
-
-
-
-**Tool: read**
-
-**Input:**
-```json
-{
-  "filePath": "C:\\Users\\clayc\\Desktop\\New folder (2)\\EFIMac\\src\\cpu\\interpreter.c",
-  "limit": 12,
-  "offset": 5726
-}
-```
-
-**Output:**
-```
-<path>C:\Users\clayc\Desktop\New folder (2)\EFIMac\src\cpu\interpreter.c</path>
-<type>file</type>
-<content>
-5726:         // The DR's 68K PC escaping the ROM window: single-shot catch of the
-5727:         // first time the emulator's r24 (68K PC) moves from the ROM window
-5728:         // (>= 0x40800000) below 0x40000000. The 68K bootstrap's PC-relative
-5729:         // JMP at ROM+0x2A can land the emulator into low RAM; dump that region
-5730:         // so we can see whether it is real low-RAM bootstrap code or a
-5731:         // mis-executed stream, then stop. Gated on g_DrYieldSeen: before the
-5732:         // first emulator-trap yield, r24 is a cold-start scratch base (e.g.
-5733:         // `li r24,0` for the lowmem reads) and not yet the 68K PC.
-5734:         if (Dr68KLowProbed == 0 && g_DrYieldSeen && g_DrBootPcSeeded &&
-5735:             (Current >= 0x40B60000 && Current < 0x40B82000)) {
-5736:             UINT32 Pc24 = g_PpcContext.Gpr[24];
-5737:             if (Dr68KLast >= 0x40800000 && Pc24 < 0x40000000) {
-
-(Showing lines 5726-5737 of 6513. Use offset=5738 to continue.)
-</content>
-```
-
----
-
-## Assistant (Build · Big Pickle · 6.8s)
-
-I'll insert the DR-BR probe just before the DR68K-LOW block (before line 5734), and remove the one at its current location.
-
-
-
-**Tool: edit**
-
-**Input:**
-```json
-{
-  "filePath": "C:\\Users\\clayc\\Desktop\\New folder (2)\\EFIMac\\src\\cpu\\interpreter.c",
-  "newString": "        // `li r24,0` for the lowmem reads) and not yet the 68K PC.\n        // DR 0x60FF (BRA.L) branch-target probe: the DR computes branch/PC\n        // targets at 0x40B6D7D8 via `lwzx r24, r28, r7` (r7 = r6 & ~7). We\n        // want the index/table slot feeding the target to see WHY it returns 0\n        // (0x00000000). MUST precede the DR68K-LOW block below (which breaks).\n        if (DrBrProbe == 0 && Current == 0x40B6D7D8 && g_DrYieldSeen) {\n            DrBrProbe = 1;\n            Print(L\"  DR-BR[1] r6=0x%08x r7=0x%08x r28=0x%08x \"\n                  L\"r24(68Kpc/post)=0x%08x slot=0x%08x\\n\",\n                  g_PpcContext.Gpr[6] & 0xFFFFFFFF,\n                  g_PpcContext.Gpr[7] & 0xFFFFFFFF,\n                  g_PpcContext.Gpr[28] & 0xFFFFFFFF,\n                  g_PpcContext.Gpr[24],\n                  CpuRead32(g_PpcContext.Gpr[28] +\n                            (UINTN)(g_PpcContext.Gpr[6] & ~7u)));\n        }\n        if (Dr68KLowProbed == 0 && g_DrYieldSeen && g_DrBootPcSeeded &&\n            (Current >= 0x40B60000 && Current < 0x40B82000)) {",
-  "oldString": "        // `li r24,0` for the lowmem reads) and not yet the 68K PC.\n        if (Dr68KLowProbed == 0 && g_DrYieldSeen && g_DrBootPcSeeded &&\n            (Current >= 0x40B60000 && Current < 0x40B82000)) {"
-}
-```
-
-**Output:**
-```
-Edit applied successfully.
-```
-
----
-
-## Assistant (Build · Big Pickle · 7.1s)
-
-**Tool: edit**
-
-**Input:**
-```json
-{
-  "filePath": "C:\\Users\\clayc\\Desktop\\New folder (2)\\EFIMac\\src\\cpu\\interpreter.c",
-  "newString": "        if (Current == 0x40B235DC && CpuRead32(0xAF2C) == 0) {",
-  "oldString": "        // DR 0x60FF (BRA.L) branch-target probe: the DR computes branch/PC\n        // targets at 0x40B6D7D8 via `lwzx r24, r28, r7` (a table indexed by\n        // r7 = r6 & ~7). For the Apple ROM's 0x60FF A-line/pc-relative entries\n        // we want to see exactly which index/table slot feeds the target so we\n        // can tell WHY it returns 0 (0x00000000). Single shot, then resume.\n        if (DrBrProbe == 0 && Current == 0x40B6D7D8 &&\n            g_DrYieldSeen) {\n            DrBrProbe = 1;\n            Print(L\"  DR-BR[1] r6=0x%08x r7=0x%08x r28=0x%08x \"\n                  L\"r24(68Kpc/post)=0x%08x slot=0x%08x\\n\",\n                  g_PpcContext.Gpr[6] & 0xFFFFFFFF,\n                  g_PpcContext.Gpr[7] & 0xFFFFFFFF,\n                  g_PpcContext.Gpr[28] & 0xFFFFFFFF,\n                  g_PpcContext.Gpr[24],\n                  CpuRead32(g_PpcContext.Gpr[28] +\n                            (UINTN)(g_PpcContext.Gpr[6] & ~7u)));\n        }\n        if (Current == 0x40B235DC && CpuRead32(0xAF2C) == 0) {"
-}
-```
-
-**Output:**
-```
-Edit applied successfully.
-```
-
----
-
-## Assistant (Build · Big Pickle · 105.3s)
-
-**Tool: bash**
-
-**Input:**
-```json
-{
-  "command": "& \"C:\\Program Files\\Git\\bin\\bash.exe\" scripts/build-windows.sh 2>&1 | Select-Object -Last 1\n./scripts/run-qemu-windows.ps1 -MacDisc \"$env:TEMP\\opencode\\mac_disc\\Mac_OS_9.2.2.iso\" -Seconds 95 2>&1 | Select-Object -Last 1\n$l = Get-Content \"$env:TEMP\\opencode\\boot_out.txt\"\n$l | Select-String \"DR-BR\" | Select-Object -First 1",
-  "timeout": 170000
-}
-```
-
-**Output:**
-```
-Built: build/EFI-Mac-Emulator.efi
-Boot log: C:\Users\clayc\AppData\Local\Temp\opencode\boot_out.txt
-
-  [7mDR-BR[0m[1] r6=0x00000010 r7=0x00000010 r28=0x00000000 r24(68Kpc/post)=0x00000000 slot=0x00000000
-
-
-```
+**Updated:** 8/31/2026, 12:03:47 PM
 
 ---
 
@@ -5277,6 +4612,868 @@ Here's a summary of what was done this session:
 **Next step (blocked on scope):** resolve the A-line trap dispatch at 0x4080AA10 that returns to 68K PC 0. The code there walks a handler table, stores a pointer to low-RAM vector `0x0008`, then reads/jumps through a low vector that's still 0. This needs feeding the vector or another DR gap fix — a substantial new reverse-engineering task.
 
 Want me to continue into that A-line/vector gap, or stop here?
+
+---
+
+## User
+
+Yes, I've committed our progress. Please continue.
+
+---
+
+## Assistant (Build · Big Pickle · 3.6s)
+
+I'll continue into the A-line/vector gap. Let me first understand the exact flow at 0x4080AA10 that leads back to PC 0. Let me build a proper 68K disassembler to decode the boot stub and A-line chain accurately.
+
+
+
+**Tool: todowrite**
+
+**Input:**
+```json
+{
+  "todos": [
+    {
+      "content": "Decode 68K flow at 0x4080AA10 A-line trap dispatch (build dis_m68k.py)",
+      "status": "in_progress",
+      "priority": "high"
+    },
+    {
+      "content": "Identify why DR returns to 68K PC 0 (vector fetch at 0x0008/0x0004)",
+      "status": "pending",
+      "priority": "high"
+    },
+    {
+      "content": "Implement fix for the A-line/vector gap",
+      "status": "pending",
+      "priority": "high"
+    },
+    {
+      "content": "Rebuild, rerun, verify DR progresses past 0x4080AA10",
+      "status": "pending",
+      "priority": "high"
+    },
+    {
+      "content": "Update TODO.md/ARCHITECTURE.md with findings",
+      "status": "pending",
+      "priority": "medium"
+    }
+  ]
+}
+```
+
+**Output:**
+```
+[
+  {
+    "content": "Decode 68K flow at 0x4080AA10 A-line trap dispatch (build dis_m68k.py)",
+    "status": "in_progress",
+    "priority": "high"
+  },
+  {
+    "content": "Identify why DR returns to 68K PC 0 (vector fetch at 0x0008/0x0004)",
+    "status": "pending",
+    "priority": "high"
+  },
+  {
+    "content": "Implement fix for the A-line/vector gap",
+    "status": "pending",
+    "priority": "high"
+  },
+  {
+    "content": "Rebuild, rerun, verify DR progresses past 0x4080AA10",
+    "status": "pending",
+    "priority": "high"
+  },
+  {
+    "content": "Update TODO.md/ARCHITECTURE.md with findings",
+    "status": "pending",
+    "priority": "medium"
+  }
+]
+```
+
+---
+
+## Assistant (Build · Big Pickle · 23.7s)
+
+Let me build a complete 68K disassembler since the current one is stubbed. I'll write a thorough m68k disassembler covering the instructions the DR executes.
+
+
+
+**Tool: write**
+
+**Input:**
+```json
+{
+  "content": "#!/usr/bin/env python3\n\"\"\"68000/68020 disassembler for the EFIMac guest ROM boot code.\n\nDecodes the ROM's 68K boot stub and A-line trap dispatch. Supports the 68020\n0x60FF (BRA.L) extension and standard 68k EA forms needed to trace the DR's\nearly boot flow.\n\nUsage:\n  python dis_m68k.py <addr_start> [<addr_end>] [--rom <flat_rom_path>]\n\"\"\"\nimport sys\n\nROM = r\"C:\\Users\\clayc\\AppData\\Local\\Temp\\opencode\\rom_flat_4mb.bin\"\nROM_BASE = 0x40800000\n\nDREG = [\"d%d\" % i for i in range(8)]\nAREG = [\"a%d\" % i for i in range(8)]\n\ndef sgn(v, bits):\n    v &= (1 << bits) - 1\n    if v & (1 << (bits - 1)):\n        v -= 1 << bits\n    return v\n\ndef rd16(d, a): return (d[a] << 8) | d[a + 1]\ndef s16(d, a): return sgn(rd16(d, a), 16)\ndef u32(d, a): return (d[a] << 24) | (d[a+1] << 16) | (d[a+2] << 8) | d[a + 3]\ndef s32(d, a): return sgn(u32(d, a), 32)\n\ndef ea(d, mode, reg, pc, word):   # word = current 68k PC (ROM_BASE based) of the EA word\n    if mode in (0,):   return \"d%d\" % reg, 0\n    if mode == 1:      return \"a%d\" % reg, 0\n    if mode == 2:      return \"(a%d)+\" % reg, 0\n    if mode == 3:      return \"-(a%d)\" % reg, 0\n    if mode == 4:      return \"(a%d)\" % reg, 0\n    if mode == 5:\n        phy = word + 2 - ROM_BASE\n        return \"(d%d,a%d)\" % (s16(d, phy), reg), 2\n    if mode == 6:\n        phy = word + 2 - ROM_BASE\n        return \"(d%d,a%d)\" % (s32(d, phy), reg), 4\n    if mode == 7:\n        if reg == 0:\n            phy = word + 2 - ROM_BASE\n            return \"(d16,pc)=0x%08x\" % (ROM_BASE + phy + 2 + s16(d, phy)), 2\n        if reg == 1:\n            phy = word + 2 - ROM_BASE\n            return \"(d8,pc,Xn)\", 2 if False else 2\n        if reg == 2:\n            return \"(*,pc)\", 0\n        if reg == 3:\n            phy = word + 2 - ROM_BASE\n            return \"#0x%04x\" % rd16(d, phy), 2\n        if reg == 4:\n            phy = word + 2 - ROM_BASE\n            return \"(d16,pc)=0x%08x\" % (ROM_BASE + phy + 2 + s16(d, phy)), 2\n        if reg == 5:\n            phy = word + 2 - ROM_BASE\n            return \"PC+s32=0x%08x\" % (ROM_BASE + phy + 4 + s32(d, phy)), 4\n        return \"?\", 0\n    return \"?\", 0\n\ndef sz(w): return {0: \".b\", 1: \".w\", 2: \".l\"}.get((w >> 6) & 3, \".?\")\n\ndef dis(d, pc, stop):\n    while pc < stop:\n        op = pc\n        w = rd16(d, pc - ROM_BASE)\n        o = w >> 12\n        src = None\n        nxt = pc + 2\n        if o == 0x0:\n            # movep / ori\n            if w & 0xFF00 == 0x0000: src = \"ori.b\"\n            elif w & 0xFF00 == 0x0200: src = \"andi.b\"\n            elif w & 0xFF00 == 0x0400: src = \"subi.b\"\n            elif w & 0xFF00 == 0x0600: src = \"addi.b\"\n            else: src = \"lea/grp-0\"\n        elif o == 0x1:\n            src = \"move.b \" + ea_fmt(d, (w >> 6) & 7, (w >> 9) & 7, w, nxt, 'src', 1)\n        elif o in (0x2, 0x3): src = \"move\" + (\"w\" if o==0x2 else \"l\")\n        elif o == 0x4:\n            if w & 0xFF00 == 0x4000 and (w & 0x83F8) == 0x4000:\n                src = \"negx\" + sz(w)\n            elif w & 0xFF00 == 0x4200: src = \"clr\" + sz(w)\n            elif w & 0xFF00 == 0x4400: src = \"neg\" + sz(w)\n            elif w & 0xFF00 == 0x4600: src = \"not\" + sz(w)\n            elif w & 0xFF00 == 0x4800:\n                mm = (w >> 3) & 7; reg = w & 7; pre = \"\"\n                src = \"lea %s,%s\" % (ea(d, mm, reg, w, nxt)[0], AREG[(w>>9)&7])\n                nxt += ea(d, mm, reg, w, nxt if False else pc)[1]\n                src = src\n            elif (w & 0xFFF8) == 0x4E70: src = \"reset\"\n            elif (w & 0xFFF8) == 0x4E72: src = \"stop\"\n            elif (w & 0xFFF8) == 0x4E73: src = \"rte\"\n            elif (w & 0xFFF0) == 0x4E40: src = \"trap #%d\" % (w & 0xF)\n            elif (w & 0xFFF8) == 0x4E70: src = \"reset\"\n            elif (w & 0xFFF0) == 0x4E50: src = \"link-x a%d\" % (w & 7)\n            elif (w & 0xFFF8) == 0x4E75: src = \"rts\"\n            elif (w & 0xFFF8) == 0x4E77: src = \"rtr\"\n            elif (w & 0xFFF8) == 0x4E76: src = \"rtd\"\n            elif (w & 0xFF00) == 0x4E80: src = \"jsr\"\n            elif (w & 0xFF00) == 0x4EC0: src = \"jmp\"\n            elif (w & 0xFF00) == 0x4000: src = \"negx\" + sz(w)\n            elif (w & 0xFF00) == 0x4200: src = \"clr\" + sz(w)\n            elif (w & 0xFF00) == 0x4400: src = \"neg\" + sz(w)\n            else: src = \"grp4-%04x\" % w\n        elif o == 0x5:\n            szl = (w >> 6) & 3; opc = \"addq\" if (w & 0x100) else \"subq\"\n            src = \"%s%s #%d,%s\" % (opc, sz(w), (w>>9)&7, AREG[w&7])\n        elif o == 0x6:\n            cond = \"bra bsr bhi bls bcc bcs bne beq bvc bvs bpl bmi bge blt bgt ble\".split()\n            c = (w >> 8) & 0xF\n            d8 = s8(w); phy = pc + 2 - ROM_BASE\n            tgt = pc + 2 + sgn(d8, 8)\n            if d8 == 0:\n                tgt = pc + 2 + s16(d, phy + 0)\n            src = \"%s %08x\" % (cond[c], (tgt - ROM_BASE + ROM_BASE) if 0 else ROM_BASE + pc + 2 - ROM_BASE + (sgn(d8,8) if d8 else s16(d,phy)))\n        elif o == 0x7: src = \"moveq #%d,%s\" % (sgn(w & 0xFF, 8), DREG[(w>>9)&7])\n        elif o == 0xA: src = \"A-line #$%04x\" % w\n        elif o == 0xF: src = \"F-line #$%04x\" % w\n        else: src = \"grp-%x\" % o\n        print(\"0x%08X: %04x      %s\" % (ROM_BASE + pc - ROM_BASE + 0 if False else pc, w, src))\n        pc = pc if src is None else max(pc + 2, nxt)\n\ndef s8(w): return w & 0xFF\n\ndef ea_fmt(d, mode, reg, w, nxt, side, size):\n    m7 = (mode == 7)\n    m = 7 if m7 else mode\n    t, extra = ea(d, m, reg, w if False else None, nxt if False else None)\n    # simplified fallback\n    return t\n\ndef main():\n    args = sys.argv[1:]\n    if not args:\n        print(__doc__); return\n    start = int(args[0], 16)\n    end = int(args[1], 16) if len(args) > 1 else start + 0x100\n    d = bytearray(open(ROM, \"rb\").read())\n    dis(d, start, end)\n\nif __name__ == \"__main__\":\n    main()\n",
+  "filePath": "C:\\Users\\clayc\\Desktop\\New folder (2)\\EFIMac\\tool_scripts\\dis_m68k.py"
+}
+```
+
+**Output:**
+```
+Wrote file successfully.
+```
+
+---
+
+## Assistant (Build · Big Pickle · 4.3s)
+
+This is getting messy. The EA decoding and instruction dispatch is becoming unwieldy and error-prone. Rather than build a fragile hand-rolled disassembler, let me check if there's a proper m68k disassembler available. Let me check what tools are installed (capstone, etc.).
+
+
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "python -c \"import capstone; print('capstone OK', capstone.__version__)\" 2>&1\npython -c \"import pyvex; print('pyvex OK')\" 2>&1\npython --version"
+}
+```
+
+**Output:**
+```
+capstone OK 5.0.7
+[31;1mTraceback (most recent call last):[0m
+[31;1m  File "<string>", line 1, in <module>[0m
+[31;1m    import pyvex; print('pyvex OK')[0m
+[31;1m    ^^^^^^^^^^^^[0m
+[31;1mModuleNotFoundError: No module named 'pyvex'[0m
+Python 3.14.6
+
+```
+
+---
+
+## Assistant (Build · Big Pickle · 6.1s)
+
+Capstone 5.0.7 is available. Let me use capstone's m68k disassembler, which is reliable. Let me replace the disassembler with a capstone-based one.
+
+
+
+
+
+**Tool: write**
+
+**Input:**
+```json
+{
+  "content": "#!/usr/bin/env python3\n\"\"\"68000/68020 disassembler for the EFIMac guest ROM boot code (capstone).\n\nUsage:\n  python dis_m68k.py <addr_start> [<addr_end>] [--rom <flat_rom_path>]\nHelps trace the ROM's 68K boot stub + A-line trap dispatch that the embedded\nPPC DR emulator executes.\n\"\"\"\nimport sys\nfrom capstone import Cs, CS_ARCH_M68K, CS_MODE_M68K_000\n\nROM = r\"C:\\Users\\clayc\\AppData\\Local\\Temp\\opencode\\rom_flat_4mb.bin\"\nROM_BASE = 0x40800000\n\ndef main():\n    args = sys.argv[1:]\n    if not args:\n        print(__doc__); return\n    start = int(args[0], 16)\n    end = int(args[1], 16) if len(args) > 1 else start + 0x200\n    if \"--rom\" in args:\n        i = args.index(\"--rom\"); ROM_arg = args[i+1]\n        global ROM\n        ROM = ROM_arg\n    d = bytearray(open(ROM, \"rb\").read())\n    phy = start - ROM_BASE\n    code = bytes(d[phy: end - ROM_BASE])\n    md = Cs(CS_ARCH_M68K, CS_MODE_M68K_000)\n    count = 0\n    for insn in md.disasm(code, start):\n        print(\"0x%08X:  %-24s %s %s\" % (insn.address, insn.bytes.hex(), insn.mnemonic, insn.op_str))\n        count += 1\n        if count > 400:\n            print(\"... truncated\")\n            break\n\nif __name__ == \"__main__\":\n    main()\n",
+  "filePath": "C:\\Users\\clayc\\Desktop\\New folder (2)\\EFIMac\\tool_scripts\\dis_m68k.py"
+}
+```
+
+**Output:**
+```
+Wrote file successfully.
+```
+
+---
+
+## Assistant (Build · Big Pickle · 3.0s)
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"C:\\Users\\clayc\\Desktop\\New folder (2)\\EFIMac\"\npython tool_scripts/dis_m68k.py 0x4080AA10 0x4080AB00 2>&1 | head -60"
+}
+```
+
+**Output:**
+```
+[31;1mhead: [0m
+[31;1m[36;1mLine |[0m
+[31;1m[36;1m[36;1m   2 | [0m python tool_scripts/dis_m68k.py 0x4080AA10 0x4080AB00 2>&1 | [36;1mhead[0m -60[0m
+[31;1m[36;1m[36;1m[0m[36;1m[0m[36;1m     | [31;1m                                                              ~~~~[0m
+[31;1m[36;1m[36;1m[0m[36;1m[0m[36;1m[31;1m[31;1m[36;1m     | [31;1mThe term 'head' is not recognized as a name of a cmdlet, function, script file, or executable program.[0m
+[31;1m[36;1m[36;1m[0m[36;1m[0m[36;1m[31;1m[31;1m[36;1m[31;1mCheck the spelling of the name, or if a path was included, verify that the path is correct and try again.[0m
+
+```
+
+---
+
+## Assistant (Build · Big Pickle · 3.5s)
+
+PowerShell doesn't have `head`. Let me use python directly or Select-Object.
+
+
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"C:\\Users\\clayc\\Desktop\\New folder (2)\\EFIMac\"\npython tool_scripts/dis_m68k.py 0x4080AA10 0x4080AB00 2>&1 | Select-Object -First 70"
+}
+```
+
+**Output:**
+```
+0x4080AA10:  3e7c2600                 movea.w #$2600, a7
+0x4080AA14:  284e                     movea.l a6, a4
+0x4080AA16:  41fa00b8                 lea.l $4080aad0(pc), a0
+0x4080AA1A:  2008                     move.l a0, d0
+0x4080AA1C:  b0a0                     cmp.l -(a0), d0
+0x4080AA1E:  670a                     beq.b $4080aa2a
+0x4080AA20:  4a90                     tst.l (a0)
+0x4080AA22:  66f8                     bne.b $4080aa1c
+0x4080AA24:  41f80008                 lea.l $8.w, a0
+0x4080AA28:  2080                     move.l d0, (a0)
+0x4080AA2A:  5148                     subq.w #$8, a0
+0x4080AA2C:  4e7b                     dc.w $4e7b
+0x4080AA2E:  8801                     or.b d1, d4
+0x4080AA30:  7400                     moveq #$0, d2
+0x4080AA32:  4dfa0008                 lea.l $4080aa3c(pc), a6
+0x4080AA36:  60ff                     dc.w $60ff
+0x4080AA38:  00000116                 ori.b #$16, d0
+0x4080AA3C:  08000000                 btst.b #$0, d0
+0x4080AA40:  671a                     beq.b $4080aa5c
+0x4080AA42:  45f9ffff55be             lea.l $ffff55be.l, a2
+0x4080AA48:  45fba8f8                 lea.l $4080aa42(pc, a2.l), a2
+0x4080AA4C:  2610                     move.l (a0), d3
+0x4080AA4E:  968a                     sub.l a2, d3
+0x4080AA50:  d1c3                     adda.l d3, a0
+0x4080AA52:  d3c3                     adda.l d3, a1
+0x4080AA54:  d9c3                     adda.l d3, a4
+0x4080AA56:  4efb3802                 jmp $4080aa5a(pc, d3.l)
+0x4080AA5A:  dfc3                     adda.l d3, a7
+0x4080AA5C:  41fa0072                 lea.l $4080aad0(pc), a0
+0x4080AA60:  2008                     move.l a0, d0
+0x4080AA62:  b0a0                     cmp.l -(a0), d0
+0x4080AA64:  670a                     beq.b $4080aa70
+0x4080AA66:  4a90                     tst.l (a0)
+0x4080AA68:  66f8                     bne.b $4080aa62
+0x4080AA6A:  41f80008                 lea.l $8.w, a0
+0x4080AA6E:  2080                     move.l d0, (a0)
+0x4080AA70:  5148                     subq.w #$8, a0
+0x4080AA72:  4e7b                     dc.w $4e7b
+0x4080AA74:  8801                     or.b d1, d4
+0x4080AA76:  7400                     moveq #$0, d2
+0x4080AA78:  4dfa0008                 lea.l $4080aa82(pc), a6
+0x4080AA7C:  60ff                     dc.w $60ff
+0x4080AA7E:  000000d0                 ori.b #$d0, d0
+0x4080AA82:  4dfa0008                 lea.l $4080aa8c(pc), a6
+0x4080AA86:  60ff                     dc.w $60ff
+0x4080AA88:  00000050                 ori.b #$50, d0
+0x4080AA8C:  2600                     move.l d0, d3
+0x4080AA8E:  203c07000000             move.l #$7000000, d0
+0x4080AA94:  c081                     and.l d1, d0
+0x4080AA96:  6712                     beq.b $4080aaaa
+0x4080AA98:  0c8003000000             cmpi.l #$3000000, d0
+0x4080AA9E:  660a                     bne.b $4080aaaa
+0x4080AAA0:  4dfa0008                 lea.l $4080aaaa(pc), a6
+0x4080AAA4:  60ff                     dc.w $60ff
+
+```
+
+---
+
+## Assistant (Build · Big Pickle · 30.2s)
+
+Now I can read the flow clearly. The capstone disassembly shows the actual structure. Let me analyze:
+
+At `0x4080AA10`:
+```
+3E7C 2600   movea.w #$2600, a7        ; SP = 0x2600
+284E        movea.l a6, a4            ; a4 = a6 (dispatch table ptr)
+41FA 00B8   lea.l $4080aad0(pc), a0   ; a0 = -... the table
+2008        move.l a0, d0
+B0A0        cmp.l -(a0), d0           ; pre-decrement; compares
+670A        beq.b $4080aa2a
+4A90        tst.l (a0)
+66F8        bne.b $4080aa1c
+41F8 0008   lea.l $8.w, a0            ; a0 = 0x0008
+2080        move.l d0, (a0)           ; [0x0008] = d0
+5148        subq.w #$8, a0
+4E7B 8801   dc.w $4e7b 8801           ; !! unhandled by capstone = 4E7B is MOVEC
+7400        moveq #$0, d2
+4DFA 0008   lea.l $4080aa3c(pc), a6
+60FF 00000116  dc.w $60ff 00000116    ; BRA.L +0x116 -> 0x4080AA3C+0x116 = 0x4080AB52?
+```
+
+Wait, capstone decodes `60FF 00000116` as `dc.w` because capstone in M68K_000 mode doesn't know 68020 BRA.L. But I know from the redirect that `60FF` with a following 32-bit displacement is `BRA.L d32` (68020). So:
+
+At 0x4080AA36: `60FF 00000116` = BRA.L +0x116 → target = 0x4080AA38 + 0x116 = 0x4080AB4E. Wait, the PC after the whole 6-byte instruction = 0x4080AA3C (LEA). Actually the displacement is relative to the address of the instruction + 4 (after the disp.words), i.e., PC = 0x4080AA36+6 = 0x4080AA3C. Wait no — the standard is target = PC_of_extension_high + ... Let me not over-analyze; the redirect in interpreter.c computes `Tgt = Pc24 + 2 + Disp` where Pc24 = address of the `60FF` word. So target = 0x4080AA36 + 2 + 0x116 = 0x4080AB4E.
+
+Hmm, but actually BRA.L displacement is relative to the address of the instruction's last word (the low displacement word), i.e., after disp. So target should be (addr_of_60FF + 6) + disp in real 68020 = 0x4080AA3C + 0x116 = 0x4080AB52. But the redirect uses Pc24+2+Disp = 0x4080AA38+0x116 = 0x4080AB4E. That's off by 4!
+
+Wait, let me reconsider. Real 68020 BRA.L: the displacement is added to the address of the **next instruction** (i.e., after all extension words). So target = PC_after_instruction + d32 = (0x4080AA36 + 6) + 0x116 = 0x4080AA3C + 0x116 = 0x4080AB52.
+
+But my redirect computed Pc24+2+Disp = 0x4080AA38 + 0x116 = 0x4080AB4E — which is 4 bytes short. Hmm wait, but actually 68020 semantics: "the displacement is relative to the address of the extension word" I think. Let me recall precisely.
+
+Actually for `BRA.L`, the effective PC for the displacement is the address of the **instruction's last word** + 2... Let me recall: 68k branch displacements are relative to the PC *after* the instruction (the current PC includes the extension words). For Bcc with 8-bit disp: target = PC + 2 + disp8 (PC after first word). For 16-bit: target = PC + 2 + disp16 where PC is the address of the instruction (so +2 for the first word, then +2 for the disp word... no).
+
+Precisely: `BRA.W`: target = (address of instruction) + 2 + disp16. `BRA.L`: target = (address of instruction) + 2 + 4 + disp32? Let me verify with the known-first redirect which worked: The very first `0x60FF` at 0x408000C0 with d32=0xA94E → redirect computed target = 0x408000C0+2+0xA94E = 0x4080AA10. And that WAS correct — the DR reached 0x4080AA10 which contains the real dispatcher code (movea.w #0x2600,a7 etc.). So `Pc24+2+Disp` is the CORRECT formula (the displacement is relative to the extension-word address, not the final PC).
+
+So for the boot-stub case it's correct. Good — the redirect formula is right (68020's `d32` is relative to the address following the displacement low word, which equals the 60FF address + 2). Actually the fact it worked empirically confirms `target = addr_of_60FF + 2 + d32`. Good.
+
+So back to the flow. The key structural discovery: the code at 0xAA10-0xAA30 is a **table walk** that when it finds a match stores `d0` to low RAM `0x0008`. But `4E7B 8801` at 0xAA2C is `MOVEC` — capstone doesn't decode it, and **the 68000-core DR also won't decode MOVEC** (it's a 68010+ instruction). This may be the next gap! But wait — the DR jumped to PC 0, not failing on MOVEC.
+
+Actually, hold on. Let me reconsider the whole picture. The disassembly reveals this is the **classic Mac boot "dispatch table"** jump.head. Let me reconsider what actually happened: DR68K-LOW showed the DR's 68K PC went to 0 (r24=0). Let me reconsider.
+
+Let me look at this from the DR68K-LOW perspective. The DR jumped to 0. But the code at 0xAA10 does `movea.l a6, a4; lea.l table,a0; ...` and a table walk. Let me trace what happens concretely.
+
+Actually, let me reconsider — maybe the DR never makes it deep into 0xAA10. The DR68K-LOW fired with r24=0 at exec=108542, immediately after DR-BRA.L[1]. Let me look at what happens between: after the redirect sets r24=0x4080AA10, the DR dispatches there. It executes the table-walk. The table walk does `b0a0 cmp.l -(a0),d0` etc. This could loop or hit a JMP.
+
+Hmm, the DR68K-LOW at PPC=0x40B67CE4 — that's the DR dispatch home. So the DR was mid-dispatch when r24 became 0.
+
+Let me instrument more precisely: I need to see the DR's 68K execution trace between the redirect (r24=0x4080AA10) and the jump to 0. The Y80 post-yield tracer was capturing this but let me check what it shows in the current run. Let me grep for the tracer output.
+
+Let me look at the 68K PCs the DR actually executed near 0xAA10 in the current log.
+
+The capstone decodes reveal this is a **DR jump-table dispatcher** (`jmp $4080aa5a(pc,d3.l)` at 0xAA56, `jmp`/handler dispatch). And `4E7B 8801` is **MOVEC** (68010+ opcode) which capstone can't decode — and critically, the **68000-core DR likely can't decode MOVEC either**. This is very likely the real next gap.
+
+But I need to confirm exactly how the DR reaches PC 0. Let me improve the instrumentation. Let me check the Y80 tracer output in the current log first.
+
+The flow at 0xAA10 is a table-walk dispatcher, and `4E7B 8801` = `MOVEC` (68010+ opcode) which the 68000-core DR likely can't decode. Let me check the current log's 68K trace to see exactly how the DR reaches PC 0.
+
+
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"C:\\Users\\clayc\\Desktop\\New folder (2)\\EFIMac\"\n$l = Get-Content \"$env:TEMP\\opencode\\boot_out.txt\"\n$l | Select-String -Pattern \"Y80|0x4080AA|68kpc=0x4080AA\" | Select-Object -First 15 | ForEach-Object { $_.Line }"
+}
+```
+
+**Output:**
+```
+  Y80[4] PPC=0x40B67B68 r24(68Kpc)=0x408000BE r27=0x0008 r1=0x0000A000
+  Y80[8] PPC=0x40B67B78 r24(68Kpc)=0x408000BE r27=0x0008 r1=0x0000A000
+  Y80[12] PPC=0x40B67C4C r24(68Kpc)=0x408000BE r27=0x0008 r1=0x0000A000
+  Y80[16] PPC=0x40B67B88 r24(68Kpc)=0x408000BE r27=0x0008 r1=0x0000A000
+  Y80[20] PPC=0x40B67C5C r24(68Kpc)=0x408000BE r27=0x0008 r1=0x0000A000
+  Y80[24] PPC=0x40B67B98 r24(68Kpc)=0x408000BE r27=0x0008 r1=0x0000A000
+  DR-BRA.L[1] redirect 0x60FF@0x408000C0 d32=0x0000A94E -> 0x4080AA10
+  Y80[28] PPC=0x40B67BA8 r24(68Kpc)=0x4080AA10 r27=0x60FF r1=0x0000A000
+  Y80[32] PPC=0x40B67BB8 r24(68Kpc)=0x4080AA10 r27=0x60FF r1=0x0000A000
+  Y80[36] PPC=0x40B67BC8 r24(68Kpc)=0x4080AA10 r27=0x60FF r1=0x0000A000
+  Y80[40] PPC=0x40B6D754 r24(68Kpc)=0x4080AA10 r27=0x60FF r1=0x0000A000
+  Y80[44] PPC=0x40B6D788 r24(68Kpc)=0x4080AA0E r27=0x60FF r1=0x0000A000
+  Y80[48] PPC=0x40B6D798 r24(68Kpc)=0x4080AA0E r27=0x60FF r1=0x0000A000
+  Y80[52] PPC=0x40B6D7A8 r24(68Kpc)=0x4080AA0E r27=0x60FF r1=0x0000A000
+  Y80[56] PPC=0x40B6D7D4 r24(68Kpc)=0x4080AA0E r27=0x60FF r1=0x00009FF8
+
+```
+
+---
+
+## Assistant (Build · Big Pickle · 70.0s)
+
+Now I see the real problem clearly. After the DR-BRA.L[1] redirect to 0x4080AA10, the trace shows:
+
+- r24 = 0x4080AA10, then the DR dispatches
+- The DR hits the **PC-relative handler** (0x40B6D780 region via 0x40B6D754 → 0x40B6D788) 
+- r24 backs up to **0x4080AA0E** — the DR is fetching an instruction at 0xAA0E, not 0xAA10.
+
+Wait — r24 = 0x4080AA0E? The redirect targeted 0x4080AA10, but the DR is at 0x4080AA0E. This means the DR's PC got **decremented by 2**. 
+
+Let me think. The redirect set r24=0x4080AA10. But then the DR's PC-relative handler at 0x40B6D7D4 re-reads the reference PC from `[0xB010]` and **backs r24 up to 0xAA0E**. 
+
+Wait — I see. The `0x60FF` redirect: after I set r24=0x4080AA10, the DR continues. But the REFSLOT seed block fires at `Current in 0x40B6D7C8..D4` and writes `[0xB010] = r24`. At that point r24=0x4080AA10, so `[0xB010]=0x4080AA10`.
+
+But hold on — the Y80[56] shows PPC=0x40B6D7D4 (the lwzx staging) with r24=0x4080AA0E. So the DR backed r24 to 0x4080AA0E (2 less than 0xAA10). 
+
+This is the crux: **after the redirect jumped to 0x4080AA10, the very first thing the code at/around 0xAA10 does is hit another instruction that routes through the PC-relative handler, which backs r24 up.** But 0xAA10 contains `3E7C 2600` (movea.w), not a PC-relative instruction...
+
+Actually wait. Let me reconsider. The DR executes `3E7C 2600` (MOVE.W #0x2600,A7). That's not PC-relative. But the trace shows r24=0xAA10 with r27=0x60FF — meaning the DR **prefetched 0x60FF as the next opcode**. But at 0xAA12 is `0x2600`... no wait.
+
+Hmm, r24=0x4080AA10, r27=0x60FF. The DR prefetched the word at... hmm. Let me reconsider — r27 is the prefetched opcode. If r24=0xAA10, the DR would prefetch `3E7C` (the word at 0xAA10). But r27=0x60FF. 
+
+Wait — 0x60FF is at 0xAA36. So r27=0x60FF doesn't match r24=0xAA10. Unless the DR's r27 is stale/lagged. Actually, maybe the r27 shown is not freshly prefetched for r24.
+
+Let me reconsider the whole thing differently. The key observation from Y80[56]: r24=0x4080AA0E. That's **0x4080AA0E** — which is the last word of the `0x60FF 00000116` at... no. Let me map addresses:
+
+- 0x4080AA36 = `60FF`
+- 0x4080AA38 = `0000`
+- 0x4080AA3A = `0116`
+- The BRA.L d32 targets... the redirect formula Tgt = Pc24+2+Disp. If Pc24=0xAA36, Tgt = 0xAA38+0x116 = 0x4080AB4E.
+
+But r24 went to 0xAA0E. That's BELOW 0xAA36. So the DR isn't following the redirect to the BRA.L target; instead something backed it up to 0xAA0E.
+
+Hold on. Let me reconsider. The Y80 trace shows r24 going 0xAA10 → 0xAA0E. It went BACKWARD by 2. This is the PC-relative handler backing up r24 to the "extension word address." But 0xAA10's first instruction `3E7C` is a MOVE immediate, not PC-relative.
+
+Actually — I bet the real issue is different. Let me reconsider what instruction the DR is actually trying to execute at 0xAA10. r27=0x60FF. The prefetched opcode is 0x60FF. So the DR thinks the current opcode is **0x60FF at address 0x4080AA0E**? No...
+
+Let me reconsider: maybe the hex dump offset is different. The DR's r24=0xAA0E. What's at 0xAA0E? From the earlier hex dump starting at 0xAA10, going backward: 0xAA10 starts `3e 7c 26 00`. So 0xAA0E = two bytes before = whatever precedes. Let me check what's at 0xAA0C-0xAA10.
+
+Actually, this backward-backup to the extension word is the PC-relative handler's normal behavior: it backs r24 up to the EA's extension-word address. So the DR is executing a PC-relative instruction whose extension word is at 0xAA0E.
+
+But 0xAA10 = `3E7C` (MOVE.W A7). Not PC-relative. Unless the DR's PC decoding is off because... 
+
+Let me step back. Maybe the actual problem: the redirect set r24=0x4080AA10, but the DR had ALREADY prefetched r27=0x60FF (thinking it was still at the 0x60FF because r27 was loaded before the redirect). So the DR now tries to execute opcode 0x60FF as if at PC=0xAA10 (or backed up to the 0x60FF's "next 68K PC"). 
+
+**That's the bug in my redirect!** When I set r24=0x4080AA10 (the target), the DR's prefetched opcode r27 is still `0x60FF` (from before the redirect). The DR dispatches opcode 0x60FF → sees the PC-relative/branch handler → reads reference PC and backs up to 0xAA0E → spins again.
+
+The redirect only changed r24, not r27. So the D9 DR is about to execute `0x60FF` at the wrong location. This is why it loops.
+
+So my redirect is incomplete: after redirecting r24 to the branch target, I must also ensure the DR starts fetching the *correct* instruction at the target. The issue is r27 (prefetched opcode) is stale.
+
+Let me reconsider the DR's dispatch protocol. How does the DR get its opcode? r27 = prefetched opcode. The dispatch at 0x40B67C60 region reads r27. If I redirect r24 (the PC), I need r27 to hold the opcode at the target. But I can't easily prefetch (the opcode is a ROM word: CpuRead16(target)).
+
+Actually — let me reconsider. Looking at the Y80 trace more carefully:
+
+```
+Y80[28] r24=0x4080AA10 r27=0x60FF   <- after redirect, DR at target, r27 still 0x60FF (stale)
+...
+Y80[44] r24=0x4080AA0E r27=0x60FF   <- backed up to 0xAA0E
+```
+
+So the DR is stuck with r27=0x60FF and keeps backing up. The DR thinks it's executing `0x60FF`.
+
+The fix: when redirecting, also load the correct prefetch. But what should r27 be? r27 should be the opcode at r24=0x4080AA10 = `3E7C` (MOVE.W #imm,A7). So I should set `Gpr[27] = CpuRead16(target)`.
+
+But wait — would that actually be the right handshake? When the DR does a JMP/BRA within the 68000 core, it updates r24 (PC) AND r27 (prefetch). So if I emulate that, I should set both.
+
+Actually, let me reconsider even more carefully. The PROGRESS/DSP normal path: the DR's normal instruction dispatch reads r27 as the opcode for r24's instruction. When the DR executes an instruction that changes PC (like a BRA), it recomputes r27 = the word at the new PC. So on my redirect, to fully emulate, I should set both r24 and r27.
+
+Let me set `Gpr[27] = CpuRead16(Tgt)` (the opcode at the branch target) when I redirect. Let me also verify: is it possible the DR reads r27 fresh from the target? Given the trace shows it stuck with r27=0x60FF, no — it kept the stale value.
+
+Let me implement: in the DR-BRA.L redirect, also set r27 to the opcode at the target. Let me update the code.
+
+Actually, let me reconsider whether r27 should be the opcode at target, or whether I also need to handle the "next prefetch." In a real 68000, r27 would be the opcode of the instruction AT the new PC (0xAA10 = 0x3E7C). And the 68020 would have no prefetch (or the DR maintains r27 as next). Setting r27=opcode at target seems right.
+
+Let me update the redirect to also set r27.
+
+Now I understand the bug: my redirect changed `r24` (the 68K PC) but not `r27` (the DR's prefetched opcode). After the redirect to 0x4080AA10, the DR still has `r27=0x60FF` stale, so it re-enters the PC-relative/branch handler, backs r24 up to 0xAA0E, and spins. I must also write `r27 = opcode at the target`. Let me fix that.
+
+
+
+**Tool: read**
+
+**Input:**
+```json
+{
+  "filePath": "C:\\Users\\clayc\\Desktop\\New folder (2)\\EFIMac\\src\\cpu\\interpreter.c",
+  "limit": 28,
+  "offset": 5778
+}
+```
+
+**Output:**
+```
+<path>C:\Users\clayc\Desktop\New folder (2)\EFIMac\src\cpu\interpreter.c</path>
+<type>file</type>
+<content>
+5778:             if (Pc24 >= 0x40800000u && Pc24 < 0x40840000u &&
+5779:                 CpuRead16(Pc24) == 0x60FF) {
+5780:                 UINT32 Disp = ((UINT32)CpuRead16(Pc24 + 2) << 16) |
+5781:                               (UINT32)CpuRead16(Pc24 + 4);
+5782:                 UINT32 Tgt = Pc24 + 2 + Disp;
+5783:                 g_PpcContext.Gpr[24] = Tgt;
+5784:                 g_DrBrFixed++;
+5785:                 if (g_DrBrFixed <= 12)
+5786:                     Print(L"  DR-BRA.L[%u] redirect 0x60FF@0x%08x d32=0x%08x -> 0x%08x\n",
+5787:                           g_DrBrFixed, Pc24, Disp, Tgt);
+5788:             }
+5789:         }
+5790:         if (Dr68KLowProbed == 0 && g_DrYieldSeen && g_DrBootPcSeeded &&
+5791:             (Current >= 0x40B60000 && Current < 0x40B82000)) {
+5792:             UINT32 Pc24 = g_PpcContext.Gpr[24];
+5793:             if (Dr68KLast >= 0x40800000 && Pc24 < 0x40000000) {
+5794:                 UINTN A;
+5795:                 Dr68KLowProbed = 1;
+5796:                 Print(L"  DR68K-LOW[1] exec=%u PPC=0x%08x r24(68Kpc)=0x%08x r27=0x%04x "
+5797:                       L"r23=0x%08x r29=0x%08x r31=0x%08x r1=0x%08x LR=0x%08x CTR=0x%08x\n",
+5798:                       Executed, Current, Pc24, g_PpcContext.Gpr[27] & 0xFFFF,
+5799:                       g_PpcContext.Gpr[23], g_PpcContext.Gpr[29],
+5800:                       g_PpcContext.Gpr[31], g_PpcContext.Gpr[1],
+5801:                       g_PpcContext.Lr, g_PpcContext.Ctr);
+5802:                 for (A = 0x00000000u; A < 0x00002000u; A += 16) {
+5803:                     Print(L"  LOW[0x%08x] %08x %08x %08x %08x\n",
+5804:                           A, CpuRead32(A), CpuRead32(A + 4),
+5805:                           CpuRead32(A + 8), CpuRead32(A + 12));
+
+(Showing lines 5778-5805 of 6566. Use offset=5806 to continue.)
+</content>
+```
+
+---
+
+## Assistant (Build · Big Pickle · 6.0s)
+
+Now let me fix the redirect to also set r27 (the prefetched opcode) to the opcode at the branch target, emulating what a real 68020 BRA.L does (updates both PC and prefetch).
+
+
+
+**Tool: edit**
+
+**Input:**
+```json
+{
+  "filePath": "C:\\Users\\clayc\\Desktop\\New folder (2)\\EFIMac\\src\\cpu\\interpreter.c",
+  "oldString": "                UINT32 Disp = ((UINT32)CpuRead16(Pc24 + 2) << 16) |\n                              (UINT32)CpuRead16(Pc24 + 4);\n                UINT32 Tgt = Pc24 + 2 + Disp;\n                g_PpcContext.Gpr[24] = Tgt;\n                g_DrBrFixed++;",
+  "newString": "                UINT32 Disp = ((UINT32)CpuRead16(Pc24 + 2) << 16) |\n                              (UINT32)CpuRead16(Pc24 + 4);\n                UINT32 Tgt = Pc24 + 2 + Disp;\n                // A real 68020 BRA.L updates the PC AND refetches the instruction\n                // opcode. The DR keeps r24 (PC) and r27 (prefetched opcode) in\n                // lock-step; if we only move r24 the DR still has the stale\n                // 0x60FF in r27 and re-enters its branch handler, backing r24 up\n                // to the ext word and spinning. Refetch r27 from the target too.\n                g_PpcContext.Gpr[24] = Tgt;\n                g_PpcContext.Gpr[27] = (UINT64)(CpuRead16(Tgt) & 0xFFFF);\n                g_DrBrFixed++;"
+}
+```
+
+**Output:**
+```
+Edit applied successfully.
+```
+
+---
+
+## Assistant (Build · Big Pickle · 75.3s)
+
+Now let me rebuild and rerun to see if the DR progresses past 0x4080AA10.
+
+The REFSLOT seed also needs care: at 0x40B6D7C8..D4 it writes `[0xB010]=r24`. After my redirect, when the DR re-enters the PC-relative handler legitimately at the target (e.g., `LEA (d16,PC)`), r24 would be the reference PC. But there's a subtlety: the REFSLOT block writes `r24` into the slot, but if at that moment the DR has r24=target (not the reference), it'd be wrong. However the existing behavior: REFSLOT fired when the DR was at 0x40B6D7C8 (the PC-relative handler's staging), where r24=reference PC. That's still correct. Let me rebuild and test.
+
+
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"C:\\Users\\clayc\\Desktop\\New folder (2)\\EFIMac\"\n& \"C:\\Program Files\\Git\\bin\\bash.exe\" scripts/build-windows.sh 2>&1 | Select-Object -Last 1\n./scripts/run-qemu-windows.ps1 -MacDisc \"$env:TEMP\\opencode\\mac_disc\\Mac_OS_9.2.2.iso\" -Seconds 60 2>&1 | Select-Object -Last 1\n$l = Get-Content \"$env:TEMP\\opencode\\boot_out.txt\"\n$l | Select-String \"DR-BRA.L\\[|DR68K-LOW\\[1\\]\" | ForEach-Object { $_.Line } | Select-Object -First 10",
+  "timeout": 160000
+}
+```
+
+**Output:**
+```
+Built: build/EFI-Mac-Emulator.efi
+Boot log: C:\Users\clayc\AppData\Local\Temp\opencode\boot_out.txt
+  DR-BRA.L[1] redirect 0x60FF@0x408000C0 d32=0x0000A94E -> 0x4080AA10
+  DR68K-LOW[1] exec=108542 PPC=0x40B67CE4 r24(68Kpc)=0x00000000 r27=0x0000 r23=0x00000000 r29=0x40BA76A0 r31=0x0000B000 r1=0x00009FF8 LR=0x40BA76A0 CTR=0x00000000
+
+```
+
+---
+
+## Assistant (Build · Big Pickle · 11.1s)
+
+Still stuck. exec=108542, same. So even with r27 refetched, the DR went to PC 0. But wait — only DR-BRA.L[1] fired (the first one). The boot-stub chain after redirect should have more `0x60FF` at 0xAA36/0xAA7C/0xAA86 etc. But only one fired. So the DR never reached those — it jumped to 0 before.
+
+Let me trace more carefully what happens right after the redirect with the r27 fix. Let me check the Y80 tracer output now after the redirect — did the DR progress past 0xAA10?
+
+Let me look at Y80 lines around and after DR-BRA.L.
+
+Still stuck — only one DR-BRA.L fired. Let me check the post-redirect trace to see where the DR goes now.
+
+
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"C:\\Users\\clayc\\Desktop\\New folder (2)\\EFIMac\"\n$l = Get-Content \"$env:TEMP\\opencode\\boot_out.txt\"\n$i = ($l | Select-String \"DR-BRA.L\\[1\\]\").LineNumber\n$l[$i..($i+20)] | ForEach-Object { $_.Line }"
+}
+```
+
+**Output:**
+```
+(no output)
+```
+
+---
+
+## Assistant (Build · Big Pickle · 3.3s)
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"C:\\Users\\clayc\\Desktop\\New folder (2)\\EFIMac\"\n$l = Get-Content \"$env:TEMP\\opencode\\boot_out.txt\"\n$l | Select-String \"DR-BRA.L\\[1\\]\" | Select-Object First | ForEach-Object { $_.LineNumber }"
+}
+```
+
+**Output:**
+```
+(no output)
+```
+
+---
+
+## Assistant (Build · Big Pickle · 6.6s)
+
+The DR-BRA.L[1] line was found earlier via Select-String but the indexing is off (line numbers don't match because of ANSI/indent). Let me search the raw lines around it.
+
+Actually the first grep returned it. Let me just look at all Y80 lines and PROGRESS lines near the end.
+
+
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"C:\\Users\\clayc\\Desktop\\New folder (2)\\EFIMac\"\n$l = Get-Content \"$env:TEMP\\opencode\\boot_out.txt\"\n$l | Select-String -Pattern \"DR-BRA.L|Y80\\[|DR68K-LOW|PROGRESS\\[\" | Select-Object -Last 25 | ForEach-Object { $_.Line.Trim() }"
+}
+```
+
+**Output:**
+```
+Y80[2520] PPC=0x40B80004 r24(68Kpc)=0x00000F9C r27=0x0000 r1=0x00009FF8
+Y80[2524] PPC=0x40B80004 r24(68Kpc)=0x00000FA4 r27=0x0000 r1=0x00009FF8
+Y80[2528] PPC=0x40B80004 r24(68Kpc)=0x00000FAC r27=0x0000 r1=0x00009FF8
+Y80[2532] PPC=0x40B80004 r24(68Kpc)=0x00000FB4 r27=0x0000 r1=0x00009FF8
+Y80[2536] PPC=0x40B80004 r24(68Kpc)=0x00000FBC r27=0x0000 r1=0x00009FF8
+Y80[2540] PPC=0x40B80004 r24(68Kpc)=0x00000FC6 r27=0x0000 r1=0x00009FF8
+Y80[2544] PPC=0x40B6D780 r24(68Kpc)=0x00000FCA r27=0xFB30 r1=0x00009FF8
+Y80[2548] PPC=0x40B6D790 r24(68Kpc)=0x00000FC8 r27=0xFB30 r1=0x00009FF8
+Y80[2552] PPC=0x40B6D7A0 r24(68Kpc)=0x00000FC8 r27=0xFB30 r1=0x00009FF8
+Y80[2556] PPC=0x40B6D7CC r24(68Kpc)=0x00000FC8 r27=0xFB30 r1=0x00009FF0
+Y80[2560] PPC=0x40B6D7DC r24(68Kpc)=0x0038155B r27=0xFB30 r1=0x00009FF0
+Y80[2564] PPC=0x40B6D7EC r24(68Kpc)=0x0038155B r27=0x0000 r1=0x00009FF0
+Y80[2568] PPC=0x40B6D348 r24(68Kpc)=0x0038155D r27=0x0000 r1=0x00009FF0
+Y80[2572] PPC=0x40B6D358 r24(68Kpc)=0x0038155D r27=0x0000 r1=0x00009FF0
+Y80[2576] PPC=0x40B6D368 r24(68Kpc)=0x0038155D r27=0x0000 r1=0x00009FF0
+Y80[2580] PPC=0x40B6D79C r24(68Kpc)=0x0038155D r27=0x0000 r1=0x00009FF0
+Y80[2584] PPC=0x40B6D7C8 r24(68Kpc)=0x0038155D r27=0x0000 r1=0x00009FF0
+Y80[2588] PPC=0x40B6D378 r24(68Kpc)=0x0038155D r27=0x0000 r1=0x00009F9C
+Y80[2592] PPC=0x40B6D388 r24(68Kpc)=0x0038155D r27=0x0000 r1=0x00009F9C
+Y80[2596] PPC=0x40B6D398 r24(68Kpc)=0x0038155B r27=0x0000 r1=0x00009F9C
+Y80[2600] PPC=0x40B6D3A8 r24(68Kpc)=0x0038155B r27=0x0000 r1=0x00009F9C
+Y80[2604] PPC=0x40B6D7CC r24(68Kpc)=0x0038155B r27=0x0000 r1=0x00009F94
+Y80[2608] PPC=0x40B6D7DC r24(68Kpc)=0x0000AAD0 r27=0x0000 r1=0x00009F94
+Y80[2612] PPC=0x40B6D7EC r24(68Kpc)=0x0000AAD0 r27=0x0000 r1=0x00009F94
+Y80[2616] PPC=0x40B6D7FC r24(68Kpc)=0x0000AAD2 r27=0x0000 r1=0x00009F94
+
+```
+
+---
+
+## Assistant (Build · Big Pickle · 15.0s)
+
+Now the DR has **progressed far past 0x4080AA10**! The r27 refetch fix worked. The Y80 trace now shows the DR executing 68K code around `0x00000F9C`, `0x00000FCA`, `0x0038155B`, `0x0000AAD0` — the DR is now running handoff/bootstrap code in **low RAM** and mixing with ROM (0xAAD0).
+
+The DR jumped to ROM 0xAAD0 (relocation table) and is doing 68K work. The r27 fix broke the 0x60FF loop. But then it hits PC-relative handler issues again (r24=0x0038155B etc — weird huge PCs).
+
+This is real, substantial progress. The DR went from stuck at 0x408000C0 → now executing low-RAM/handoff code around 0xF9C, 0xFC8, 0x8155B, 0xAAD0. Let me understand where these are. `0x0000AAD0` is a ROM→low-RAM relocation (the base+offset of the `lea $4080aad0(pc),a0` table relocated into low RAM).
+
+Let me look at the bigger picture — check PROGRESS and how far exec got, and whether there's still a loop/bounce. Let me look at ALL Y80 output condensed and the PROGRESS markers.
+
+The r27 refetch fix worked — the DR now executes handoff code in low RAM (0xF9C, 0xFC8) and the relocated table at 0xAAD0 instead of looping on the `0x60FF`. Let me look at the overall progress and where it now bounces.
+
+
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"C:\\Users\\clayc\\Desktop\\New folder (2)\\EFIMac\"\n$l = Get-Content \"$env:TEMP\\opencode\\boot_out.txt\"\n\"=== DR-BRA.L occurrences ===\"\n($l | Select-String \"DR-BRA.L\").Count\n$l | Select-String \"DR-BRA.L\" | ForEach-Object { $_.Line.Trim() } | Select-Object -First 12\necho \"=== DR68K-LOW / OTHER probes ===\"\n$l | Select-String \"DR68K-LOW|DR-LOWSTATE\" | ForEach-Object { $_.Line.Trim() } | Select-Object -First 5\necho \"=== PROGRESS markers (last) ===\"\n$l | Select-String \"PROGRESS\\[\" | ForEach-Object { $_.Line.Trim() } | Select-Object -Last 4"
+}
+```
+
+**Output:**
+```
+=== DR-BRA.L occurrences ===
+1
+DR-BRA.L[1] redirect 0x60FF@0x408000C0 d32=0x0000A94E -> 0x4080AA10
+=== DR68K-LOW / OTHER probes ===
+DR68K-LOW[1] exec=108542 PPC=0x40B67CE4 r24(68Kpc)=0x00000000 r27=0x0000 r23=0x00000000 r29=0x40BA76A0 r31=0x0000B000 r1=0x00009FF8 LR=0x40BA76A0 CTR=0x00000000
+DR68K-LOW: continuing (break removed)
+=== PROGRESS markers (last) ===
+
+```
+
+---
+
+## Assistant (Build · Big Pickle · 11.8s)
+
+Only ONE DR-BRA.L fired (the first), and the DR now runs low-RAM code — but no more `0x60FF` branches were needed because the A-line chain uses a different mechanism past 0xAA10. The DR68K-LOW fired at exec=108542 with r24=0 (still jumped to 0 once), then continued.
+
+But the Y80 trace showed it reaching 0xF9C, 0xFC8, 0x8155B, 0xAAD0. So after that one jump-to-0, it continued into handoff code. Let me see the full Y80 progression to understand the current state — is it making forward progress or looping?
+
+Let me look at the final state of the run — where does it end up?
+
+The single DR68K-LOW (jump to 0) happened once at exec=108542, then it continued into handoff code. Let me trace the full 68K PC sequence from the redirect to see the actual path and whether it's progressing or looping now.
+
+
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"C:\\Users\\clayc\\Desktop\\New folder (2)\\EFIMac\"\n$l = Get-Content \"$env:TEMP\\opencode\\boot_out.txt\"\n$l | Select-String \"Y80\\[\" | ForEach-Object { if ($_.Line -match 'r24\\(68Kpc\\)=0x([0-9A-F]+)\\s+r27=0x([0-9A-F]+)') { \"pc=0x$($Matches[1]) op=$($Matches[2])\" } } | Select-Object -First 40"
+}
+```
+
+**Output:**
+```
+pc=0x408000BE op=0008
+pc=0x408000BE op=0008
+pc=0x408000BE op=0008
+pc=0x408000BE op=0008
+pc=0x408000BE op=0008
+pc=0x408000BE op=0008
+pc=0x4080AA10 op=3E7C
+pc=0x4080AA10 op=3E7C
+pc=0x4080AA10 op=3E7C
+pc=0x4080AA10 op=3E7C
+pc=0x4080AA0E op=3E7C
+pc=0x4080AA0E op=3E7C
+pc=0x4080AA0E op=3E7C
+pc=0x4080AA0E op=3E7C
+pc=0x4080AA0E op=0000
+pc=0x4080AA10 op=3E7C
+pc=0x4080AA10 op=3E7C
+pc=0x4080AA22 op=66F8
+pc=0x4080AA24 op=41F8
+pc=0x4080AA1E op=670A
+pc=0x4080AA22 op=66F8
+pc=0x4080AA24 op=41F8
+pc=0x4080AA1E op=670A
+pc=0x4080AA20 op=4E7B
+pc=0x4080AA2C op=4E7B
+pc=0x4080AA2E op=8801
+pc=0x4080AA2E op=8801
+pc=0x4080AA2E op=8801
+pc=0x4080AA30 op=7400
+pc=0x4080AA30 op=7400
+pc=0x4080AA32 op=4DFA
+pc=0x4080AB4E op=08C7
+pc=0x4080AB50 op=001B
+pc=0x4080AFB4 op=2030
+pc=0x4080AFB6 op=81F2
+pc=0x4080AFC6 op=3030
+pc=0x4080AFD6 op=B040
+pc=0x4080AFDA op=0000
+pc=0x4080AB60 op=2C49
+pc=0x4080AB62 op=6704
+
+```
+
+---
+
+## Assistant (Build · Big Pickle · 21.5s)
+
+Now I can see the actual flow clearly:
+
+1. Boot stub at 0x408000BE (`LEA (8,PC),A6`)
+2. Redirect: 0x60FF → target compute
+3. The DR starts at 0x4080AA10 (op=3E7C = MOVE.W #0x2600,A7), backs to 0xAA0E, then properly executes 0xAA10 → table walk
+4. Table walk loop (0xAA22 BNE, 0xAA24, 0xAA1E BEQ)
+5. Hits **0x4080AA20 with op=4E7B, 0xAA2C op=4E7B** — this is `MOVEC` (`4E7B 8801`)!
+6. Then 0xAA30 (MOVEQ), 0xAA32 (LEA)
+7. **0x4080AB4E** — this is the `60FF 00000116` BRA.L target computed as 0xAA36+2+... wait no. R24 went to 0x4080AB4E which is exactly the redirect target formula for the `0x60FF` at 0xAA36: 0xAA36+2+0x116 = 0x4080AB4E. 
+
+Wait — but only ONE DR-BRA.L fired (the first at 0x408000C0). Yet the DR reached 0xAB4E which is the target of the `0x60FF` at 0xAA36. That means **the DR actually executed the `0x60FF 00000116` at 0xAA36 itself** (capstone showed `dc.w $60ff` at 0xAA36 followed by `00000116`). Since my DR-BRA.L redirect has cap `< 64` and would fire at ANY `0x60FF`, but the log shows only one. 
+
+Hmm, but actually — maybe the DR executed `60FF 00000116` as its own instruction and the **68000 core handled it differently now**, OR the second 0x60FF got redirected but the trace counter (Y80) doesn't show the DR-BRA.L print. Wait no, the DR-BRA.L count is 1.
+
+Actually wait — re-reading: after 0xAA32 (op=4DFA=LEA), the next PC is 0x4080AB4E. But the instruction at 0xAA32 is `4DFA 0008` = LEA (8,PC),A6 at 0xAA32, which is a 4-byte instruction [0xAA32-0xAA35], next PC should be 0xAA36 (the `60FF`). The DR instead went to 0xAB4E. 
+
+So the `60FF 00000116` at 0xAA36 WAS consumed — the DR multiplied... no. 0xAB4E = 0xAA36 + 2 + 0x116. So something redirected it. But the DR-BRA.L counter only incremented once...
+
+OH. Maybe the DR-BRA.L print is gated by `g_DrBrFixed <= 12` for printing, but the redirect itself fires every time `< 64`. Wait, the FIRST instance printed as [1]. If a second one fired it'd print [2]. Only [1] printed. 
+
+Unless the second `0x60FF` at 0xAA36 was handled by a DIFFERENT code path — not my redirect. Let me reconsider: maybe after the r27-refetch fix, the DR itself can now compute some branches. Actually no — the DR is 68000 core, can't do 0x60FF.
+
+Hmm, actually maybe the DR-BRA.L redirect DID fire for 0xAA36 but the max-print logic... no, it prints [1] then if a 2nd fired it prints [2]. Only one printed means the redirect fired exactly once (at 0x408000C0).
+
+So how did the DR get from 0xAA32 to 0xAB4E? Let me reconsider. Perhaps the DR, after jumping to 0x4080AA10 the first time, does NOT go through the 0xAA36 60FF via my redirect. Instead it re-enters and... 
+
+Actually — you know what, the exact mechanism matters less than the outcome: **the DR is now making genuine forward progress through the boot code** (0xAA10 dispatch → 0xAB4E → 0xAFB4 → 0xAFD6 → 0xAB60). It's executing the ROM boot continuation. The `MOVEC` at 0xAA2C printed as op=4E7B (`dc.w $4e7b`) and `8801` — the DR may have skipped/treated it. 
+
+This is excellent progress — the DR boot is now running the actual boot continuation, not looping. The boot has advanced far beyond the previous deadlock. Let me get the full picture — where does it end / what does the system do now? Let me look at the very end of the run and whether the UiApp or some boot state is reached.
+
+
+
+**Tool: bash**
+
+**Input:**
+```json
+{
+  "command": "cd \"C:\\Users\\clayc\\Desktop\\New folder (2)\\EFIMac\"\n$l = Get-Content \"$env:TEMP\\opencode\\boot_out.txt\"\necho \"=== last 6 Y80 PCs ===\"\n$l | Select-String \"Y80\\[\" | ForEach-Object { if ($_.Line -match 'r24\\(68Kpc\\)=0x([0-9A-F]+)\\s+r27=0x([0-9A-F]+)') { \"pc=0x$($Matches[1]) op=$($Matches[2])\" } } | Select-Object -Last 6\necho \"=== final 12 log lines ===\"\n$l | Select-Object -Last 12 | ForEach-Object { $_.Line.Trim() }"
+}
+```
+
+**Output:**
+```
+=== last 6 Y80 PCs ===
+pc=0x0038155B op=0000
+pc=0x0038155B op=0000
+pc=0x0038155B op=0000
+pc=0x0000AAD0 op=0000
+pc=0x0000AAD0 op=0000
+pc=0x0000AAD2 op=0000
+=== final 12 log lines ===
+[31;1mInvalidOperation: [0m
+[31;1m[36;1mLine |[0m
+[31;1m[36;1m[36;1m   6 | [0m $l | Select-Object -Last 12 | ForEach-Object { [36;1m$_.Line.Trim()[0m }[0m
+[31;1m[36;1m[36;1m[0m[36;1m[0m[36;1m     | [31;1m                                                ~~~~~~~~~~~~~~[0m
+[31;1m[36;1m[36;1m[0m[36;1m[0m[36;1m[31;1m[31;1m[36;1m     | [31;1mYou cannot call a method on a null-valued expression.[0m
+[31;1mInvalidOperation: [0m
+[31;1m[36;1mLine |[0m
+[31;1m[36;1m[36;1m   6 | [0m $l | Select-Object -Last 12 | ForEach-Object { [36;1m$_.Line.Trim()[0m }[0m
+[31;1m[36;1m[36;1m[0m[36;1m[0m[36;1m     | [31;1m                                                ~~~~~~~~~~~~~~[0m
+[31;1m[36;1m[36;1m[0m[36;1m[0m[36;1m[31;1m[31;1m[36;1m     | [31;1mYou cannot call a method on a null-valued expression.[0m
+[31;1mInvalidOperation: [0m
+[31;1m[36;1mLine |[0m
+[31;1m[36;1m[36;1m   6 | [0m $l | Select-Object -Last 12 | ForEach-Object { [36;1m$_.Line.Trim()[0m }[0m
+[31;1m[36;1m[36;1m[0m[36;1m[0m[36;1m     | [31;1m                                                ~~~~~~~~~~~~~~[0m
+[31;1m[36;1m[36;1m[0m[36;1m[0m[36;1m[31;1m[31;1m[36;1m     | [31;1mYou cannot call a method on a null-valued expression.[0m
+[31;1mInvalidOperation: [0m
+[31;1m[36;1mLine |[0m
+[31;1m[36;1m[36;1m   6 | [0m $l | Select-Object -Last 12 | ForEach-Object { [36;1m$_.Line.Trim()[0m }[0m
+[31;1m[36;1m[36;1m[0m[36;1m[0m[36;1m     | [31;1m                                                ~~~~~~~~~~~~~~[0m
+[31;1m[36;1m[36;1m[0m[36;1m[0m[36;1m[31;1m[31;1m[36;1m     | [31;1mYou cannot call a method on a null-valued expression.[0m
+[31;1mInvalidOperation: [0m
+[31;1m[36;1mLine |[0m
+[31;1m[36;1m[36;1m   6 | [0m $l | Select-Object -Last 12 | ForEach-Object { [36;1m$_.Line.Trim()[0m }[0m
+[31;1m[36;1m[36;1m[0m[36;1m[0m[36;1m     | [31;1m                                                ~~~~~~~~~~~~~~[0m
+[31;1m[36;1m[36;1m[0m[36;1m[0m[36;1m[31;1m[31;1m[36;1m     | [31;1mYou cannot call a method on a null-valued expression.[0m
+[31;1mInvalidOperation: [0m
+[31;1m[36;1mLine |[0m
+[31;1m[36;1m[36;1m   6 | [0m $l | Select-Object -Last 12 | ForEach-Object { [36;1m$_.Line.Trim()[0m }[0m
+[31;1m[36;1m[36;1m[0m[36;1m[0m[36;1m     | [31;1m                                                ~~~~~~~~~~~~~~[0m
+[31;1m[36;1m[36;1m[0m[36;1m[0m[36;1m[31;1m[31;1m[36;1m     | [31;1mYou cannot call a method on a null-valued expression.[0m
+[31;1mInvalidOperation: [0m
+[31;1m[36;1mLine |[0m
+[31;1m[36;1m[36;1m   6 | [0m $l | Select-Object -Last 12 | ForEach-Object { [36;1m$_.Line.Trim()[0m }[0m
+[31;1m[36;1m[36;1m[0m[36;1m[0m[36;1m     | [31;1m                                                ~~~~~~~~~~~~~~[0m
+[31;1m[36;1m[36;1m[0m[36;1m[0m[36;1m[31;1m[31;1m[36;1m     | [31;1mYou cannot call a method on a null-valued expression.[0m
+[31;1mInvalidOperation: [0m
+[31;1m[36;1mLine |[0m
+[31;1m[36;1m[36;1m   6 | [0m $l | Select-Object -Last 12 | ForEach-Object { [36;1m$_.Line.Trim()[0m }[0m
+[31;1m[36;1m[36;1m[0m[36;1m[0m[36;1m     | [31;1m                                                ~~~~~~~~~~~~~~[0m
+[31;1m[36;1m[36;1m[0m[36;1m[0m[36;1m[31;1m[31;1m[36;1m     | [31;1mYou cannot call a method on a null-valued expression.[0m
+[31;1mInvalidOperation: [0m
+[31;1m[36;1mLine |[0m
+[31;1m[36;1m[36;1m   6 | [0m $l | Select-Object -Last 12 | ForEach-Object { [36;1m$_.Line.Trim()[0m }[0m
+[31;1m[36;1m[36;1m[0m[36;1m[0m[36;1m     | [31;1m                                                ~~~~~~~~~~~~~~[0m
+[31;1m[36;1m[36;1m[0m[36;1m[0m[36;1m[31;1m[31;1m[36;1m     | [31;1mYou cannot call a method on a null-valued expression.[0m
+[31;1mInvalidOperation: [0m
+[31;1m[36;1mLine |[0m
+[31;1m[36;1m[36;1m   6 | [0m $l | Select-Object -Last 12 | ForEach-Object { [36;1m$_.Line.Trim()[0m }[0m
+[31;1m[36;1m[36;1m[0m[36;1m[0m[36;1m     | [31;1m                                                ~~~~~~~~~~~~~~[0m
+[31;1m[36;1m[36;1m[0m[36;1m[0m[36;1m[31;1m[31;1m[36;1m     | [31;1mYou cannot call a method on a null-valued expression.[0m
+[31;1mInvalidOperation: [0m
+[31;1m[36;1mLine |[0m
+[31;1m[36;1m[36;1m   6 | [0m $l | Select-Object -Last 12 | ForEach-Object { [36;1m$_.Line.Trim()[0m }[0m
+[31;1m[36;1m[36;1m[0m[36;1m[0m[36;1m     | [31;1m                                                ~~~~~~~~~~~~~~[0m
+[31;1m[36;1m[36;1m[0m[36;1m[0m[36;1m[31;1m[31;1m[36;1m     | [31;1mYou cannot call a method on a null-valued expression.[0m
+[31;1mInvalidOperation: [0m
+[31;1m[36;1mLine |[0m
+[31;1m[36;1m[36;1m   6 | [0m $l | Select-Object -Last 12 | ForEach-Object { [36;1m$_.Line.Trim()[0m }[0m
+[31;1m[36;1m[36;1m[0m[36;1m[0m[36;1m     | [31;1m                                                ~~~~~~~~~~~~~~[0m
+[31;1m[36;1m[36;1m[0m[36;1m[0m[36;1m[31;1m[31;1m[36;1m     | [31;1mYou cannot call a method on a null-valued expression.[0m
+
+```
+
+---
+
+## Assistant (Build · Big Pickle · 5.4s)
+
+The `.Line` method failed because the tail lines are from QEMU's non-string output. Let me read the file tail differently — find the last meaningful log lines. The DR progress reached low-RAM handoff at 0xAAD0 / 0x38155B. Let me look at the final log content and whether the system reached the UiApp menu (the usual "stuck" point).
+
+Let me grep for key markers in the last portion of the log.
+
+The `.Line` failed on QEMU's tail output. Let me look at the tail via a robust read and check the DR's final destination and overall system state.
 
 ---
 

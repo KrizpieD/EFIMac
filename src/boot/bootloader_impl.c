@@ -54,6 +54,7 @@ typedef struct {
     VOID*   SystemFileHosts[PPC_MAX_SYSTEM_FILES];
     PPC_SYSTEM_FILE Drivers[PPC_MAX_DRIVERS];
     VOID*   DriverHosts[PPC_MAX_DRIVERS];
+    BOOLEAN OsRuntimeStaged;    // 68K System data fork staged for DR handoff
 } PPC_BOOTLOADER_CONTEXT;
 
 // Global bootloader context
@@ -2444,26 +2445,22 @@ PpcPatchNewWorldRom (
         Print(L"68K emulator: neutralised %u rlwimi dispatch-bit-20 words\n", Count);
     }
 
-#if 0 // FAITHFUL: EMUL_OP marker scaffolding retired
-    // Overwrite the opcode-table slots for the EMUL_OP extended opcodes
-    // (0xFE40..0xFE40+OP_MAX+2) with POWERPC_EMUL_OP markers ("addi r0,r0,n")
-    // followed by `b 0x366084` (re-enter the DR emulator loop). The
-    // interpreter intercepts the markers (PpcEmulatorDispatchOp).
+// EMUL_OP marker slots (additive; the SheepShaver trap-table redirect and
+    // entry routines stay retired -- only the dispatch-table slots for the
+    // EMUL_OP extended opcodes are armed). The DR's 68K opcode table maps
+    // (0xFE40+selector) to an 8-byte slot at ROM + 0x3FF200; write
+    // `PPC_EMUL_OP_MARKER | (selector+3)` ("mulli r0,r0,n") so a boot device
+    // open dispatches to the host device layer (the interpreter's EMUL_OP
+    // intercept) and resumes the DR loop at 0x366084. The slots are cold
+    // until a ROM site executes a 0xFE4x opcode.
     {
         UINT32 Entry = PPC_NEW_WORLD_ROM_EMUL_OP_ENTRY_OFFSET;
-        RomPatchWriteWord32(Rom, Entry +  0, PPC_EMUL_OP_MARKER | 0);   // EMUL_RETURN
-        RomPatchWriteWord32(Rom, Entry +  4, 0x4BF66E80);
-        RomPatchWriteWord32(Rom, Entry +  8, PPC_EMUL_OP_MARKER | 1);   // EXEC_RETURN
-        RomPatchWriteWord32(Rom, Entry + 12, 0x4BF66E78);
-        RomPatchWriteWord32(Rom, Entry + 16, PPC_EMUL_OP_MARKER | 2);   // EXEC_NATIVE
-        RomPatchWriteWord32(Rom, Entry + 20, 0x4BF66E70);
         for (I = 0; I < PPC_OP_MAX; I++) {
-            RomPatchWriteWord32(Rom, Entry + 24 + I * 8,
-                                PPC_EMUL_OP_MARKER | (I + 3));
-            RomPatchWriteWord32(Rom, Entry + 28 + I * 8, 0x4BF66E68 - I * 8);
+            RomPatchWriteWord32(Rom, Entry + I * 8, PPC_EMUL_OP_MARKER | (I + 3));
         }
+        Print(L"EMUL_OP marker slots armed: %u opcodes at ROM+0x%X\n",
+              PPC_OP_MAX, Entry);
     }
-#endif // FAITHFUL: EMUL_OP markers retired
 
     // XLM ("eXtra Low Memory") globals the entry routines read; they sit above
     // the 0x0-0x1800 low-memory area the nanokernel zeroes during its boot.
@@ -2525,6 +2522,82 @@ PpcPatchNewWorldRom (
         }
     }
 
+    return EFI_SUCCESS;
+}
+
+// Stage the classic Mac OS 68K System data fork into guest RAM so the DR
+// handoff (which jumps to low-RAM 0x0) can relocate the real 68K boot stub
+// there. Reads the file through the in-emulator HFS reader into a host buffer,
+// then bulk-copies it into the mapped nanokernel system area (guest
+// 0x68000000-0x70000000) at PPC_OS_RUNTIME_GUEST_BASE, and records that guest
+// base in the emulator boot-info block (offset +20) for the interpreter to find.
+EFI_STATUS
+EFIAPI
+PpcStageOsRuntime (
+    VOID
+    )
+{
+    if (g_BootContext.OsRuntimeStaged) {
+        return EFI_SUCCESS;
+    }
+
+    PPC_HFS_VOLUME_INFO HfsInfo;
+    EFI_STATUS Status = PpcHfsGetVolumeInfo(&HfsInfo);
+    if (EFI_ERROR(Status)) {
+        Status = PpcHfsMount(NULL);
+        if (EFI_ERROR(Status)) {
+            return EFI_NOT_FOUND;
+        }
+    }
+
+    PPC_HFS_ENTRY Sys;
+    Status = PpcHfsOpenPath(PPC_HFS_SYSTEM_FILE_PATH, &Sys);
+    if (EFI_ERROR(Status) || Sys.IsDirectory || Sys.Size == 0) {
+        Print(L"OS runtime: 'System' not found on volume (%r)\n", Status);
+        return EFI_NOT_FOUND;
+    }
+
+    UINTN FileSize = (UINTN)Sys.Size;
+    if (FileSize > PPC_OS_RUNTIME_MAX_SIZE) {
+        Print(L"OS runtime: System too large: %d bytes\n", (UINT64)FileSize);
+        return EFI_LOAD_ERROR;
+    }
+    if (!g_BootContext.NkSystemAreaInstalled) {
+        PpcInstallNkSystemArea();
+    }
+
+    VOID* Host = NULL;
+    Status = BS->AllocatePool(EfiBootServicesData, FileSize, &Host);
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+
+    UINTN Got = FileSize;
+    Status = PpcHfsReadFile(&Sys, Host, &Got);
+    if (EFI_ERROR(Status) || Got != FileSize) {
+        Print(L"OS runtime: failed to read System data fork: %r (got %d/%d)\n",
+              Status, (UINT64)Got, (UINT64)FileSize);
+        BS->FreePool(Host);
+        return EFI_ERROR(Status) ? Status : EFI_LOAD_ERROR;
+    }
+
+    // Bulk copy host -> guest (big-endian byte order is preserved by a raw
+    // byte copy; classic 68K data is stored as bytes in guest RAM).
+    for (UINTN I = 0; I < FileSize; I++) {
+        PpcWriteGuestByte(PPC_OS_RUNTIME_GUEST_BASE + (UINT32)I,
+                          ((UINT8*)Host)[I]);
+    }
+    BS->FreePool(Host);
+
+    // Record the staged guest base in the emulator boot-info block (+20) so
+    // the interpreter's DR-handoff can relocate the 68K boot stub to low RAM.
+    BootWriteWord32(PPC_LOW_MEM_GUEST_BASE + PPC_LOW_MEM_BOOTINFO_OFFSET +
+                        PPC_LOW_MEM_BOOTINFO_OSRUNTIME_OFFSET,
+                    PPC_OS_RUNTIME_GUEST_BASE);
+
+    g_BootContext.OsRuntimeStaged = TRUE;
+    Print(L"OS runtime staged: System -> guest 0x%x (%d bytes)\n",
+          PPC_OS_RUNTIME_GUEST_BASE, (UINT64)FileSize);
     return EFI_SUCCESS;
 }
 
@@ -2591,6 +2664,10 @@ PpcPrepareSystemForBoot (
                     (UINT32)(g_BootContext.RomLoaded ? g_BootContext.RomSize : 0));
     BootWriteWord32(PPC_LOW_MEM_GUEST_BASE + PPC_LOW_MEM_BOOTINFO_OFFSET + 16,
                     g_BootContext.RomType);
+
+    // Stage the classic Mac OS 68K System data fork so the DR handoff can
+    // relocate its boot stub into low RAM. Best-effort: failure just logs.
+    PpcStageOsRuntime();
 
     g_BootContext.SystemReady = TRUE;
     g_BootContext.SystemBooting = TRUE;
@@ -2829,6 +2906,14 @@ PpcLocateSystemFolder (
         // OS disc through the in-emulator HFS/HFS+ reader.
         if (!g_BootContext.SystemFolderFound) {
             BootLocateSystemFolderHfs();
+        } else if (!g_BootContext.SystemPresent || !g_BootContext.FinderPresent) {
+            // The boot volume's System Folder is incomplete (holds e.g. only
+            // Extensions / Mac OS ROM staged on the ESP): System and Finder
+            // live on the attached Mac OS disc, so merge them in from HFS.
+            Print(L"System Folder on boot volume incomplete (System=%d Finder=%d): "
+                  L"merging from Mac OS disc\n",
+                  g_BootContext.SystemPresent, g_BootContext.FinderPresent);
+            BootLocateSystemFolderHfs();
         }
     }
 
@@ -2853,6 +2938,13 @@ PpcLoadSystemFiles (
     if (g_BootContext.SystemFileCount > 0) {
         return EFI_ALREADY_STARTED;
     }
+
+    // The guest (nanokernel/DR) wipes the first 8 KB of low RAM during boot,
+    // so the 'EFI!' low-memory marker written by PpcPrepareSystemForBoot is
+    // gone by the time we stage files. Re-arm it here so the post-staging
+    // self-test really validates the staging paths (which must never touch
+    // low memory) rather than reflecting the guest's deliberate wipe.
+    BootWriteWord32(PPC_LOW_MEM_GUEST_BASE + PPC_LOW_MEM_MAGIC_OFFSET, 0x45464921u);
 
     Status = BootEnsureSystemArea();
     if (EFI_ERROR(Status)) {

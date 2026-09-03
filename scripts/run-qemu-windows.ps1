@@ -55,7 +55,7 @@ if (-not (Test-Path $Vars)) {
 $Args = @(
     "-drive", "if=pflash,format=raw,readonly=on,file=$(Join-Path $Ovmf 'usr\share\OVMF\OVMF_CODE_4M.fd')",
     "-drive", "if=pflash,format=raw,file=$Vars",
-    "-m", "512",
+    "-m", "1024",
     "-drive", "file=fat:rw:$Esp,format=raw"
 )
 if ($MacDisc -ne "") {

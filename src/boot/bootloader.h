@@ -137,6 +137,18 @@ enum {
 // Low-memory global offsets (emulator-defined boot info block)
 #define PPC_LOW_MEM_MAGIC_OFFSET    0x0000
 #define PPC_LOW_MEM_BOOTINFO_OFFSET 0x0100
+// Boot-info block fields at PPC_LOW_MEM_BOOTINFO_OFFSET. Field 0..4 = RAM
+// base/size, ROM base/size, ROM type (see PpcPrepareSystemForBoot). Field +20
+// carries the guest base of the staged 68K OS bootstrap file so the DR handoff
+// (which jumps to low-RAM 0x0) can relocate the real 68K boot stub there.
+#define PPC_LOW_MEM_BOOTINFO_OSRUNTIME_OFFSET  20
+
+// Guest area where the classic Mac OS 68K bootstrap file (the "System" data
+// fork) is staged during boot prep, ready for the DR handoff to relocate its
+// 68K boot stub into low RAM. Backed by the mapped nanokernel system area
+// (0x68000000-0x70000000), well clear of the NK's own 0x68F0-0x68FF usage.
+#define PPC_OS_RUNTIME_GUEST_BASE  0x68E00000
+#define PPC_OS_RUNTIME_MAX_SIZE    0x01000000  // 16 MB (fits the 7 MB System)
 
 // System Folder layout on the boot volume (classic Mac OS)
 #define PPC_SYSTEM_FOLDER_PATH      L"\\System Folder"
@@ -412,6 +424,21 @@ PpcInstallNkSystemArea (
 EFI_STATUS
 EFIAPI
 PpcRunBootSelfTest (
+    VOID
+    );
+
+/**
+  Stage the classic Mac OS 68K System data fork into guest RAM (the OS-runtime
+  area at PPC_OS_RUNTIME_GUEST_BASE) and record its guest base in the boot-info
+  block. The DR handoff later relocates the 68K boot stub from this file to
+  low-RAM 0x0. No-op if already staged or if no HFS volume is mounted.
+  @retval EFI_SUCCESS       OS runtime staged (or already staged)
+  @retval EFI_NOT_FOUND     No "System" file on the mounted volume
+  @retval EFI_STATUS        Other errors from the HFS read / guest write
+**/
+EFI_STATUS
+EFIAPI
+PpcStageOsRuntime (
     VOID
     );
 

@@ -23,6 +23,7 @@
 #include "translation.h"
 #include "boot/bootloader.h"
 #include "hardware/abstraction.h"
+#include "fs/hfs.h"
 
 // ---------------------------------------------------------------------------
 // Register shorthands (DR emulator mapping)
@@ -228,6 +229,13 @@ EmulDriveToDevice (
 // Perform a Prime read/write against the mapped device using the standard
 // IOParam field offsets: ioBuffer +22, ioReqCount +26, ioActCount +30,
 // ioPosMode +34, ioPosOffset +36.
+//
+// Reads are routed through the in-emulator HFS volume when one is mounted:
+// the guest-visible byte offset is translated by the volume's logical->physical
+// base (VolumeBase) and bounded by the volume size, so the guest's own HFS
+// driver sees a self-consistent block device. When no HFS volume is mounted
+// (or the requested range lies past the volume), the raw UEFI block device at
+// the absolute offset is read as a fallback.
 static UINT32
 EmulDiskPrimeTransfer (
     IN UINT32 Pb,
@@ -235,11 +243,14 @@ EmulDiskPrimeTransfer (
     )
 {
     PPC_BLOCK_DEVICE_INFO Dev;
+    PPC_HFS_VOLUME_INFO Vol;
     UINT32 Buffer = EmulRl(Pb + 22);
     UINT32 ReqCount = EmulRl(Pb + 26);
     UINT32 PosOffset = EmulRl(Pb + 36);
     UINT16 RefNum = EmulRw(Pb + 14);
     UINTN Device;
+    BOOLEAN UseVolume = FALSE;
+    UINT64 VolumeBytes = 0;
     UINT64 BytePos;
     UINTN Remaining;
     UINT8 Sector[2048];
@@ -254,8 +265,34 @@ EmulDiskPrimeTransfer (
         return 64;                            // nsDrvErr
     }
 
+    // If the in-emulator HFS reader has a volume mounted on this same device,
+    // present it as the boot disk: use its byte range to bound the PRIME reads
+    // so the guest's own HFS driver never walks off the end of the filesystem.
+    if (!EFI_ERROR(PpcHfsGetVolumeInfo(&Vol)) && Vol.Mounted &&
+        (UINTN)Vol.DeviceIndex == Device) {
+        UseVolume = TRUE;
+        VolumeBytes = Vol.TotalBytes;
+    }
+
+    // Raw media bytes at BytePos (absolute). On a raw-at-0 volume (the common
+    // boot case) VolumeBase==0, so absolute reads already coincide with the
+    // volume. For APM/ISO-embedded volumes the guest PRIME offsets are absolute
+    // media offsets, which is what the APM-scanning driver expects; the volume
+    // bounds below keep those reads inside the filesystem.
     BytePos = (UINT64)PosOffset & ~0xFFu;     // long portion of ioPosOffset
     Remaining = ReqCount;
+
+    // Bound the transfer to the in-emulator volume so a guest reading past the
+    // filesystem end gets a defined short read instead of walking off into
+    // unrelated media / non-existent blocks.
+    if (UseVolume && BytePos + Remaining > VolumeBytes) {
+        if (BytePos >= VolumeBytes) {
+            EmulWl(Pb + 30, 0);               // ioActCount = 0 (past EOF)
+            return 0;
+        }
+        Remaining = (UINTN)(VolumeBytes - BytePos);
+    }
+
     while (Remaining > 0 && Buffer != 0) {
         UINTN BlockSize = Dev.BlockSize ? Dev.BlockSize : 512;
         EFI_LBA Lba;
