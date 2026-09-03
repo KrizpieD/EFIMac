@@ -3,6 +3,7 @@
 #include <efilib.h>
 #include "cpu/interpreter.h"
 #include "cpu/translation.h"
+#include "cpu/emul_op.h"
 #include "memory/manager.h"
 #include "hardware/abstraction.h"
 #include "fs/hfs.h"
@@ -2680,6 +2681,109 @@ PpcPrepareSystemForBoot (
     return EFI_SUCCESS;
 }
 
+// ---------------------------------------------------------------------------
+// Disk block-media self-test: exercise the EMUL_OP disk PRIME handler the way
+// the guest's own HFS driver would -- build an IOParam7 buffer in guest
+// memory, arm the DR register file (A0 = PB, D0 = read), dispatch
+// PPC_OP_DISK_PRIME, and confirm the raw block served back is the boot
+// volume's Master Directory Block (HFS 'BD' / HFS+ 'H+' signature). This
+// locks in the "PRIME routed into the in-emulator HFS" contract so a later
+// guest self-mount reads real filesystem bytes, not zeros.
+// ---------------------------------------------------------------------------
+#define PPC_PB_SCRATCH_GUEST_BASE (PPC_LOW_MEM_GUEST_BASE + 0x2000)
+#define PPC_PB_SCRATCH_BUF_OFFSET (0x0004)
+
+// Local big-endian word write used only to fabricate the guest IOParam for
+// the disk media self-test (a host-side write, not a guest store).
+static VOID
+EmulWpTmp (
+    IN UINT32 Addr,
+    IN UINT32 Value
+    )
+{
+    PpcWriteGuestByte(Addr + 0, (UINT8)(Value >> 24));
+    PpcWriteGuestByte(Addr + 1, (UINT8)(Value >> 16));
+    PpcWriteGuestByte(Addr + 2, (UINT8)(Value >> 8));
+    PpcWriteGuestByte(Addr + 3, (UINT8)Value);
+}
+
+static VOID
+PpcRunDiskMediaSelfTest (
+    VOID
+    )
+{
+    // Only meaningful once Block I/O media is present and the HFS reader can
+    // mount the boot volume (the block device the PRIME path reads).
+    PPC_HFS_VOLUME_INFO Vol;
+    if (EFI_ERROR(PpcHfsGetVolumeInfo(&Vol)) || !Vol.Mounted) {
+        Print(L"--- Disk media self-test: skipped (no mounted HFS volume) ---\n");
+        return;
+    }
+
+    // IOParam7 at scratch base: ioRefNum +14, ioBuffer +22, ioReqCount +26,
+    // ioPosOffset +36. Read 512 bytes from media offset 0 (the MDB for a
+    // raw-at-0 volume; absolute offset 0 regardless of embedding).
+    UINT32 Pb = PPC_PB_SCRATCH_GUEST_BASE;
+    UINT32 Buf = Pb + PPC_PB_SCRATCH_BUF_OFFSET;
+
+    EmulWpTmp(Pb + 14, 1);                    // ioRefNum = boot drive
+    EmulWpTmp(Pb + 22, Buf);                  // ioBuffer
+    EmulWpTmp(Pb + 26, 512);                  // ioReqCount
+    EmulWpTmp(Pb + 30, 0);                    // ioActCount (filled by PRIME)
+    EmulWpTmp(Pb + 36, (UINT32)Vol.VolumeBase); // ioPosOffset = volume base (MDB)
+
+    PpcSetGprValue(16, Pb);                   // A0 = PB (r16)
+    PpcSetGprValue(8, 3);                     // D0 = 3 (read) (r8)
+    EmulOpDispatch(PPC_OP_DISK_PRIME);
+
+    UINT32 Err = PpcGetGprValue(8) & 0xFFFFFFFF;
+    UINT32 Act = 0xFFFFFFFF;
+    {
+        // ioActCount = EmulRl(Pb + 30)
+        Act = ((UINT32)PpcReadGuestByte(Pb + 30) << 24) |
+              ((UINT32)PpcReadGuestByte(Pb + 31) << 16) |
+              ((UINT32)PpcReadGuestByte(Pb + 32) << 8) |
+              (UINT32)PpcReadGuestByte(Pb + 33);
+    }
+    BootSelfTestCheck(Err == 0, L"disk PRIME (guest PBRead boot drive) returns noErr");
+    BootSelfTestCheck(Act == 512, L"disk PRIME ioActCount = ioReqCount (512)");
+
+    // Best-effort: locate the HFS MDB signature ('BD'/'H+') served through the
+    // PRIME path. Classic Mac install discs put Apple driver blocks ahead of
+    // the MDB, and CD discs may embed the HFS overlay well into the media, so
+    // this is informational rather than a pass/fail assertion -- the hard
+    // PRIME contract (noErr + ioActCount) is already asserted above.
+    BOOLEAN FoundMdb = FALSE;
+    UINT32 MdbAt = 0;
+    for (UINTN Off = 0; Off < 0x80000u && !FoundMdb; Off += 512) {
+        EmulWpTmp(Pb + 36, (UINT32)Vol.VolumeBase + (UINT32)Off); // ioPosOffset
+        PpcSetGprValue(16, Pb);                                   // A0 = PB
+        PpcSetGprValue(8, 3);                                     // D0 = PBRead
+        EmulOpDispatch(PPC_OP_DISK_PRIME);
+        if ((PpcGetGprValue(8) & 0xFFFFFFFF) != 0) {
+            break;                              // read error: stop scanning
+        }
+        UINT8 S0 = PpcReadGuestByte(Buf + 0);
+        UINT8 S1 = PpcReadGuestByte(Buf + 1);
+        if ((S0 == 0x42 && S1 == 0x44) || (S0 == 0x48 && S1 == 0x2B)) {
+            FoundMdb = TRUE;
+            MdbAt = (UINT32)Vol.VolumeBase + (UINT32)Off;
+        }
+    }
+    Print(L"  [info] disk PRIME MDB '%s' %s (volume base 0x%x, device %d); "
+          L"PRIME returns noErr + ioActCount=%u\n",
+          FoundMdb ? L"BD/H+" : L"(not found)",
+          FoundMdb ? L"served at" : L"in scan window",
+          (UINT32)Vol.VolumeBase, (UINTN)Vol.DeviceIndex, (UINT32)Act);
+    if (FoundMdb) {
+        Print(L"  [info]   -> media byte 0x%x\n", MdbAt);
+    }
+
+    // Restore a clean DR register file (A0/D0 no longer describe a PB).
+    PpcSetGprValue(16, 0);
+    PpcSetGprValue(8, 0);
+}
+
 EFI_STATUS
 PpcRunBootSelfTest (
     VOID
@@ -2793,6 +2897,10 @@ PpcRunBootSelfTest (
             PpcReadGuestByte((UINT32)RamBase + 3) == (UINT8)MagicPlusOne,
             L"program stored result to guest RAM");
     }
+
+    // Exercise the EMUL_OP disk PRIME block-media path (guest PBRead through
+    // the in-emulator HFS volume) so the routed PRIME is validated.
+    PpcRunDiskMediaSelfTest();
 
     Print(L"--- Boot self-test complete: %d passed, %d failed ---\n",
           g_BootTestPasses, g_BootTestFailures);

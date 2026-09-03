@@ -516,7 +516,11 @@ EmulOpDispatch (
     // ---- Generic disk ---------------------------------------------------
     case PPC_OP_DISK_OPEN:     RD(0) = EmulDriverOpen(RA(0), RA(1), FALSE); break;
     case PPC_OP_DISK_PRIME:
-        RD(0) = EmulDiskPrimeTransfer(RA(0), (RD(0) & 0xFFFF) == 3);
+        // D0 carries the File Manager function code for the transfer. The
+        // read-mostly boot media only refuses writes, so treat function 4
+        // (PBWrite = fsmWrite/write) as a write and everything else (e.g. 3
+        // = PBRead/read) as a read.
+        RD(0) = EmulDiskPrimeTransfer(RA(0), (RD(0) & 0xFFFF) == 4);
         break;
     case PPC_OP_DISK_CONTROL:  RD(0) = EmulDriverControl(RA(0)); break;
     case PPC_OP_DISK_STATUS:   RD(0) = EmulDriverStatus(RA(0)); break;
