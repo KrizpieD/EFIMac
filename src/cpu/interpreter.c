@@ -8,6 +8,20 @@
 // Global PowerPC CPU context (backing store for the interpreter and the
 // public register accessor API)
 PPC_CPU_CONTEXT g_PpcContext = {0};
+// KCKCJUMP latch: set by PpcExecuteInstruction when a DR dispatch branch
+// (bctr-form) lands in the kckc-filled data region below the emulator base;
+// PpcRunGuest dumps the tail ring + ECB context once it observes the latch.
+static UINTN  gKckcJumpPending = 0;
+static UINT32 gKckcPc  = 0;
+static UINT32 gKckcCtr = 0;
+static UINT32 gKckcR29 = 0;
+static UINT32 gKckcR24 = 0;
+static UINT32 gKckcR27 = 0;
+static UINT32 gKckcR28 = 0;
+static UINT32 gKckcR30 = 0;
+static UINT32 gKckcR31 = 0;
+static UINT32 gKckcCr  = 0;
+static UINT32 gKckcLr  = 0;
 
 // ---------------------------------------------------------------------------
 // PPC-native pivot switch (see ARCHITECTURE.md "Architectural Reference").
@@ -3454,6 +3468,23 @@ PpcExecuteInstruction (
                 if (PpcBranchTaken(BO(w), BI(w))) {
                     Next = Target;
                 }
+                // DR dispatch trap: if this branch jumps into the kckc-filled
+                // data region below the emulator base, record the snapshot; the
+                // tail ring (with r29/CTR) lives in PpcRunGuest which dumps it.
+                if (PpcBranchTaken(BO(w), BI(w)) && Target >= 0x40900000 &&
+                    Target < 0x40B60000 && gKckcJumpPending == 0) {
+                    gKckcJumpPending = 1;
+                    gKckcPc  = CurrentAddress;
+                    gKckcCtr = Target;
+                    gKckcR29 = g_PpcContext.Gpr[29];
+                    gKckcR24 = g_PpcContext.Gpr[24];
+                    gKckcR27 = g_PpcContext.Gpr[27];
+                    gKckcR28 = g_PpcContext.Gpr[28];
+                    gKckcR30 = g_PpcContext.Gpr[30];
+                    gKckcR31 = g_PpcContext.Gpr[31];
+                    gKckcCr  = g_PpcContext.Cr;
+                    gKckcLr  = g_PpcContext.Lr;
+                }
             }
             break;
 
@@ -4701,6 +4732,8 @@ UINTN TbProbe = 0;
     static UINT32 TailR15[4096];
     static UINT32 TailR16[4096];
     static UINT32 TailCr[4096];
+    static UINT32 TailR29[4096];
+    static UINT32 TailCtr[4096];
     static UINT32 PcsDumped = 0;
     static UINT32 TraceDumped = 0;
     static UINT32 StoreProbed = 0;
@@ -5100,6 +5133,80 @@ UINTN TbProbe = 0;
                   CpuRead32(g_PpcContext.Gpr[24]),
                   CpuRead16(0x4080002A), CpuRead16(0x4080002C),
                   CpuRead32(0xB814), CpuRead32(0xB074));
+            {
+                // WALK probe (diagnostic, one-time): when the boot falls into the
+                // kckc data region we dump the live DR dispatch code the interpreter
+                // has been executing at 0x40B6D7xx (the branch/PC-relative handler)
+                // plus the dispatch-home loop 0x40B67A00-0x40B67C80 and the
+                // emulator-coldstart 0x40B6E964, so we can confirm the executing
+                // bytes (vs. the ROM file) and whether the rlwimi dispatch-bit-20
+                // neutralization actually landed in the live buffer.
+                UINT32 A;
+                Print(L"  WALKDR dispatch 0x40B6D740-0x40B6D820:\n");
+                for (A = 0x40B6D740; A < 0x40B6D820; A += 16) {
+                    Print(L"    [0x%08x] %08x %08x %08x %08x\n",
+                          A, CpuRead32(A), CpuRead32(A + 4),
+                          CpuRead32(A + 8), CpuRead32(A + 0xC));
+                }
+                Print(L"  WALKDR home 0x40B67A00-0x40B67C80:\n");
+                for (A = 0x40B67A00; A < 0x40B67C80; A += 16) {
+                    Print(L"    [0x%08x] %08x %08x %08x %08x\n",
+                          A, CpuRead32(A), CpuRead32(A + 4),
+                          CpuRead32(A + 8), CpuRead32(A + 0xC));
+                }
+                Print(L"  WALKDR home2 0x40B67C80-0x40B67F00 (rlwimi sites):\n");
+                for (A = 0x40B67C80; A < 0x40B67F00; A += 16) {
+                    Print(L"    [0x%08x] %08x %08x %08x %08x\n",
+                          A, CpuRead32(A), CpuRead32(A + 4),
+                          CpuRead32(A + 8), CpuRead32(A + 0xC));
+                }
+                Print(L"  WALKDR rlwimi sites 0x40B688C8 0x40B6960C/90/E8 0x40B69744/A0 0x40B6C680 0x40B6D384 0x40B6DDE4:\n");
+                {
+                    static const UINT32 Sites[] = {
+                        0x40B688C0, 0x40B69600, 0x40B69680, 0x40B696D0,
+                        0x40B69730, 0x40B69790, 0x40B6C670, 0x40B6D370,
+                        0x40B6DDD0
+                    };
+                    UINTN S;
+                    for (S = 0; S < sizeof(Sites)/sizeof(Sites[0]); S++) {
+                        A = Sites[S];
+                        Print(L"    [0x%08x] %08x %08x %08x %08x\n",
+                              A, CpuRead32(A), CpuRead32(A + 4),
+                              CpuRead32(A + 8), CpuRead32(A + 0xC));
+                    }
+                }
+                Print(L"  WALKDR coldstart 0x40B6E940-0x40B6E9A0:\n");
+                for (A = 0x40B6E940; A < 0x40B6E9A0; A += 16) {
+                    Print(L"    [0x%08x] %08x %08x %08x %08x\n",
+                          A, CpuRead32(A), CpuRead32(A + 4),
+                          CpuRead32(A + 8), CpuRead32(A + 0xC));
+                }
+                Print(L"  WALKDR table bases (opcode-0 slots + region heads):\n");
+                for (A = 0x40A80000; A < 0x40A80040; A += 16) {
+                    Print(L"    [0x%08x] %08x %08x %08x %08x\n",
+                          A, CpuRead32(A), CpuRead32(A + 4),
+                          CpuRead32(A + 8), CpuRead32(A + 0xC));
+                }
+                for (A = 0x40AFC000; A < 0x40AFC040; A += 16) {
+                    Print(L"    [0x%08x] %08x %08x %08x %08x\n",
+                          A, CpuRead32(A), CpuRead32(A + 4),
+                          CpuRead32(A + 8), CpuRead32(A + 0xC));
+                }
+                Print(L"    [0x40B00000] %08x %08x %08x %08x\n",
+                      CpuRead32(0x40B00000), CpuRead32(0x40B00004),
+                      CpuRead32(0x40B00008), CpuRead32(0x40B0000C));
+                for (A = 0x40B80000; A < 0x40B80040; A += 16) {
+                    Print(L"    [0x%08x] %08x %08x %08x %08x\n",
+                          A, CpuRead32(A), CpuRead32(A + 4),
+                          CpuRead32(A + 8), CpuRead32(A + 0xC));
+                }
+                Print(L"  WALKDR ECB slots 0xB2C0-0xB300 (ctx[r26..r31] + pc):\n");
+                for (A = 0x0000B2C0; A < 0x0000B300; A += 16) {
+                    Print(L"    [0x%08x] %08x %08x %08x %08x\n",
+                          A, CpuRead32(A), CpuRead32(A + 4),
+                          CpuRead32(A + 8), CpuRead32(A + 0xC));
+                }
+            }
         }
         // Arrival at the NK call-table[0] target after the emulator-start
         // routine's blr. Dump the runtime code once to see whether the NK
@@ -5615,8 +5722,37 @@ UINTN TbProbe = 0;
     TailR15[TailStart] = g_PpcContext.Gpr[15];
     TailR16[TailStart] = g_PpcContext.Gpr[16];
     TailCr[TailStart] = g_PpcContext.Cr;
+    TailR29[TailStart] = g_PpcContext.Gpr[29];
+    TailCtr[TailStart] = g_PpcContext.Ctr;
         TailStart = (TailStart + 1) % 4096;
         if (TailCount < 4096) TailCount++;
+        // Latched by PpcExecuteInstruction when a DR dispatch bctr lands in the
+        // kckc-filled region. The tail ring now holds the instruction stream up
+        // to and including that branch: dump the r29/CTR evolution so the
+        // instruction that corrupted the dispatch-table base is visible.
+        if (gKckcJumpPending == 1) {
+            UINTN I;
+            UINTN N = (TailCount < 96) ? TailCount : 96;
+            CHAR16 Mn[16];
+            Print(L"  KCKCJUMP@PC=0x%08x CTR=0x%08x r29=0x%08x r24(68Kpc)=0x%08x "
+                  L"r27=0x%08x r28=0x%08x r30=0x%08x r31=0x%08x CR=0x%08x LR=0x%08x\n",
+                  gKckcPc, gKckcCtr, gKckcR29, gKckcR24, gKckcR27, gKckcR28,
+                  gKckcR30, gKckcR31, gKckcCr, gKckcLr);
+            for (I = 0; I < N; I++) {
+                UINTN Idx = (TailStart + TailCount - 1 - I) % 4096;
+                PpcDecodeInstruction(TailInst[Idx], Mn, sizeof(Mn));
+                Print(L"  KCKC[-%d] PC=0x%08x 0x%08x %s -> 0x%08x "
+                      L"r24=0x%08x r27=0x%08x r29=0x%08x CTR=0x%08x CR=0x%08x\n",
+                      (UINTN)I + 1, TailPc[Idx], TailInst[Idx], Mn, TailNext[Idx],
+                      TailR24[Idx], TailR27[Idx], TailR29[Idx], TailCtr[Idx], TailCr[Idx]);
+            }
+            Print(L"  KCKC ECB ctx: [1c4]=0x%08x [1cc]=0x%08x [1dc]=0x%08x "
+                  L"[1ec]=0x%08x [1f4]=0x%08x [1fc]=0x%08x [b074]=0x%08x [b078]=0x%08x\n",
+                  CpuRead32(0xB1C4), CpuRead32(0xB1CC), CpuRead32(0xB1DC),
+                  CpuRead32(0xB1EC), CpuRead32(0xB1F4), CpuRead32(0xB1FC),
+                  CpuRead32(0xB074), CpuRead32(0xB078));
+            gKckcJumpPending = 2; // dumped once
+        }
         if (TailProbed == 0 && (Current == 0x40B6CA68 || Current == 0x40B6CA78 || Current == 0x40B6CA84 || Current == 0x40B6CA88)) {
             TailProbed = 1;
             Print(L"  MOVE-SR-TAIL PC=0x%08x r3=0x%08x r24=0x%08x r27=0x%08x r25=0x%08x r28=0x%08x r31=0x%08x CR=0x%08x CR0=%x CR2=%x CR5=%x CR7=%x\n",

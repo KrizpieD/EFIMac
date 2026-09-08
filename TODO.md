@@ -482,7 +482,16 @@ only as a later legacy-runtime fallback for the Classic app layer.
 - **New World ROM patching** (`PpcPatchNewWorldRom`): ConfigInfo LA fields
   redirected, twi kernel-trap table rewritten, 5 emulator-entry routines
   installed, EMUL_OP dispatch markers installed, rlwimi dispatch-bit-20
-  neutralised, XLM globals seeded.
+  neutralised, XLM globals seeded. NOTE (2026-09-07): the bit-20
+  neutralisation now decodes the instruction instead of matching the
+  `0x531DA2D6` byte pattern; the DR dispatch families `0x501DA2D6`,
+  `0x507DA2D6`, `0x509DA2D6`, `0x509D1B78`, `0x50DD1B78` also zero bit 20
+  of the table base (0x40B80000 -> 0x40A80000 kckc) and were being missed.
+  With all 23 sites neutralised the DR dispatch works: 68K emulation now
+  runs ~1.4M instructions and the 68K PC advances (0xAAD2 -> ...). New
+  blocker: the run ends at `bclr` with LR=0x40BFFFF8 after dispatching a
+  bogus 68K word 0xFB30 (r27=0xFFFFFB30) read near 68K PC 0xAFCA; boot
+  stops on the ROM-end reserved word `0x00000808`.
 - **68K DR-emulator hook** at `0x40B67C60`: the PPC interpreter intercepts the
   common dispatch and calls `M68kExecuteFromPPC()` for native 68K execution.
 - **PPC-level 68K opcode hooks**: MOVE SR (0x46FC), RESET (0x4E70), escape

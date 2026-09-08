@@ -2425,20 +2425,32 @@ PpcPatchNewWorldRom (
     RomWriteEmulatorClassHelper(Rom, 0x36F7D0);
 #endif // FAITHFUL handoff retired
 
-    // The ROM's control-flow dispatch glue bakes `rlwimi r29,r24,0x14,0xb,0xb`
-    // (0x531DA2D6) into every branch/jmp path: it copies the low bit of the
-    // 68K PC into bit 20 (0x100000) of the dispatch address. For valid 68K
+    // The ROM's control-flow dispatch glue bakes a family of
+    // `rlwimi r29,...` words that force bit 20 (0x100000) of the
+    // dispatch-table base to 0: they copy the low bit of the 68K PC (held
+    // in r24/r1/r3/...) into bit 20 of the dispatch address. For valid 68K
     // code (always word-aligned) that bit is 0, which zeroes bit 20 of the
     // opcode-table base. The dispatch table lives at 0x40b80000 (bit 20 = 1),
     // so every control-flow re-dispatch would land 0x100000 off (in the "kckc"
     // data region) and the boot walks garbage. On real hardware the table base
-    // has bit 20 = 0 and the rlwimi is a harmless no-op; with our base it must
-    // be neutralised. NOP every occurrence in the emulator image.
+    // has bit 20 = 0 and the rlwimi is a harmless no-op; with our base every
+    // rlwimi whose bitmask covers bit 20 must be neutralised. The encoding
+    // family varies (SH/MB/ME span, RS register, mask width: 0x531DA2D6 /
+    // 0x501DA2D6 / 0x537DA2D6 / 0x509D1B78 / 0x50DD1B78 ...), so decode the
+    // instruction rather than matching a byte pattern.
     {
         UINT32 Count = 0;
         for (I = 0x360000; I + 4 <= 0x380000; I += 4) {
-            if (Rom[I] == 0x53 && Rom[I + 1] == 0x1D &&
-                Rom[I + 2] == 0xA2 && Rom[I + 3] == 0xD6) {
+            const UINT32 W = ((UINT32)Rom[I] << 24) |
+                             ((UINT32)Rom[I + 1] << 16) |
+                             ((UINT32)Rom[I + 2] << 8) | Rom[I + 3];
+            const UINT32 MB = (W >> 6) & 0x1F;
+            const UINT32 ME = (W >> 1) & 0x1F;
+            const int CoversBit20 =
+                (MB <= ME) ? (MB <= 11 && 11 <= ME) : (11 >= MB || 11 <= ME);
+            if (((W >> 26) & 0x3F) == 20 &&   // rlwimi
+                ((W >> 16) & 0x1F) == 29 &&   // RA = r29 (table base)
+                CoversBit20) {
                 RomPatchWriteWord32(Rom, I, 0x60000000);
                 Count++;
             }
