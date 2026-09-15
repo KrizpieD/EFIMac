@@ -86,9 +86,16 @@ efi_main (
   
   // Initialize the GNU-EFI library
   InitializeLib(ImageHandle, SystemTable);
+
+  // OVMF's BDS arms a 5-minute UEFI WatchdogTimer before dispatching our boot
+  // option. Because the guest never returns from the emulator loop, that
+  // watchdog fires ~300s in and resets the platform (observed as a guest reset
+  // in every long run). Cancel it so the emulator can run indefinitely.
+  gBS->SetWatchdogTimer(0, 0, 0, NULL);
+  Print(L"UEFI watchdog cancelled\n");
   
   // Print welcome message
-  Print(L"EFI Mac OS Boot Layer v0.2\n");
+  Print(L"EFI Mac OS Boot Layer v0.2-A207G1 [%x]\n", 0x81AD3A13);
   Print(L"Heavy bootloader for classic Mac OS (System 7, Mac OS 8/9) via UEFI\n");
   Print(L"Initializing PowerPC environment...\n");
   

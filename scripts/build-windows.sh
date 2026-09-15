@@ -3,7 +3,7 @@
 # Run from git-bash. Usage: bash scripts/build-windows.sh
 set -euo pipefail
 
-LLVM_BIN="/c/Program Files/LLVM/bin"
+LLVM_BIN="/c/Program Files/LLVM/bin"; LLVM_BIN_WIN="C:/Program Files/LLVM/bin"
 export PATH="$LLVM_BIN:$PATH"
 
 cd "$(dirname "$0")/.." || exit 1

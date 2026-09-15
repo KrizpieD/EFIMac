@@ -12,6 +12,7 @@
 #include "translation.h"
 #include "emul_op.h"
 #include "boot/bootloader.h"
+#include "fs/hfs.h"
 #include <efi.h>
 #include <efilib.h>
 #include <lib.h>
@@ -215,6 +216,18 @@ M68kReadByte (
     IN UINT32 Address
     )
 {
+    // Classic ROM alias banks: real Old-World hardware decodes the whole
+    // 0xA8-0xAB range down to the 4MB ROM chip (the 68K VBL/handler code
+    // lives there, e.g. level-1 autovector -> 0xA9C97063). The 0xF8-0xFF
+    // range is the same 4MB ROM aliased at the top of the 68K space (the
+    // DR-era OS keeps 68K thunk/jump tables there). Repeat the same 4MB
+    // guest ROM image that sits at 0x40800000.
+    if (Address >= 0xA8000000u && Address < 0xAC000000u) {
+        return PpcReadGuestByte (0x40800000u + (Address & 0x3FFFFFu));
+    }
+    if (Address >= 0xF8000000u) {
+        return PpcReadGuestByte (0x40800000u + (Address & 0x3FFFFFu));
+    }
     return PpcReadGuestByte (Address);
 }
 
@@ -260,6 +273,23 @@ M68kWriteWord (
                    Value, Address, g_M68kContext.PC);
         }
     }
+    {
+        // Low-RAM write watch during the 68K boot routine window: does the
+        // ROM's boot glue/copy actually write anything below 0x1000 (the
+        // 0x112 handoff targets)? A0/A1 = the source/dest registers.
+        static UINTN LrWWHits = 0;
+        if (LrWWHits < 24 && Address < 0x1000u &&
+            g_M68kContext.PC >= 0x40809000u &&
+            g_M68kContext.PC < 0x4080E400u) {
+            LrWWHits++;
+            Print (L"68K RAMWRITE.W val=0x%04x -> [0x%04x] @PC=0x%08x "
+                   L"A0=%08x A1=%08x A2=%08x A4=%08x SP=%08x\n",
+                   Value, Address, g_M68kContext.PC,
+                   g_M68kContext.A[0], g_M68kContext.A[1],
+                   g_M68kContext.A[2], g_M68kContext.A[4],
+                   M68kGetStackPointer ());
+        }
+    }
     PpcWriteGuestByte (Address, (UINT8)(Value >> 8));
     PpcWriteGuestByte (Address + 1, (UINT8)Value);
 }
@@ -280,6 +310,20 @@ M68kWriteLong (
                    Value, Address, g_M68kContext.PC,
                    g_M68kContext.A[0], g_M68kContext.A[1],
                    M68kGetStackPointer ());
+        }
+    }
+    {
+        static UINTN LrWLHits = 0;
+        if (LrWLHits < 24 && Address < 0x1000u &&
+            g_M68kContext.PC >= 0x40809000u &&
+            g_M68kContext.PC < 0x4080E400u) {
+            LrWLHits++;
+            Print (L"68K RAMWRITE val=0x%08x -> [0x%04x] @PC=0x%08x "
+                   L"A0=%08x A1=%08x A2=%08x A4=%08x D0=%08x SP=%08x\n",
+                   Value, Address, g_M68kContext.PC,
+                   g_M68kContext.A[0], g_M68kContext.A[1],
+                   g_M68kContext.A[2], g_M68kContext.A[4],
+                   g_M68kContext.D[0], M68kGetStackPointer ());
         }
     }
     {
@@ -2056,6 +2100,14 @@ M68kExecuteRte (
     g_M68kContext.Supervisor = (g_M68kContext.SR & M68K_SR_S) != 0;
     g_M68kContext.PC = M68kPopLong ();
     g_M68kInInterrupt = FALSE;
+    {
+        static UINTN RteCount = 0;
+        if (RteCount < 8) {
+            RteCount++;
+            Print (L"  68K RTE -> PC=0x%08x SR=0x%04x\n",
+                   g_M68kContext.PC, g_M68kContext.SR);
+        }
+    }
 }
 
 // Execute RTR: pop CCR then PC. (Previously routed to RTE, which pops a
@@ -2089,37 +2141,132 @@ M68kExecuteIllegal (
     )
 {
     UINTN K;
+    // DR-era thunk bank: the ROM walks 0xFFFF0000..0xFFFF7FFF as instructions,
+    // but the words there are a PRIVATE opcode table (records of
+    // "3860 0008 4BF7 <index>") that only the DR emulator understands.  Words
+    // with no 68000 meaning (0x4B98, 0x4D08, 0x4E78, ...) are markers, not
+    // faults.  Resume them like the DR would: step past the word and any
+    // effective-address extension a real 68020 would consume.
+    if (g_M68kContext.PC >= 0xFFFF0002u && g_M68kContext.PC <= 0xFFFF8000u) {
+        UINT16 OpAddr = (UINT16) (g_M68kContext.PC - 2);
+        static BOOLEAN DrThunkReported = FALSE;
+        if (!DrThunkReported) {
+            DrThunkReported = TRUE;
+            Print (L"  68K DR-THUNK 0x%04x@0xFFFF%04x resumed (thunk bank)\n",
+                   Opcode, OpAddr);
+        }
+        g_M68kContext.PC += 2;
+        {
+            UINT16 EaM = (Opcode >> 3) & 7;
+            UINT16 EaR = Opcode & 7;
+            if (EaM == 3 || EaM == 4 || EaM == 5 || EaM == 6) {
+                g_M68kContext.PC += 2;      // (d8,An,Xn) / (d16,An)
+            } else if (EaM == 7) {
+                if (EaR == 1)      g_M68kContext.PC += 4;  // ABS.L
+                else if (EaR <= 4) g_M68kContext.PC += 2;  // ABS.W / PC-rel / #imm
+            }
+        }
+        return;
+    }
     Print (L"  68K ILLEGAL INSTRUCTION: 0x%04x at PC=0x%08x\n", Opcode, g_M68kContext.PC - 2);
     {
         static BOOLEAN RingShown = FALSE;
         if (!RingShown) {
             RingShown = TRUE;
-            Print (L"  ILLEGAL last 64 PCs:");
-            for (K = 0; K < 64; K++) {
+            Print (L"  ILLEGAL last 232 PCs:");
+            for (K = 0; K < 232; K++) {
                 UINTN Idx = (g_LastPcIdx + 256 - 1 - K) % 256;
                 Print (L" %08x/%04x", g_LastPcRing[Idx], g_LastOpRing[Idx]);
-                if ((K & 7) == 7) Print (L"\n     ");
+if ((K & 7) == 7) Print (L"\n     ");
             }
             Print (L"\n");
             M68kTraceFlush ();
         }
     }
-    g_M68kContext.Halted = TRUE;
+    // Deliver a real illegal-instruction exception (vector 0x10) exactly
+    // like the hardware, instead of halting the machine.  A fault taken
+    // while ALREADY servicing an exception is a double fault: halt so a
+    // bogus handler cannot spin forever.
+    if (g_M68kInInterrupt) {
+        static BOOLEAN DoubleFaultReported = FALSE;
+        if (!DoubleFaultReported) {
+            DoubleFaultReported = TRUE;
+            Print (L"  68K DOUBLE-FAULT: illegal 0x%04x inside handler "
+                   L"(PC=0x%08x SR=0x%04x) - HALTING\n",
+                   Opcode, g_M68kContext.PC, g_M68kContext.SR);
+        }
+        g_M68kContext.Halted = TRUE;
+        return;
+    }
+    M68kRaiseException (M68K_VEC_ILLEGAL_INSTR);
 }
 
-// Raise a 68K exception
+// Install the low-memory 68K software-vector glue at 0x112.  The guest
+// nanokernel points the early-fault vectors ([0x0C] bus/address error,
+// [0x14] zero-divide, [0x1C]) at 0x112 and expects the ROM's own exception
+// glue there; that ROM stage never ran in our environment, so 0x112 sits
+// zeroed and the first fault marches through zeros into a double fault.
+// Patch in an RTE stub (matching MacOS "continue past the faulting
+// instruction" handler behaviour): the exception frame's saved PC already
+// points past the faulted 68K opcode, so RTE alone resumes the guest exactly
+// where real glue would continue.  Idempotent and cheap enough for a
+// per-batch re-assert (the pool scrubber may zero 0x112 again later).
+static VOID
+M68kEnsureLowVectorGlue (
+    VOID
+    )
+{
+    // LINE-F vector: any 0xFFFF service call must vector here.  The glue
+    // skips the opcode AND the service-selector word, then RTE resumes the
+    // guest past the pair -- the hardware handler's frame convention.
+    if (M68kReadLong (0x2Cu) == 0x400u || M68kReadLong (0x2Cu) == 0u) {
+        M68kWriteLong (0x404, 0x50AF0004u); // ADDQ.L #4,2(SP)
+        M68kWriteWord (0x408, 0x4E73u);     // RTE
+        M68kWriteLong (0x2Cu, 0x404u);
+    }
+    if (M68kReadLong (0x0Cu) == 0x112u ||
+        M68kReadLong (0x14u) == 0x112u ||
+        M68kReadLong (0x1Cu) == 0x112u) {
+        if (M68kReadWord (0x112u) == 0x0000u) {
+            M68kWriteWord (0x112u, 0x4E73u);   // RTE
+            Print (L"  68K low-vector glue: RTE installed at 0x112\n");
+        }
+    }
+}
+
+// Raise a 68K exception with the full 68000 processing side effects.
+//   1. Switches to the supervisor stack (the frame must live on the SSP,
+//      even when the fault occurred in user mode).
+//   2. Hardware interrupts set the interrupt mask to their level.
+//   3. Pushes PC then SR, sets the S bit, and vectors through the
+//      exception table (vector = VectorNumber, address = long at that
+//      low-RAM offset).
+static VOID M68kCaptureLineFSvc (VOID);
+static VOID M68kLineFService (VOID);
+static VOID M68kLineFSvcDispatch (UINT16 Sel);
+VOID M68kLineFScript (VOID);
+
 VOID
 M68kRaiseException (
     IN UINT8 VectorNumber
     )
 {
+    // User mode: the frame goes on the supervisor stack.  Set S first so
+    // the push helpers target the SSP; RTE later restores the user A7.
+    // (The pre-raise context is kept so LINE-F boot services can resume the
+    // guest exactly: those are fast callouts, not persisting exceptions.)
+    UINT32   PreRaiseSr  = g_M68kContext.SR;
+    BOOLEAN  PreRaiseSup = g_M68kContext.Supervisor;
+    UINT32   PreRaiseSp  = PreRaiseSup ? g_M68kContext.SSP : g_M68kContext.A[7];
+    if (!g_M68kContext.Supervisor) {
+        g_M68kContext.SR |= M68K_SR_S;
+        g_M68kContext.Supervisor = TRUE;
+    }
+
     // Push PC then SR
     M68kPushLong (g_M68kContext.PC);
     M68kPushWord (g_M68kContext.SR);
 
-    // Set supervisor mode
-    g_M68kContext.SR |= M68K_SR_S;
-    g_M68kContext.Supervisor = TRUE;
     g_M68kInInterrupt = TRUE;
 
     // Read vector address from exception table
@@ -2130,7 +2277,306 @@ M68kRaiseException (
         g_M68kContext.Halted = TRUE;
         return;
     }
+    // The nanokernel seeds unsupported-vector slots with the 0x80000000
+    // guard value. Real hardware would stop; keep early boot alive by
+    // treating it like a plain "continue past this opcode" fault, same as
+    // the 0x112 glue (the frame's saved PC already points past it).
+    if (VecAddr == 0x80000000u) {
+        static UINTN GuardPatchCount = 0;
+        if (GuardPatchCount < 8) {
+            GuardPatchCount++;
+            Print (L"  68K EXCEPTION %d: guard vector 0x80000000 -> RTE "
+                   L"(continue), retPC=0x%08x\n", VectorNumber,
+                   g_M68kContext.PC);
+        }
+        VecAddr = 0x400u;   // RTE
+    }
+    {
+        static UINTN RaiseCount = 0;
+        if (RaiseCount < 24) {
+            RaiseCount++;
+            Print (L"  68K RAISE #%d vec=%d vecAddr=0x%08x retPC=0x%08x SR=0x%04x\n",
+                   (UINT32)RaiseCount, VectorNumber, VecAddr,
+                   g_M68kContext.PC, g_M68kContext.SR);
+        }
+        if (VecAddr >= 0xA8000000u && VecAddr < 0xAC000000u) {
+            // Execution is entering the classic ROM alias bank: trace the
+            // whole handler (through its first RTE) so we can map what it
+            // does and where it expects the 0xFFFF02xx dispatcher.
+            g_M68kDebugSteps = 600;
+        }
+    }
+    if (VectorNumber == M68K_VEC_LINE_1111) {
+        M68kCaptureLineFSvc ();
+        M68kLineFService ();
+        // Fast return: the ROM DR boot uses LINE-F as a call-out, not a
+        // persisting exception.  Undo the frame entirely, restore the
+        // pre-raise register context, and resume PAST the opcode+selector
+        // pair (SvcPc+4) so the boot script's next pair executes.  Routing
+        // the return through the vec-0x2C glue as *code* (ADDQ.L #4,2(SP);
+        // RTE) misfired on the interpreter: ADDQ to (A7) carries the
+        // extension as a displacement and the RTE frame arithmetic never
+        // landed back in the ROM script (the guest drifted into low-RAM
+        // zeros at 0x40A afterwards).
+        g_M68kContext.SR = PreRaiseSr;
+        g_M68kContext.Supervisor = PreRaiseSup;
+        if (PreRaiseSup) {
+            g_M68kContext.SSP = PreRaiseSp;
+        } else {
+            g_M68kContext.A[7] = PreRaiseSp;
+        }
+        g_M68kInInterrupt = FALSE;
+        // Post-script desert gate: the executed DR boot script ends around
+        // 0x4080E2A8; the ROM past it is 0xFFFF desert that real hardware
+        // never executes.  The LINE-F fast-return would walk that desert
+        // forever, so instead branch into the DR chunk-loader at 0x4080E33C
+        // with the Session-14 walker continuation 0x4080015C synthesized as
+        // the return address (mimics JSR 0xE33C; the loader's RTS lands the
+        // boot back in the low-RAM copy phase).
+        if (g_M68kContext.PC >= 0x4080E2AAu) {
+            UINT32 Sp;
+            static UINTN ScriptEndCount = 0;
+            if (ScriptEndCount < 4) {
+                ScriptEndCount++;
+                Print (L"  68K SCRIPT-END: desert @ 0x%08x sel=0x%04x -> "
+                       L"JSR 0x4080E33C (ret 0x4080015C), SP=0x%08x\n",
+                       g_M68kContext.PC,
+                       M68kFetchWord (g_M68kContext.PC + 2),
+                       (UINT32)M68kGetStackPointer());
+            }
+            Sp = M68kGetStackPointer ();
+            Sp -= 4;
+            M68kWriteLong (Sp, 0x4080015Cu);
+            if (g_M68kContext.Supervisor) {
+                g_M68kContext.SSP = Sp;
+            } else {
+                g_M68kContext.A[7] = Sp;
+            }
+            g_M68kContext.PC = 0x4080E33Cu;
+            return;
+        }
+        g_M68kContext.PC = (UINT32)g_M68kContext.PC + 4;
+        return;
+    }
+    // Classic ROM alias bank: Old-World hardware decodes 0xA8-0xAB down to
+    // the 4MB ROM image. Execute in the canonical 0x408xxxxx domain (all
+    // reads/writes through the M68kRead*/Write* alias) so the batch guards
+    // and drop-in checks see a plain ROM PC.
+    if (VecAddr >= 0xA8000000u && VecAddr < 0xAC000000u) {
+        VecAddr = 0x40800000u + (VecAddr & 0x3FFFFFu);
+    }
     g_M68kContext.PC = VecAddr;
+}
+
+// Capture the LINE-F (vec 0x2C) service-call contract: the selector word
+// follows the 0xFFFF opcode, and boot services pass a mailbox/location in
+// A0/A1.  Dump a bounded record so the boot-read service can be implemented
+// from real data (SheepShaver-spirit: serve the boot reads host-side).
+static VOID
+M68kCaptureLineFSvc (
+    VOID
+    )
+{
+    static UINTN SvcCaptureCount = 0;
+    static UINTN SvcCaptureLimit = 64;
+    UINT32 SvcPc, Sel;
+    UINTN K;
+    if (SvcCaptureCount >= SvcCaptureLimit) return;
+    SvcCaptureCount++;
+    SvcPc = g_M68kContext.PC;               // frame PC = address of 0xFFFF
+    Sel  = M68kFetchWord (SvcPc + 2);       // service selector word
+    Print (L"  LINEF-SVC #%d pc=0x%08x sel=0x%04x\n",
+           (UINT32)SvcCaptureCount, SvcPc, Sel);
+    Print (L"     d0=%08x d1=%08x d2=%08x d3=%08x d4=%08x d5=%08x d6=%08x d7=%08x\n",
+           g_M68kContext.D[0], g_M68kContext.D[1], g_M68kContext.D[2],
+           g_M68kContext.D[3], g_M68kContext.D[4], g_M68kContext.D[5],
+           g_M68kContext.D[6], g_M68kContext.D[7]);
+    Print (L"     a0=%08x a1=%08x a2=%08x a3=%08x a4=%08x a5=%08x a6=%08x sp=%08x\n",
+           g_M68kContext.A[0], g_M68kContext.A[1], g_M68kContext.A[2],
+           g_M68kContext.A[3], g_M68kContext.A[4], g_M68kContext.A[5],
+           g_M68kContext.A[6], M68kGetStackPointer());
+    Print (L"     sel-ctx:");
+    for (K = 0; K < 8; K++) {
+        Print (L" %04x@%08x", M68kFetchWord (SvcPc + 4 + K * 2),
+               SvcPc + 4 + K * 2);
+    }
+    if (g_M68kContext.A[0] >= 0x100u && g_M68kContext.A[0] < 0x100000u) {
+        Print (L"\n     a0-ctx:");
+        for (K = 0; K < 12; K++) {
+            Print (L" %08x@%08x", M68kReadLong (
+                       (UINT32)(g_M68kContext.A[0] + K * 4)),
+                   g_M68kContext.A[0] + K * 4);
+        }
+    }
+    if (SvcCaptureCount == 1) {
+        Print (L"\n     lowRAM block 0xF00-0x1280 on first svc:\n");
+        for (K = 0; K < 144; K++) {
+            if ((K & 7) == 0) Print (L"       %04x: ", (UINT32)(0xF00 + K * 2));
+            Print (L"%04x ", M68kFetchWord ((UINT32)(0xF00 + K * 2)));
+            if ((K & 7) == 7) Print (L"\n");
+        }
+    }
+    Print (L"\n");
+}
+
+// Execute the LINE-F device service for the selector word that follows
+// the 0xFFFF opcode.  Invoked from the vec-0x2C exception path (frame PC
+// still addresses the 0xFFFF opcode).  The result registers are set for
+// the guest; the RTE+4 glue resumes past opcode+selector.
+static VOID
+M68kLineFService (
+    VOID
+    )
+{
+    UINT32 SvcPc = (UINT32)g_M68kContext.PC;
+    M68kLineFSvcDispatch (M68kFetchWord (SvcPc + 2));
+}
+
+// Execute the LINE-F (vec 0x2C) device service for a already-extracted
+// selector word.  See M68kLineFService for the contract discussion.
+static VOID
+M68kLineFSvcDispatch (
+    IN UINT16 Sel
+    )
+{
+    static UINTN SvcServiced = 0;
+    static UINTN SvcServiceLimit = 24;
+    static UINTN RpDumps = 0;
+    UINTN K;
+    if (SvcServiced >= SvcServiceLimit) return;
+    SvcServiced++;
+    switch (Sel) {
+    case 0x9760:   // boot-service table entry (E1xx walk gate)
+    case 0x9420:
+    case 0x8B9C:
+    case 0xFFFC:   // kernel/console service
+    case 0xFFFE:
+        g_M68kContext.D[0] = 0;             // report success
+        break;
+    case 0xFB30:   // rp-kernel boot I/O
+    case 0xFA30:
+        if (RpDumps < 2) {
+            UINT32 Sp;
+            RpDumps++;
+            Print (L"  rp-I/O svc sel=0x%04x d0=%08x a0=%08x a1=%08x a2=%08x sp=%08x\n",
+                   Sel, g_M68kContext.D[0], g_M68kContext.A[0],
+                   g_M68kContext.A[1], g_M68kContext.A[2],
+                   M68kGetStackPointer());
+            Sp = M68kGetStackPointer ();
+            Print (L"     frame@%08x:", Sp);
+            for (K = 0; K < 16; K++) {
+                Print (L" %08x", M68kReadLong ((UINT32)(Sp + (UINT32)(K * 4))));
+            }
+            Print (L"\n     d4=%08x d5=%08x d6=%08x d7=%08x "
+                   L"a3=%08x a4=%08x a5=%08x a6=%08x\n",
+                   g_M68kContext.D[4], g_M68kContext.D[5],
+                   g_M68kContext.D[6], g_M68kContext.D[7],
+                   g_M68kContext.A[3], g_M68kContext.A[4],
+                   g_M68kContext.A[5], g_M68kContext.A[6]);
+            Print (L"\n     e1xx-desc E148-E1D8:");
+            for (K = 0xE148; K < 0xE1D8; K += 8) {
+                Print (L" %08x:%08x", M68kReadLong ((UINT32)K),
+                       M68kReadLong ((UINT32)(K + 4)));
+            }
+            Print (L"\n");
+            if (g_M68kContext.D[3] != 0u && g_M68kContext.D[3] < 0x100000u) {
+                Print (L"     d3(vol/path/base)=0x%08x d4=0x%08x d5=0x%08x\n",
+                       g_M68kContext.D[3], g_M68kContext.D[4],
+                       g_M68kContext.D[5]);
+            }
+            for (K = 0xFC0; K < 0x1100; K += 16) {
+                Print (L"     %04x:%04x %04x %04x %04x %04x %04x %04x %04x\n",
+                       (UINT32)K, M68kFetchWord ((UINT32)K),
+                       M68kFetchWord ((UINT32)(K + 2)),
+                       M68kFetchWord ((UINT32)(K + 4)),
+                       M68kFetchWord ((UINT32)(K + 6)),
+                       M68kFetchWord ((UINT32)(K + 8)),
+                       M68kFetchWord ((UINT32)(K + 10)),
+                       M68kFetchWord ((UINT32)(K + 12)),
+                       M68kFetchWord ((UINT32)(K + 14)));
+            }
+        }
+        g_M68kContext.D[0] = 0;             // report success so the walker
+        break;                              // proceeds to populate the block
+    default:
+        break;                              // unknown: just advance past pair
+    }
+}
+
+// Drain a LINE-F "DR script" region: the low-RAM boot mailbox
+// (0xFC0-0x1800) is a NK-built struct of parameter words, embedded FFFF+
+// selector service pairs, and ASCII message text - NOT executable code.
+// Walking it as code only produced false illegal-opcode faults.  Service
+// the pairs, skip the data/text words, and leave PC just past the region
+// so real boot code can run.
+VOID
+M68kLineFScript (
+    VOID
+    )
+{
+    UINT32 Pc = (UINT32)g_M68kContext.PC;
+    while (Pc >= 0xFC0u && Pc < 0x1800u) {
+        if (M68kFetchWord (Pc) == 0xFFFFu && Pc + 2 < 0x1800u) {
+            UINT16 Sel = M68kFetchWord (Pc + 2);
+            g_M68kContext.PC = Pc;
+            M68kLineFSvcDispatch (Sel);
+            Pc = (UINT32)g_M68kContext.PC + 4;   // skip opcode + selector
+        } else {
+            Pc += 2;                            // parameter / data word
+        }
+    }
+    g_M68kContext.PC = Pc;
+    Print (L"  68K DR-script drained: PC=0x%08x (D0=%08x) ctx:",
+           (UINT32)g_M68kContext.PC, g_M68kContext.D[0]);
+    {
+        UINTN K;
+        for (K = 0; K < 8; K++) {
+            Print (L" %04x@%08x", M68kFetchWord (Pc + (UINT32)(K * 2)),
+                   Pc + (UINT32)(K * 2));
+        }
+    }
+    Print (L"\n");
+    {
+        static UINTN RegionDumped = 0;
+        UINTN K;
+        if (RegionDumped++ == 0) {
+            Print (L"   rp-kernel region 0x2800-0x3100 on first drain:\n");
+            for (K = 0x2800; K < 0x3100; K += 16) {
+                Print (L"     %04x:%04x %04x %04x %04x %04x %04x %04x %04x\n",
+                       (UINT32)K, M68kFetchWord ((UINT32)K),
+                       M68kFetchWord ((UINT32)(K + 2)),
+                       M68kFetchWord ((UINT32)(K + 4)),
+                       M68kFetchWord ((UINT32)(K + 6)),
+                       M68kFetchWord ((UINT32)(K + 8)),
+                       M68kFetchWord ((UINT32)(K + 10)),
+                       M68kFetchWord ((UINT32)(K + 12)),
+                       M68kFetchWord ((UINT32)(K + 14)));
+            }
+        }
+    }
+}
+
+// Raise a hardware interrupt at the given 68000 level (1-7).  Sets the
+// interrupt mask to that level (so nested interrupts of lower priority
+// stay masked until the handler RTEs) and vectors through the level's
+// autovector (level N = vector 0x18+N => long at offset 0x64+4*(N-1)).
+VOID
+M68kRaiseInterrupt (
+    IN UINT8 Level
+    )
+{
+    if (Level < 1 || Level > 7) {
+        return;
+    }
+    // The whole point of the IPL gate: only fire when the guest has
+    // unmasked this level (IPL < Level).
+    UINT16 CurIpl = (UINT16)((g_M68kContext.SR >> 8) & 7);
+    if (CurIpl >= Level) {
+        return;
+    }
+    g_M68kContext.SR = (UINT16)((g_M68kContext.SR & ~0x0700u) |
+                                ((UINT32)Level << 8));
+    M68kRaiseException (M68K_VEC_LEVEL1 + (UINT8)((Level - 1) * 4));
 }
 
 // ---------------------------------------------------------------------------
@@ -2923,6 +3369,35 @@ M68kExecuteInstruction (
     }
     // ---- END dead tail-dispatch skip -------------------------------------
 
+    // ---- DR thunk bank: reserved marker words ----------------------------
+    // The DR-era ROM walks the 0xFFFF0000-0xFFFF7FFF thunk table AS code.
+    // Several families there (0x4Bxx, 0x4Dxx) have NO 68000 meaning -- they
+    // are markers that only the real DR emulator understands.  Skip them
+    // before any opcode decoder can mis-handle them (the CHK mask
+    // 0xF138==0x4100 over-matches 0x4D00 and would trap spuriously).
+    if (g_M68kContext.PC >= 0xFFFF0002u && g_M68kContext.PC <= 0xFFFF8000u &&
+        ((Opcode & 0xFF00) == 0x4B00 || (Opcode & 0xFF00) == 0x4D00)) {
+        static BOOLEAN DrThunkReported = FALSE;
+        if (!DrThunkReported) {
+            DrThunkReported = TRUE;
+            Print (L"  68K DR-THUNK 0x%04x@0xFFFF%04x skipped before decode\n",
+                   Opcode, (UINT16) (g_M68kContext.PC - 2));
+        }
+        g_M68kContext.PC += 2;              // step over the marker word
+        {
+            UINT16 EaM = (Opcode >> 3) & 7;
+            UINT16 EaR = Opcode & 7;
+            if (EaM == 3 || EaM == 4 || EaM == 5 || EaM == 6) {
+                g_M68kContext.PC += 2;      // (d8,An,Xn) / (d16,An)
+            } else if (EaM == 7) {
+                if (EaR == 1)      g_M68kContext.PC += 4;  // ABS.L
+                else if (EaR <= 4) g_M68kContext.PC += 2;  // ABS.W / PC-rel / #imm
+            }
+        }
+        return 4;
+    }
+    // ---- END DR thunk bank intercept -------------------------------------
+
     // Dispatch based on the top 10 bits (bits 15-6) of the opcode
     UINT8 TopBits = Opcode >> 12;
 
@@ -2973,6 +3448,108 @@ M68kExecuteInstruction (
                 M68kClearFlag (M68K_CCR_Z);
             } else {
                 M68kSetFlag (M68K_CCR_Z);
+            }
+            break;
+        }
+
+        // Standard dynamic bit ops (68000): 0000 rrr ooo eeeeee.
+        // rrr = bit-number D-register (bits 10-8), ooo = op (bits 7-5):
+        //   000 = BTST, 001 = BCHG, 010 = BCLR, 011 = BSET,
+        // eeeeee = 6-bit EA. In group 0 these occupy the ODD SubBits
+        // (the Dn numbering in bits 10-8 makes SubBits 1,3,5,...F).
+        // The 68K boot code uses the standard 01xx form (e.g. BTST D0,D4
+        // = 0x0104 at 0x4080E22C). An (mode 1) and #imm (mode 7/reg 4)
+        // are not valid operands for bit ops.
+        if (SubBits & 1) {
+            UINT8 BitDreg = (Opcode >> 8) & 7;
+            UINT8 BitOp   = (Opcode >> 5) & 7;
+            UINT16 EaOp   = Opcode & 0x3F;
+            UINT8 EaMode  = (EaOp >> 3) & 7;
+            UINT8 BitNum  = g_M68kContext.D[BitDreg] & 31;
+            if (EaMode == 0) {
+                // Data-register direct: 32-bit operand, all 32 bits testable.
+                UINT32 Val = g_M68kContext.D[EaOp & 7];
+                UINT32 Mask = 1u << BitNum;
+                switch (BitOp) {
+                case 0:  // BTST
+                    if (Val & Mask) {
+                        M68kClearFlag (M68K_CCR_Z);
+                    } else {
+                        M68kSetFlag (M68K_CCR_Z);
+                    }
+                    break;
+                case 1:  // BCHG
+                    if (Val & Mask) {
+                        M68kClearFlag (M68K_CCR_Z);
+                    } else {
+                        M68kSetFlag (M68K_CCR_Z);
+                    }
+                    g_M68kContext.D[EaOp & 7] = Val ^ Mask;
+                    break;
+                case 2:  // BCLR
+                    if (Val & Mask) {
+                        M68kClearFlag (M68K_CCR_Z);
+                    } else {
+                        M68kSetFlag (M68K_CCR_Z);
+                    }
+                    g_M68kContext.D[EaOp & 7] = Val & ~Mask;
+                    break;
+                case 3:  // BSET
+                    if (Val & Mask) {
+                        M68kClearFlag (M68K_CCR_Z);
+                    } else {
+                        M68kSetFlag (M68K_CCR_Z);
+                    }
+                    g_M68kContext.D[EaOp & 7] = Val | Mask;
+                    break;
+                default:
+                    M68kExecuteIllegal (Opcode);
+                    break;
+                }
+            } else if (EaMode == 1 || (EaMode == 7 && (EaOp & 7) == 4)) {
+                M68kExecuteIllegal (Opcode);
+            } else {
+                // Memory operands: byte size; the bit number is used
+                // modulo 8. BTST is read-only; BCHG/BCLR/BSET write back.
+                UINT8 MemBit = BitNum & 7;
+                UINT8 Val = (UINT8)M68kReadEA (EaOp, M68K_SIZE_BYTE);
+                UINT8 Mask = (UINT8)(1u << MemBit);
+                switch (BitOp) {
+                case 0:  // BTST
+                    if (Val & Mask) {
+                        M68kClearFlag (M68K_CCR_Z);
+                    } else {
+                        M68kSetFlag (M68K_CCR_Z);
+                    }
+                    break;
+                case 1:  // BCHG
+                    if (Val & Mask) {
+                        M68kClearFlag (M68K_CCR_Z);
+                    } else {
+                        M68kSetFlag (M68K_CCR_Z);
+                    }
+                    M68kWriteEA (EaOp, M68K_SIZE_BYTE, (UINT32)(Val ^ Mask));
+                    break;
+                case 2:  // BCLR
+                    if (Val & Mask) {
+                        M68kClearFlag (M68K_CCR_Z);
+                    } else {
+                        M68kSetFlag (M68K_CCR_Z);
+                    }
+                    M68kWriteEA (EaOp, M68K_SIZE_BYTE, (UINT32)(Val & ~Mask));
+                    break;
+                case 3:  // BSET
+                    if (Val & Mask) {
+                        M68kClearFlag (M68K_CCR_Z);
+                    } else {
+                        M68kSetFlag (M68K_CCR_Z);
+                    }
+                    M68kWriteEA (EaOp, M68K_SIZE_BYTE, (UINT32)(Val | Mask));
+                    break;
+                default:
+                    M68kExecuteIllegal (Opcode);
+                    break;
+                }
             }
             break;
         }
@@ -3355,9 +3932,40 @@ M68kExecuteInstruction (
         if ((Opcode & 0xFFC0) == 0x4EC0) {
             UINT32 EA;
             M68kComputeEA (Opcode & 0x3F, &EA, NULL);
-            if (EA == 0) {
-                M68kTrace (L"  JMP(0): RTS\n");
-                g_M68kContext.PC = M68kPopLong ();
+            if (EA == 0 || EA < 0x400u) {
+                // Uninitialized DR dispatch slot — the target pointer was
+                // never installed (e.g. MOVE.L (0x069C).W,A1 / JMP(A1)
+                // with 0x069C still zeroed).  Pop the return address; if it
+                // is garbage, scan the stack for a plausible caller.
+                UINT32 Sp = g_M68kContext.Supervisor
+                            ? g_M68kContext.SSP : g_M68kContext.A[7];
+                UINT32 Ret = M68kPopLong ();
+                BOOLEAN RetOk =
+                    (((Ret & 1) == 0) &&
+                     ((Ret >= 0x40800000u &&
+                       (Ret < 0x41000000u || Ret >= 0xFFC00000u)) ||
+                      Ret < 0x00100000u));
+                if (!RetOk) {
+                    UINT8 s;
+                    for (s = 0; s < 48 && !RetOk; s++) {
+                        Ret = M68kReadLong ((UINT32)(Sp + s * 4));
+                        if (((Ret & 1) == 0) &&
+                            Ret >= 0x40800000u &&
+                            (Ret < 0x41000000u || Ret >= 0xFFC00000u)) {
+                            RetOk = TRUE;
+                            if (g_M68kContext.Supervisor)
+                                g_M68kContext.SSP = (UINT32)(Sp + s * 4 + 4);
+                            else
+                                g_M68kContext.A[7] = (UINT32)(Sp + s * 4 + 4);
+                        }
+                    }
+                }
+                if (!RetOk) {
+                    // Nothing plausible on the stack either — treat as NOP.
+                    Print (L"  68K JMP(%08x): no return, NOP\n", EA);
+                    break;
+                }
+                g_M68kContext.PC = Ret;
             } else {
                 M68kLogLowTransfer (g_M68kContext.PC - 2, Opcode, EA);
                 g_M68kContext.PC = EA;
@@ -3465,6 +4073,9 @@ M68kExecuteInstruction (
             break;
         }
 
+        // 0x4Bxx / 0x4Dxx: reserved on 68000/68010 (used by the DR-era ROM only
+        // as private thunk-table markers).  Handled centrally in
+        // M68kExecuteIllegal for the 0xFFFF0000 bank.
         M68kExecuteIllegal (Opcode);
         break;
     }
@@ -3730,6 +4341,74 @@ M68kExecuteInstruction (
                     M68kWriteWord ((UINT32)(Rec + 0x0C), 0x20);
                 }
             }
+            // ---- A71E: DR boot-read status gate --------------------------
+            // The ROM's kernel trap A71E dispatches to handler 0x40833776;
+            // its status subroutine 0x408347C0 rounds the boot-read length
+            // from the descriptor (D0 = chunk size, e.g. 0x7C -> 0x90) and
+            // then tests the low-memory "prepared" flag at byte 0x4:
+            //   3006 MOVE.W D6,D0 ; 323C 0400 MOVE.W #$0400,D1
+            //   C240 AND.L D1,D0 ; 6706 BEQ.S ; 2038 0118 MOVE.L $118.W,D0
+            //   7000 MOVEQ #0,D0 ; 102B 0004 MOVE.B 4(A3),D0
+            //   7203 MOVEQ #3,D1 ; B280 CMP.L D1,D0 ; 670A BEQ.S prepared
+            //   MOVE.W #$D,$8.W ; MOVEQ #$8F,D0 ; ... RTS   -> D0=-113 fail
+            // Keep byte 0x4 == 3 so the gate returns SUCCESS instead of the
+            // -113 error that parks the DR boot in the low-RAM zero walk.
+            if ((Opcode & 0x0FFF) == 0x071E &&
+                M68kReadByte (0x00000004u) != 3) {
+                M68kWriteByte (0x00000004u, 3);
+                Print (L"  A71E boot-read: prepared flag byte[4]=3 (sel(D0)=%08x)\n",
+                       g_M68kContext.D[0]);
+            }
+            // Service A71E/A647 INLINE (do not dispatch to the ROM trap
+            // handler): 
+            //   * A71E (boot-read gate): the ROM handler's stack frame does
+            //     not balance against an inline A-line word (our dispatch
+            //     double-pushes; its RTS then pops a bogus return and the
+            //     boot parks at low-RAM addresses 0x88+).
+            //   * A647 (sel D0=$AA6B, memory/hw-probe gate): the ROM's own
+            //     trap table maps A647 to the script-desert at 0x4080E07A,
+            //     whose scan (MOVE.L (A0),D2 of the 0x0C400001 RAM-band
+            //     descriptor, then BSR 0x4080E01C) spins forever in a
+            //     fixed-point bit-scan (D0=0x6B, A1=0x0E005021) — the real
+            //     path just does BRA+6 -> RTS right after the trap.
+            // Both return plain success: D0=0, CCR Z=1 (set below at the
+            // bottom of this case); the caller continues right after the
+            // trap word (A71E -> 0x4080E348 BNE.S; A647 -> 0x4080E364 BRA).
+            if ((Opcode & 0x0FFF) == 0x071E ||
+                (Opcode & 0x0FFF) == 0x0647) {
+                g_M68kContext.D[0] = 0;
+            }
+            // On the same gate, prove live keyword reads from the mounted
+            // HFS volume (System file boot block head) so the next DR read
+            // service can be keyed to real sector data instead of zeros.
+            if ((Opcode & 0x0FFF) == 0x071E) {
+                static BOOLEAN A71ReadProbe = FALSE;
+                if (!A71ReadProbe) {
+                    A71ReadProbe = TRUE;
+                    PPC_HFS_ENTRY Sys;
+                    if (!EFI_ERROR (PpcHfsOpenPath (L"System Folder:System", &Sys))) {
+                        UINT8 Head[64];
+                        UINTN Cap = sizeof (Head);
+                        EFI_STATUS RS = PpcHfsReadFile (&Sys, Head, &Cap);
+                        if (!EFI_ERROR (RS) || RS == EFI_BUFFER_TOO_SMALL) {
+                            Print (L"  A71E HFS probe: 'System Folder:System' "
+                                   L"size=%d read %d bytes\n",
+                                   (UINT32) Sys.Size, (UINT32) Cap);
+                            for (UINTN I = 0; I < Cap; I += 16) {
+                                Print (L"    %04x:", (UINT32) I);
+                                for (UINTN J = I; J < I + 16 && J < Cap; J++) {
+                                    Print (L" %02x", Head[J]);
+                                }
+                                Print (L"\n");
+                            }
+                        } else {
+                            Print (L"  A71E HFS probe: read FAILED\n");
+                        }
+                    } else {
+                        Print (L"  A71E HFS probe: 'System Folder:System' NOT FOUND\n");
+                    }
+                }
+            }
             // ---- HOST TRAP SERVICES ------------------------------------
             // The NK maintains its own heap via Toolbox-style traps long
             // before any MacOS zone exists. Rather than reimplementing the
@@ -3814,7 +4493,9 @@ M68kExecuteInstruction (
                 BOOLEAN NkService = (TrapOp == 0x06E) ||
                                     (TrapOp == 0x004) ||
                                     (TrapOp == 0x01F) ||
-                                    (TrapOp == 0x080);
+                                    (TrapOp == 0x080) ||
+                                    (TrapOp == 0x0647) ||
+                                    (TrapOp == 0x71E);
                 if (!NkService) {
                     UINT32 TblBase = 0x40800000u +
                                      M68kReadLong (0x40800022u);
@@ -4091,9 +4772,27 @@ M68kExecuteInstruction (
             break;
         }
 
-        // Any other Line-F word (real FPU instructions etc.) must not
-        // raise an exception either; log and continue.
-        {
+        // Any other Line-F word. The New World 68K ROM also encodes DR
+        // service invocations as a 0xFFFF F-line word followed by a 16-bit
+        // service selector (the 0xFFFF9760 / 0xFFFF9420 / 0xFFFF8B9C device
+        // constants seen in the E1xx boot stream). On real hardware this is
+        // a LINE-F exception: the CPU pushes the 68K frame at the opcode
+        // address and vectors to 0x2C, whose handler services the call and
+        // RTE'rs past the selector word. Emulate exactly that: raise vec
+        // 0x2C with the frame PC rewound to the 0xFFFF word so any guest-
+        // installed handler runs; the seeded glue services it by skipping
+        // opcode + selector.
+        if (Opcode == 0xFFFFu) {
+            static BOOLEAN DbgLineFVec = FALSE;
+            if (!DbgLineFVec) {
+                DbgLineFVec = TRUE;
+                Print (L"68K LINE-F vec 0x2C: vectoring 0xFFFF service "
+                       L"calls (vec[0x2C]=0x%08x)\n",
+                       M68kReadLong (0x2Cu));
+            }
+            g_M68kContext.PC -= 2;   // frame PC points at the opcode
+            M68kRaiseException (M68K_VEC_LINE_1111);   // 0x2C
+        } else {
             static UINTN DbgLineF = 0;
             if (DbgLineF++ < 20) {
                 Print (L"68K LINE-F op 0x%04x @PC=0x%08x (ignored)\n",
@@ -4162,26 +4861,90 @@ M68kExecuteFromPPC (
         g_M68kContext.DiagCanary = 0xDEADC0DEu;
     }
 
-    // STOP #imm parked the CPU: stay parked until the PPC hook wakes us
-    // (it clears Stopped when a decrementer interrupt is pending).
+    // STOP #imm parked the CPU: a real 68000 STOP suspends until an
+    // interrupt with a level ABOVE the SR interrupt mask is pending.  The
+    // level-1 VIA tick accumulates in the interrupt flags while we sleep;
+    // the boot parks here with SR=0x2018 (IPL 0), so a level-1 VIA
+    // qualifies.  Poll and deliver it to wake the boot; otherwise stay
+    // parked (yield to the PPC side) until such an interrupt arrives.
+    BOOLEAN SkipSyncFromWake = FALSE;
     if (g_M68kContext.Stopped) {
-        static UINTN ParkEntryCount = 0;
-        ParkEntryCount++;
-        if ((ParkEntryCount & 1023) == 1) {
-            Print (L"  68K PARKED by STOP [#%d]: SR=0x%04x PC=0x%08x SSP=0x%08x "
-                   L"(DW=%d DN=%d MSR=%08x XP=%d)\n",
-                   (UINT32)ParkEntryCount,
-                   g_M68kContext.SR, g_M68kContext.PC, g_M68kContext.SSP,
-                   g_PpcContext.DecrementerWritten,
-                   g_PpcContext.DecrementerNegative,
-                   g_PpcContext.Msr,
-                   g_PpcContext.ExceptionPending);
+        BOOLEAN Waked = FALSE;
+        if ((((g_M68kContext.SR >> 8) & 7) < 1) &&
+            M68kReadLong (M68K_VEC_LEVEL1) != 0) {
+            UINT32 F = EmulOpGetAndClearInterruptFlags ();
+            if (F & INTFLAG_VIA) {
+                static UINTN ParkWakeCount = 0;
+                ParkWakeCount++;
+                if (ParkWakeCount <= 8) {
+                    Print (L"  68K STOP-WAKE #%d: VIA lvl1 -> VBL handler, "
+                           L"PC=0x%08x SR=0x%04x\n",
+                           (UINT32)ParkWakeCount, g_M68kContext.PC,
+                           g_M68kContext.SR);
+                }
+                M68kWriteLong (0x900, 1);       // keep poll parity
+                if (ParkWakeCount <= 2) {
+                    // One-shot instruction trace across the wake so we can
+                    // see what the OS does per VBL (does progress advance?).
+                    if ((g_M68kContext.SR & 0x2000) != 0) {
+                        g_M68kDebugSteps = 120;     // supervisor SR
+                    }
+                }
+                M68kRaiseInterrupt (1);
+                g_M68kContext.Stopped = FALSE;
+                Waked = TRUE;
+                SkipSyncFromWake = TRUE;
+            } else if (F != 0) {
+                EmulOpSignalInterrupt (F);
+            }
         }
-        return EFI_NOT_READY;
+        if (!Waked) {
+            static UINTN ParkEntryCount = 0;
+            // Keep the 60 Hz VIA line alive while we yield: no 68K
+            // instructions run here, so the phase-C Count-based clock
+            // advance is zero and INTFLAG_VIA would never become pending
+            // (dead chicken-and-egg).  Advance a little each yield so the
+            // next VBL event materializes within a dozen or so yields.
+            EmulOpAdvanceClock (200u * 1667u);
+            ParkEntryCount++;
+            {
+                static UINTN DiagCount = 0;
+                if (ParkEntryCount <= 24 || DiagCount < 24) {
+                    DiagCount++;
+                    Print (L"  68K STOP-POLL[%d] us=%08x SR=%04x "
+                           L"IPL=%d vec64=%08x\n",
+                           (UINT32)ParkEntryCount,
+                           (UINT32)(EmulOpGetMicroseconds () & 0xFFFFFFFF),
+                           g_M68kContext.SR,
+                           (g_M68kContext.SR >> 8) & 7,
+                           M68kReadLong (M68K_VEC_LEVEL1));
+                }
+            }
+            if ((ParkEntryCount & 1023) == 1) {
+                Print (L"  68K PARKED by STOP [#%d]: SR=0x%04x PC=0x%08x "
+                       L"SSP=0x%08x "
+                       L"(DW=%d DN=%d MSR=%08x XP=%d)\n",
+                       (UINT32)ParkEntryCount,
+                       g_M68kContext.SR, g_M68kContext.PC, g_M68kContext.SSP,
+                       g_PpcContext.DecrementerWritten,
+                       g_PpcContext.DecrementerNegative,
+                       g_PpcContext.Msr,
+                       g_PpcContext.ExceptionPending);
+            }
+            return EFI_NOT_READY;
+        }
     }
 
-    // Sync PPC registers into 68K context
-    M68kSyncFromPPC ();
+    // Sync PPC registers into 68K context (skip right after a park wake,
+    // where the level-1 frame was just pushed: the PPC regs are stale and
+    // would clobber the freshly-set PC/SSP/SR).
+    if (!SkipSyncFromWake) {
+        M68kSyncFromPPC ();
+    }
+
+    // Re-assert the 0x112 glue if the guest's fault vectors point there but
+    // the word is still zeroed (cheap read-read + occasional single write).
+    M68kEnsureLowVectorGlue ();
 
     // ---- PHASE C: batch-start hooks ------------------------------------
     // Refresh the XLM block if the ROM's pool-scrubber wiped it. The scrub
@@ -4366,6 +5129,7 @@ M68kExecuteFromPPC (
             UINT32 PcNow = g_M68kContext.PC;
             BOOLEAN Ok = (PcNow < 0x01000000u) ||
                          (PcNow >= 0x40800000u && PcNow < 0x41000000u) ||
+                         (PcNow >= 0xA8000000u && PcNow < 0xAC000000u) ||
                          (PcNow >= 0xFFC00000u);   // classic ROM alias
             if (!Ok && !RunawayReported) {
                 UINTN K;
@@ -4401,6 +5165,49 @@ M68kExecuteFromPPC (
             g_LastPcRing[g_LastPcIdx] = PcNow;
             g_LastOpRing[g_LastPcIdx] = M68kReadWord (PcNow);
             g_LastPcIdx = (g_LastPcIdx + 1) % 256;
+        }
+        // DR-script region: the NK-built low-RAM boot mailbox (0xFC0-0x1800)
+        // is a script of parameter words, FFFF+selector service pairs, and
+        // ASCII message text, NOT executable code.  Drain it (service the
+        // pairs host-side, skip the data/text words) instead of executing
+        // data as opcodes.
+        if (g_M68kContext.PC >= 0xFC0u && g_M68kContext.PC < 0x1800u) {
+            static UINTN ScriptRuns = 0;
+            M68kLineFScript ();
+            if (ScriptRuns++ < 2) {
+                Print (L"  68K DR-script drain entry PC=0x%08x (run #%d)\n",
+                       (UINT32)(g_M68kContext.PC - 2), (UINT32)ScriptRuns);
+            }
+            continue;
+        }
+        // Pending-interrupt delivery: 68000 checks IRQ lines between
+        // instructions.  A level-1 (VBL) request can only fire while the
+        // guest has cleared IPL 1, and only if the guest actually owns
+        // the autovector (if vector 0x64 is still NULL the guest has not
+        // installed an interrupt environment yet - leave it to the $900
+        // EMUL_OP acknowledge path above).
+        if (!g_M68kContext.Halted &&
+            (((g_M68kContext.SR >> 8) & 7) == 0) &&
+            M68kReadLong (M68K_VEC_LEVEL1) != 0) {
+            UINT32 F = EmulOpGetAndClearInterruptFlags ();
+            if (F & INTFLAG_VIA) {
+                static UINTN VblExcCount = 0;
+                VblExcCount++;
+                if (VblExcCount < 8) {
+                    Print (L"  68K VBL-EXC #%d PC=0x%08x SR=0x%04x "
+                           L"SSP=0x%08x\n",
+                           (UINT32)VblExcCount, g_M68kContext.PC,
+                           g_M68kContext.SR,
+                           g_M68kContext.Supervisor ? g_M68kContext.SSP
+                                                    : g_M68kContext.A[7]);
+                }
+                M68kWriteLong (0x900, 1);       // keep poll parity
+                M68kRaiseInterrupt (1);
+                continue;                        // enter the handler first
+            }
+            if (F != 0) {
+                EmulOpSignalInterrupt (F);
+            }
         }
         // DR-callback walker guard: at 0x408081BA the ROM does jsr (a2)
         // where a2 was built from a stack frame ([a1+0x44] chain). With our
@@ -5177,9 +5984,10 @@ M68kExecuteFromPPC (
             M68kReadWord (g_M68kContext.PC) == 0x60FEu) {
             static BOOLEAN ParkReported = FALSE;
             if (!ParkReported) {
-                UINTN K;
+UINTN K;
                 UINT32 SpNow = g_M68kContext.Supervisor ?
                                g_M68kContext.SSP : g_M68kContext.A[7];
+                UINT32 SpForDump = SpNow;
                 ParkReported = TRUE;
                 Print (L"  68K DEADLOOP PARK at 0x408047AE "
                        L"(SR=%04x SP=%08x D0=%08x D3=%08x A0=%08x A1=%08x "
@@ -5195,6 +6003,32 @@ M68kExecuteFromPPC (
                     if ((K & 7) == 7) Print (L"\n     ");
                 }
                 Print (L"\n");
+                Print (L"  68K PARK regs D0=%08x D1=%08x D2=%08x D3=%08x D4=%08x "
+                       L"D5=%08x D6=%08x D7=%08x\n",
+                       g_M68kContext.D[0], g_M68kContext.D[1], g_M68kContext.D[2],
+                       g_M68kContext.D[3], g_M68kContext.D[4], g_M68kContext.D[5],
+                       g_M68kContext.D[6], g_M68kContext.D[7]);
+                Print (L"  68K PARK regs A0=%08x A1=%08x A2=%08x A3=%08x "
+                       L"A4=%08x A5=%08x A6=%08x SP=%08x\n",
+                       g_M68kContext.A[0], g_M68kContext.A[1], g_M68kContext.A[2],
+                       g_M68kContext.A[3], g_M68kContext.A[4], g_M68kContext.A[5],
+                       g_M68kContext.A[6], SpNow);
+                {
+                    // Dump the 68K supervisor stack: the return-chain and
+                    // locals reveal what the boot was doing as it parked.
+                    UINTN W;
+                    if (SpForDump >= 0x9000 && SpForDump < 0x10000) {
+                        for (W = 0; W < 96; W += 4) {
+                            UINT32 Wall = (UINT32)(0xA000 - (W + 0));
+                            Print (L"  68K PARK SP[%04x] %08x %08x %08x %08x\n",
+                                   0xA000 - (UINTN)W,
+                                   M68kReadLong (Wall),
+                                   M68kReadLong ((UINT32)(Wall - 4)),
+                                   M68kReadLong ((UINT32)(Wall - 8)),
+                                   M68kReadLong ((UINT32)(Wall - 12)));
+                        }
+                    }
+                }
                 M68kTraceFlush ();
             }
             // BRA$ (0x60FE) at 0x408047AE is the correct68K idle loop.
@@ -5288,7 +6122,9 @@ M68kExecuteFromPPC (
             // Advance the emulated clock by one VBL period so the VIA flag
             // is set for the next batch-start VBL injection.  Without this
             // the clock never advances (Count ≈ 0) and VBL never fires.
-            EmulOpAdvanceClock (16667 * 200);
+            // Overshoot by 1 us so the >= test in EmulOpAdvanceClock sets
+            // INTFLAG_VIA now instead of landing exactly on the boundary.
+            EmulOpAdvanceClock (200u * 16667u + 200u * 1u);
             g_M68kContext.Stopped = TRUE;
             break;
         }
@@ -5416,6 +6252,47 @@ M68kReset (
     // Clear all registers
     ZeroMem (g_M68kContext.D, sizeof (g_M68kContext.D));
     ZeroMem (g_M68kContext.A, sizeof (g_M68kContext.A));
+
+    // The macintosh firmware installs a 68K exception vector table during
+    // hardware init, BEFORE the OS takes over.  When we cut over to the C
+    // interpreter the ROM's own reset/vector-install stage may have been
+    // skipped, so mirror the firmware here: point every fault vector at an
+    // RTE stub (0x400) so exceptions behave like real hardware (vector +
+    // return) instead of NULL-vector halting during boot.
+    {
+        static BOOLEAN VecsSeeded = FALSE;
+        if (!VecsSeeded && M68kReadLong (0x08) == 0) {
+            UINT32 Vec;
+            VecsSeeded = TRUE;
+            M68kWriteWord (0x400, 0x4E73u);   // RTE
+            for (Vec = 0x08; Vec <= 0x3C; Vec += 4) {
+                // vec 0x2C (LINE-F) gets a dedicated glue that resumes
+                // PAST the 0xFFFF opcode AND its 16-bit service selector,
+                // matching the hardware handler's frame convention.
+                if (Vec == 0x2C) {
+                    M68kWriteLong (0x404, 0x50AF0004u); // ADDQ.L #4,2(SP)
+                    M68kWriteWord (0x408, 0x4E73u);     // RTE
+                    if (M68kReadLong (Vec) == 0) M68kWriteLong (Vec, 0x404);
+                } else if (M68kReadLong (Vec) == 0) {
+                    M68kWriteLong (Vec, 0x400);
+                }
+            }
+            for (Vec = 0x64; Vec <= 0x7C; Vec += 4) {   // autovectors 1-7
+                if (M68kReadLong (Vec) == 0) M68kWriteLong (Vec, 0x400);
+            }
+            for (Vec = 0x80; Vec <= 0xBF; Vec += 4) {   // TRAP #0..#15, A-line
+                if (M68kReadLong (Vec) == 0) M68kWriteLong (Vec, 0x400);
+            }
+            Print (L"  68K reset: seeded exception vectors (faults -> RTE at "
+                   L"0x400)\n");
+        }
+    }
+
+    // Ensure the guest's low-memory software vectors stay functional even
+    // if a later stage points them at 0x112 before the ROM glue existed.
+    M68kEnsureLowVectorGlue ();
+
+    g_M68kInInterrupt = FALSE;
 
     Print (L"  68K reset: SSP=0x%08x PC=0x%08x SR=0x%04x\n",
            g_M68kContext.SSP, g_M68kContext.PC, g_M68kContext.SR);

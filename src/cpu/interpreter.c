@@ -1,6 +1,7 @@
 #include "interpreter.h"
 #include "translation.h"
 #include "emul_op.h"
+#include "m68k.h"
 #include "boot/bootloader.h"
 #include <efi.h>
 #include <efilib.h>
@@ -35,8 +36,9 @@ static UINT32 gKckcLr  = 0;
 //
 // Setting USE_PPC_NATIVE_DR=1 lets the ROM's own PPC opcode table drive the
 // 68K emulator (the de-hijack), and only seeds/keeps the trap/device escapes.
-// Default is 0 = current C-68K behaviour, so the baseline is unchanged until
-// the PPC environment (translation, KernelData/hardware seeds) is complete.
+// Default is 0 = current C-68K behaviour (the SheepShaver track: the common
+// dispatch at 0x40B67C60 is intercepted and every 68K instruction runs
+// through the hand-rolled C interpreter in m68k.c).
 #define USE_PPC_NATIVE_DR 1
 
 // ---------------------------------------------------------------------------
@@ -346,10 +348,23 @@ static BOOLEAN g_KdProfileEnabled = FALSE;
 static UINT32  g_KdProfileLoads   = 0;
 static UINT32  g_KdBucket[PPC_KERNELDATA_WORDS];
 
-// Record a load from the KernelData page (called on lwz/lhz/lbz).
+// PC sample histogram: which code site generates the KernelData loads. Two
+// windows: low memory (0x00000000..0x00400000, the 68K-emulator/ECB area)
+// and the ROM/emulator-in-RAM window (0x40000000..0x40C00000), 4 KB pages.
+#define PPC_KDPROF_LO_BASE   0x00000000u
+#define PPC_KDPROF_HI_BASE   0x40000000u
+#define PPC_KDPROF_PAGES     1024
+static UINT32 g_KdPcBucketLo[PPC_KDPROF_PAGES];
+static UINT32 g_KdPcBucketHi[PPC_KDPROF_PAGES];
+static UINTN  g_KdPcSampled = 0;
+
+// Record a load from the KernelData page (called on lwz/lhz/lbz).  PC is
+// sampled every 2048th load so the emulator's poll loop location shows in
+// the KDPROF dump instead of just the field offsets.
 static VOID
 PpcKdProfileLoad (
-    IN UINT32 Ea
+    IN UINT32 Ea,
+    IN UINT32 Pc
     )
 {
     if (!g_KdProfileEnabled) {
@@ -362,6 +377,15 @@ PpcKdProfileLoad (
         g_KdProfileLoads++;
         if (g_KdProfileLoads >= 4000000u) {
             g_KdProfileEnabled = FALSE;   // bounded sampling window
+        }
+        if ((g_KdProfileLoads & 0x7FF) == 0) {
+            g_KdPcSampled++;
+            if (Pc < PPC_KDPROF_LO_BASE + PPC_KDPROF_PAGES * 0x1000u) {
+                g_KdPcBucketLo[(Pc - PPC_KDPROF_LO_BASE) >> 12]++;
+            } else if (Pc >= PPC_KDPROF_HI_BASE &&
+                       Pc < PPC_KDPROF_HI_BASE + PPC_KDPROF_PAGES * 0x1000u) {
+                g_KdPcBucketHi[(Pc - PPC_KDPROF_HI_BASE) >> 12]++;
+            }
         }
     }
 }
@@ -395,6 +419,32 @@ PpcKdProfileDump (
         }
         Print(L"    KD[+0x%03x] x%d\n", (UINT32)(Best * 4), g_KdBucket[Best]);
         g_KdBucket[Best] = 0;
+    }
+    {
+        // PC sample histogram: the code site that generates the loads.
+        UINTN  P;
+        UINT32 Best;
+        Print(L"  KDPROF load-PC pages (4K, sampled %d):\n", (UINT32)g_KdPcSampled);
+        for (P = 0; P < 2; P++) {
+            for (K = 0; K < 12; K++) {
+                Best = PPC_KDPROF_PAGES;
+                UINT32 *Win = (P == 0) ? g_KdPcBucketLo : g_KdPcBucketHi;
+                for (B = 0; B < PPC_KDPROF_PAGES; B++) {
+                    if (Win[B] != 0 &&
+                        (Best == PPC_KDPROF_PAGES || Win[B] > Win[Best])) {
+                        Best = B;
+                    }
+                }
+                if (Best == PPC_KDPROF_PAGES) {
+                    break;
+                }
+                Print(L"    PCPAGE 0x%08x x%d%s\n",
+                      (UINT32)((P == 0 ? PPC_KDPROF_LO_BASE : PPC_KDPROF_HI_BASE) +
+                               Best * 0x1000), Win[Best],
+                      (P == 0 ? L" [low]" : L" [rom]"));
+                Win[Best] = 0;
+            }
+        }
     }
     g_KdProfileEnabled = FALSE;
 }
@@ -874,6 +924,34 @@ static UINT32 g_DrYieldSeen = 0;
 // so the exact 68K word stream the DR executes post-yield is visible, then it
 // switches off after ~6000 instructions to keep the log bounded.
 static UINT32 g_DrPostYieldWindow = 0;
+// Spill-band decoder: after the DRYIELD-RESUME, once the 68K PC enters the
+// low-RAM zone (>= 0xA800) it logs each instruction op + PPC handler address
+// (up to 96) to reconstruct the off-the-end word stream verbatim.
+static UINT32 g_DrSpillDump = 0;
+static UINT32 g_DrJsrTrace = 0;
+// Yield-cycle counter: incremented at every DRYIELD-RESUME. The trace blocks
+// below are gated on this (plus their own window bands) so the traces fire
+// only during the FIRST few yield cycles. g_DrPostYieldWindow resets to 1
+// every yield, so windows 660-790 recur thousands of times per soak and the
+// A207PROBE/JSX counters would otherwise self-exhaust before any output
+// survives QEMU's serial chardev (which keeps only the log tail).
+static UINT32 g_DrYieldCount = 0;
+// A207 dispatch net-leak compensation state machine (file scope so the
+// DRYIELD-RESUME block can reset it to a known zero like the other trace
+// counters; function-local .bss statics become mid-boot garbage here).
+static UINT32 g_DrA207ArmPc = 0;      // 68K past-trap PC at the arm site
+static UINT32 g_DrA207ArmSp = 0;      // r1 at the arm site (pre-dispatch SP)
+static UINT32 g_DrA207ArmState = 0;   // 0 idle, 1 armed, 2 in-rom
+static UINT32 g_DrA207ArmLogged = 0;  // one-shot clamp log
+static UINT32 g_DrA207Base = 0;       // cycle baseline = r1 at first landing
+static UINT32 g_DrA207Land = 0;       // landing log budget
+static UINT32 g_DrOsAdvance = 0;      // OSINLOW A207-return probe budget
+static UINT32 g_DrA207Cap = 0;        // one-shot runtime truth capture
+static UINT32 g_DrA207Steer = 1;      // EXPERIMENT: A207 returns 0 + prefill gate
+// Single-shot gate: once the DR returns from its 0x116 service call (68K a6 =
+// 0x4080AA3C) with D0 bit0 cleared so the boot driver skips the unstaged low-
+// RAM relocation, this is set to stop re-evaluating the hook.
+static UINT32 g_DrRelocGate = 0;
 
 static VOID   CpuWrite32(UINT32 A, UINT32 V)
 {
@@ -3322,6 +3400,18 @@ PpcExecuteInstruction (
                 g_PpcContext.Srr0 = 0x40B67B60;        // DR dispatch loop (refetch)
                 g_DrYieldSeen = 1;
                 g_DrPostYieldWindow = 1;
+                g_DrYieldCount++;
+                g_DrSpillDump = 0;      // BSS zero-fill skipped by loader for 0x1800b12a0+;
+                g_DrJsrTrace = 0;       // force counters to known values so gates see 0
+                g_DrA207ArmPc = 0;
+                g_DrA207ArmSp = 0;
+                g_DrA207ArmState = 0;
+                g_DrA207ArmLogged = 0;
+                g_DrA207Base = 0;
+g_DrA207Land = 0;
+                g_DrOsAdvance = 0;
+                g_DrA207Cap = 0;
+                g_DrA207Steer = 1;
                 Print(L"  DRYIELD-RESUME @rfi trap=0x40B6E8C8 68Kpc(r24)=0x%08x "
                       L"r27(op)=0x%04x -> DR dispatch 0x40B67B60\n",
                       g_PpcContext.Gpr[24], g_PpcContext.Gpr[27] & 0xFFFF);
@@ -3585,7 +3675,7 @@ PpcExecuteInstruction (
     case 32: // lwz
         {
             UINT32 Ea = EaD(w, RA(w));
-            PpcKdProfileLoad(Ea);
+            PpcKdProfileLoad(Ea, CurrentAddress);
             g_PpcContext.Gpr[RT(w)] = CpuRead32(Ea);
         }
         break;
@@ -3619,7 +3709,7 @@ PpcExecuteInstruction (
                 }
                 g_PpcContext.Gpr[RT(w)] = 0x04;
             } else {
-                PpcKdProfileLoad(Ea);
+                PpcKdProfileLoad(Ea, CurrentAddress);
                 g_PpcContext.Gpr[RT(w)] = g_ReadByte(Ea);
             }
         }
@@ -3682,7 +3772,7 @@ PpcExecuteInstruction (
     case 40: // lhz
         {
             UINT32 Ea = EaD(w, RA(w));
-            PpcKdProfileLoad(Ea);
+            PpcKdProfileLoad(Ea, CurrentAddress);
             g_PpcContext.Gpr[RT(w)] = CpuRead16(Ea);
         }
         break;
@@ -4768,6 +4858,12 @@ UINTN TbProbe = 0;
     static UINT32 DrLowMarchProbed = 0;
     static UINT32 DrHandoffJmpProbed = 0;
     static UINT32 DrOsInjected = 0;
+    static UINT32 DrC68kTrapRequest = 0;
+    static UINT32 NativeDrHandoffLogged = 0;
+    static UINT32 DrWildTrapProbed = 0;
+    static UINT32 DrTrapDecide = 0;
+    static UINT32 DrTrapDecideB = 0;
+    static UINT32 NativeDrR28ArmLogged = 0;
     // Post-inject 68K boot-step trace buffer (see the BOOTSTEP recorder below).
     static UINT32 BootStepIdx = 0;
     static UINT32 BootStepDumpDone = 0;
@@ -4777,6 +4873,7 @@ UINTN TbProbe = 0;
     // 68K A-line trap call tracer (see TRAPTR recorder below).
     static UINT32 TrapTraceIdx = 0;
     static UINT32 TrapTraceDumpDone = 0;
+    static UINT32 TrapTraceDumpedApex = 0;
     static UINT32 TrapTracePc[256];
     static UINT32 TrapTraceOp[256];
     static UINT32 TrapTraceD0[256];
@@ -4806,6 +4903,10 @@ UINTN TbProbe = 0;
     static UINT32 WalkProbed = 0;
     static UINT32 EeRetProbed = 0;
     static UINT32 PutsProbed = 0;
+    static UINT32 DrTrapE0 = 0;
+    static UINT32 DrTrap80 = 0;
+    static UINT32 DrTrap00 = 0;
+    static UINT32 DrTrap1C = 0;
     static CHAR16 PutsBuf[512];
     static UINT32 HandoffChainProbed = 0;
     static UINT32 IrqRetProbed = 0;
@@ -4835,6 +4936,31 @@ UINTN TbProbe = 0;
 
         Instr = CpuRead32(g_PpcContext.Pc);
         Current = g_PpcContext.Pc;
+
+        // ---- Free-run page logger: with USE_PPC_NATIVE_DR the ROM's own
+        // PPC 68K emulator drives the guest.  Log the first visit to each
+        // distinct 4 KB PPC page (capped) to see where the native boot goes
+        // once the C-68K intercept is removed.
+        {
+            static UINT32 FreePages[96];
+            static UINT32 FreePageCount = 0;
+            UINT32 Fp = Current >> 12;
+            UINT32 Fi;
+#if !USE_PPC_NATIVE_DR
+            Fp = 0xFFFFFFFF;                // disabled build: nothing to log
+#endif
+            for (Fi = 0; Fi < FreePageCount; Fi++) {
+                if (FreePages[Fi] == Fp) break;
+            }
+            if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 96) {
+                FreePages[FreePageCount++] = Fp;
+                Print (L"  FREERUN page=0x%08x firstPC=0x%08x r24(68Kpc)=0x%08x "
+                       L"r27=0x%04x r1=0x%08x\n",
+                       Fp << 12, Current, g_PpcContext.Gpr[24],
+                       (UINT32)(g_PpcContext.Gpr[27] & 0xFFFF),
+                       g_PpcContext.Gpr[1]);
+            }
+        }
 
         // ---- Decisive trap-handoff trace: watch the exact PC sequence as the
         // boot-tail twui raises 0x700 and we try to deliver it to the ROM's
@@ -4971,6 +5097,121 @@ UINTN TbProbe = 0;
         // functions are emulated here in C and the context is handed back to
         // the ROM's common dispatch (0x40B67C60).
         UINT32 Hooked = 0;
+        // ---- Native 68K dispatch-loop hook (SheepShaver track) ----
+        // When the PPC DR-emulator is about to dispatch a 68K instruction
+        // (its DR dispatch loop at 0x40B67B60 / common dispatch at
+        // 0x40B67C60), intercept and execute the 68K instruction natively via
+        // the C interpreter (m68k.c), completely replacing the PPC-based
+        // opcode table. 0x40B67B60 is the DR's dispatch-loop entry (arrived
+        // at from the DR cold-start with r24 = the 68K PC, r1 = SSP and r25 =
+        // SR loaded by the DR's own self-init); 0x40B67C60 is kept as a
+        // fallback for any direct-to-full-dispatch transitions. Resuming at
+        // 0x40B67B60 re-enters the loop so every 68K instruction is serviced
+        // by the C interpreter and the PPC DR never executes an opcode.
+        // USE_PPC_NATIVE_DR disables this intercept so the ROM's own PPC
+        // opcode-translation table drives the 68K emulator (the pivot).
+#if !USE_PPC_NATIVE_DR
+        if (Current == 0x40B67B60 || Current == 0x40B67C60) {
+            static UINTN M68kTakeoverCount = 0;
+            if (M68kTakeoverCount == 0) {
+                M68kTakeoverCount = 1;
+                // Reset the 68K CPU from the seeded low-memory vector table
+                // (SSP 0x0000 = 0xA000, PC 0x0004 = 0x4080002A, SR = 0x2700).
+                M68kReset ();
+            }
+            // On real hardware the PPC nanokernel preempts emulated 68K
+            // code asynchronously (decrementer tick). Without this, any 68K
+            // "wait for interrupt" park loop spins forever because the C
+            // interpreter never checks the PPC interrupt state mid-batch.
+            // Flag it here and let the normal end-of-iteration tick logic /
+            // loop-top delivery run, with SRR0 = Next = the dispatch entry
+            // we will resume from.
+            if (g_PpcContext.DecrementerWritten &&
+                g_PpcContext.DecrementerNegative &&
+                (g_PpcContext.Msr & PPC_MSR_EE) &&
+                g_PpcContext.ExceptionPending == 0) {
+                g_PpcContext.ExceptionPending = PPC_EXCEPTION_DECREMENTER;
+                // Wake a 68K STOP #imm park: the interrupt will be serviced
+                // at the PPC level, then the 68K batch resumes afterwards.
+                g_M68kContext.Stopped = FALSE;
+                {
+                    static UINTN WakeCount = 0;
+                    WakeCount++;
+                    if ((WakeCount & 1023) == 1) {
+                        Print(L"  68K WAKE [#%d] DEC pending\n", (UINT32)WakeCount);
+                    }
+                }
+            }
+            Status = M68kExecuteFromPPC ();
+            g_PpcContext.Gpr[27] = 0;
+            g_PpcContext.Gpr[29] = 0x40B80000;
+            Next = 0x40B67B60;
+            Hooked = 1;
+        }
+#endif
+        // Post-OS-handoff native-DR continuation: the C-68K takerover
+        // (DrC68kTrapRequest == 2 -> M68kExecuteFromPPC) has been REMOVED.
+        // SheepShaver reference (emul_ppc.cpp:1053-1084): the ROM's own PPC
+        // DR runs the entire 68K OS loader natively; host C serves only the
+        // patched EMUL_OP opcode-slot markers (interpreter.c:3188-3205 via
+        // EmulOpDispatch), and 68K A-traps are serviced by the OS's own 68K
+        // trap dispatcher under the DR. DrC68kTrapRequest is kept as a phase
+        // marker only (set to 1 by OSINJECT) so the post-handoff DR dispatch
+        // is observed, not diverted.
+        if (Current == 0x40B6CA84 && Instr == 0x4E800421) {
+            // Tail's `bctrl` (software fn ed.v[0x80C]). 68K MOVE #<imm>,SR
+            // (0x46FC) routes here via entry[0x46FC] -> 0x40B6C570 bnsl cr2
+            // -> 0x40B6CA68. r3 = address of imm word, r27 = SR value.
+            // ed.v[0x80C] is always NULL -- the bctrl would jump to address 0.
+            // Intercept, sync68K SR, advance r24 past the imm, and hand off
+            // to the native 68K dispatch loop at 0x40B67C60.
+            if (CpuRead32(0x0000B80C) == 0 && CpuRead16(g_PpcContext.Gpr[3] - 2) == 0x46FC) {
+                UINT16 Sr = CpuRead16(g_PpcContext.Gpr[3]);
+                g_PpcContext.Gpr[24] = g_PpcContext.Gpr[3] + 2;
+                g_PpcContext.Gpr[25] = Sr >> 8;
+                g_PpcContext.Gpr[26] = 0;
+                g_PpcContext.Gpr[27] = 0;
+                g_PpcContext.Gpr[29] = 0x40B80000;
+                g_PpcContext.Xer = 0;
+                g_PpcContext.Cr &= ~0x0F00000F;
+                g_PpcContext.Cr = (g_PpcContext.Cr & ~0x00F00000) | 0x00100000;
+                Next = 0x40B67C60;
+                Hooked = 1;
+                Print(L"  MOVE-SR-HOOK 46FC SR=0x%04x r24=0x%08x CR=0x%08x -> 0x40b67c60\n",
+                      Sr, g_PpcContext.Gpr[24], g_PpcContext.Cr);
+            }
+        }
+        if (Current == 0x40BA7380) {
+            // entry[0x4E70] = 68K RESET (software fn ed.v[0x828]): reset the
+            // external devices. Treated as a no-op; continue at opcode+2
+            // (r24 already points there from the common dispatch).
+            if (CpuRead32(0x0000B828) == 0 && CpuRead16(g_PpcContext.Gpr[24] - 2) == 0x4E70) {
+                g_PpcContext.Gpr[27] = 0;
+                g_PpcContext.Gpr[29] = 0x40B80000;
+                Next = 0x40B67C60;
+                Hooked = 1;
+                Print(L"  RESET-HOOK 4E70 r24=0x%08x CR=0x%08x -> 0x40b67c60\n",
+                      g_PpcContext.Gpr[24], g_PpcContext.Cr);
+            }
+        }
+        if (Current == 0x40BA73D8 && Instr == 0x80BF087C) {
+            // entry[0x4E7B] = 68K escape (software fn ed.v[0x87C]): the
+            // dispatch has already consumed the 2-byte parameter word into
+            // r27 and advanced r24 past the opcode (r24 = param address).
+            // Treated as a no-op; advance r24 past the parameter and resume
+            // the DR loop at the next 68K opcode.
+            if (CpuRead32(0x0000B87C) == 0 && CpuRead16(g_PpcContext.Gpr[24] - 2) == 0x4E7B) {
+                UINT32 Resume = g_PpcContext.Gpr[24] + 2;
+                UINT16 Param = (UINT16)g_PpcContext.Gpr[27];
+                g_PpcContext.Gpr[24] = Resume;
+                g_PpcContext.Gpr[27] = 0;
+                g_PpcContext.Gpr[29] = 0x40B80000;
+                Next = 0x40B67C60;
+                Hooked = 1;
+                Print(L"  4E7B-HOOK param=0x%04x resume=0x%08x CR=0x%08x -> 0x40b67c60\n",
+                      Param, Resume, g_PpcContext.Cr);
+            }
+        }
         // ---- 68K DR software-function trampoline (observation only) ----
         // The ROM's PPC DR emulator routes 68K opcodes that need a "software
         // function" (the DR's own PPC instruction generators) through a small
@@ -5765,6 +6006,48 @@ UINTN TbProbe = 0;
                   CpuRead32(0xB818), CpuRead32(0xB074), CpuRead32(0xB078), CpuRead32(0xB814),
                   CpuRead32(0xB2CC));
         }
+        // ---- Trap-stub parse probes: fire on FIRST execution of the
+        // 0x81E2 RTS-terminated stub parser (JSR trap dispatch). These are
+        // independent of the yield-window counters so they trigger on any
+        // boot path that reaches the parser.
+        if (DrTrapE0 == 0 && Current == 0x40B694E0) {
+            DrTrapE0 = 1;
+            Print(L"  TRAPSTUB-E0 r24=0x%08x r27=0x%04x r6=0x%04x r3=0x%08x r4=0x%08x "
+                  L"r29=0x%08x r16=0x%08x LR=0x%08x CTR=0x%08x CR=0x%08x\n",
+                  g_PpcContext.Gpr[24], g_PpcContext.Gpr[27] & 0xFFFF,
+                  g_PpcContext.Gpr[6] & 0xFFFF, g_PpcContext.Gpr[3],
+                  g_PpcContext.Gpr[4], g_PpcContext.Gpr[29],
+                  g_PpcContext.Gpr[16], g_PpcContext.Lr,
+                  g_PpcContext.Ctr, g_PpcContext.Cr);
+        }
+        if (DrTrap80 == 0 && Current == 0x40B97980) {
+            DrTrap80 = 1;
+            Print(L"  TRAPSTUB-97980 r24=0x%08x r27=0x%04x r3=0x%08x r4=0x%08x "
+                  L"r29=0x%08x r16=0x%08x LR=0x%08x CR=0x%08x\n",
+                  g_PpcContext.Gpr[24], g_PpcContext.Gpr[27] & 0xFFFF,
+                  g_PpcContext.Gpr[3], g_PpcContext.Gpr[4],
+                  g_PpcContext.Gpr[29], g_PpcContext.Gpr[16],
+                  g_PpcContext.Lr, g_PpcContext.Cr);
+        }
+        if (DrTrap00 == 0 && Current == 0x40B69500) {
+            DrTrap00 = 1;
+            Print(L"  TRAPSTUB-500 r3=0x%08x r4=0x%08x r24=0x%08x r27=0x%04x "
+                  L"r29=0x%08x r16=0x%08x LR=0x%08x CTR=0x%08x CR=0x%08x  "
+                  L"-> dispatched handler ptr is r4 after lwzx\n",
+                  g_PpcContext.Gpr[3], g_PpcContext.Gpr[4],
+                  g_PpcContext.Gpr[24], g_PpcContext.Gpr[27] & 0xFFFF,
+                  g_PpcContext.Gpr[29], g_PpcContext.Gpr[16],
+                  g_PpcContext.Lr, g_PpcContext.Ctr, g_PpcContext.Cr);
+        }
+        if (DrTrap1C == 0 && Current == 0x40B6951C) {
+            DrTrap1C = 1;
+            Print(L"  TRAPSTUB-51C r24=0x%08x r27=0x%04x r3=0x%08x r4=0x%08x "
+                  L"r29=0x%08x r16=0x%08x LR=0x%08x CTR=0x%08x CR=0x%08x\n",
+                  g_PpcContext.Gpr[24], g_PpcContext.Gpr[27] & 0xFFFF,
+                  g_PpcContext.Gpr[3], g_PpcContext.Gpr[4],
+                  g_PpcContext.Gpr[29], g_PpcContext.Gpr[16],
+                  g_PpcContext.Lr, g_PpcContext.Ctr, g_PpcContext.Cr);
+        }
         if (PutsProbed < 4000 && Current == 0x40B26444) {
             UINT8 Ch = (UINT8)(g_PpcContext.Gpr[29] & 0xFF);
             if (PutsProbed < sizeof(PutsBuf) - 1) {
@@ -5990,9 +6273,230 @@ UINTN TbProbe = 0;
                         DrOsInjected = 1;
                         PpcCopyGuestMemory(0x00000000u, SysBase + 0x200, 0xA0);
                         PpcCopyGuestMemory(0x000002AE, SysBase + 0x2AE, 4);
+                        // The ROM $A9A0 handler (0x40865E40) ends every outcome
+                        // path with `movea.l ($698).w,a0; jmp (a0)`. With low-RAM
+                        // [0x698]==0 the DR jumps 0x4086604E -> 0x0 and restarts
+                        // the injected stub, looping forever. On a real Mac the
+                        // 68K loader pre-sets [0x698] to its resume PC before the
+                        // trap; seed it to the stub's post-trap address (0xE) so
+                        // the handler's terminal jump continues the OS bootstrap.
+                        CpuWrite32(0x00000698u, 0x0000000Eu);
+                        // The handler also requires selector 'PDEF' ([sp+6],
+                        // pushed by our stub's `move.l #'boot',-(sp)` at low-RAM
+                        // 0x4) and version < 8 ([sp+4]; stub pushes #1, OK) to
+                        // take its real success path (traps A88F/A9C4/A8FD/A99A,
+                        // then [0x0A5A] <- [[0x0A50]]). Patch the staged
+                        // immediate 'boot' (62 6F 6F 74) to 'PDEF' (50 44 45 46)
+                        // so the ROM's own bootstrap work actually runs.
+                        CpuWrite32(0x00000004u, 0x50444546u);
+                        // Seed the low-RAM 68K trap dispatch table at 0xE00.
+                        // The native DR reads the A-trap handler via
+                        // `lwzx r24,r6,r7` with r6=[gd+0x7B0]=0xE00 and
+                        // r7=4*(trap & 0x3ff): for $A9A0 that is [0xE00+0x680]
+                        // = [0x1480]. The table is normally built by the ROM's
+                        // own 68K bootstrap before OS handoff (which OSINJECT
+                        // bypasses), so mirror the ROM trap table (base =
+                        // ROMBase + [ROMBase+0x22], see SheepShaver
+                        // find_rom_trap) into low RAM. Entries are stored as
+                        // absolute 68K addresses (ROM-relative offset +
+                        // 0x40800000) because the DR jumps to the raw value.
+                        {
+                            UINT32 RomTbl = 0x40800000u + CpuRead32(0x40800022);
+                            UINT32 Idx;
+                            for (Idx = 0; Idx < 0x500u; Idx++) {
+                                UINT32 H = CpuRead32(RomTbl + 4 * Idx);
+                                if (H < 0x400000u)
+                                    H += 0x40800000u;
+                                CpuWrite32(0x00000E00u + 4 * Idx, H);
+                            }
+                            Print(L"  TRAP-SEED low-RAM 0xE00 <- ROM tbl 0x%08x: "
+                                  L"[A9A0@0x1480]=0x%08x [A9C9@0x1524]=0x%08x "
+                                  L"[A003@0x1E0C]=0x%08x\n",
+                                  RomTbl, CpuRead32(0x00001480),
+                                  CpuRead32(0x00001524),
+                                  CpuRead32(0x00001E0C));
+                        }
+                        // The DR dispatches a second trap class through a
+                        // SEPARATE low-RAM table. Block 0x40B69660 does
+                        // `lwzx r24,r6,r7` with r6=[gd+0x7B4]=0x400 and
+                        // r7=4*(trap & 0xff): for $A207 that is
+                        // [0x400+0x1C]=[0x41C]. The ROM's own init sets
+                        // [gd+0x7B4]=0x400 at 0x40B6DBC0 but the table
+                        // contents are normally built by the 68K bootstrap
+                        // (which OSINJECT bypasses); mirror the A-handler
+                        // into the low-byte slot like the 0xE00 table.
+                        CpuWrite32(0x00000400u + 4 * (0x207u & 0xFFu),
+                                   CpuRead32(0x00000E00u + 4 * 0x207u));
+                        CpuWrite32(0x00000400u + 4 * (0x003u & 0xFFu),
+                                   CpuRead32(0x00000E00u + 4 * 0x403u));
+                        Print(L"  TRAP-SEED low-RAM 0x400 (8-bit idx): "
+                              L"[A207@0x41C]=0x%08x [A003@0x40C]=0x%08x "
+                              L"gd[0xB7B4 base]=0x%08x\n",
+                              CpuRead32(0x0000041C),
+                              CpuRead32(0x0000040C),
+                              CpuRead32(0x0000B7B4u));
+                        // The 0x81E2 JST stub family (e.g. A207 handler
+                        // 0x4087BAA0 -> jsr 0x4087C902: `81E2 2054 0064`)
+                        // dispatches handler = M32([0x2054] + d16). The
+                        // offsets ARE 4*(trap&0x3ff), exactly like the native
+                        // A-trap path, so the correct [0x2054] is the low-RAM
+                        // trap dispatch mirror (0xE00) seeded above: disp 0x64
+                        // -> mirror[0x19]=0x4082D3CE.  The ROM's own 68K
+                        // bootstrap would set this pre-handoff; OSINJECT
+                        // skips it, leaving the stub to deref the stale
+                        // 0x40800000 (=ROM base) -> M32(0x40800064)=0x79EC0000
+                        // garbage and derailing the DR.
+                                                CpuWrite32(0x00002054u, 0x00000E00u);
+                        Print(L"  TRAP-SEED [0x2054]=0x00000E00 (0x81E2 JST "
+                              L"stub base) -> [0xE64]=0x%08x [0xE68]=0x%08x "
+                              L"[0xE6C]=0x%08x [0xE70]=0x%08x\n",
+                              CpuRead32(0x00000E64u),
+                              CpuRead32(0x00000E68u),
+                              CpuRead32(0x00000E6Cu),
+                              CpuRead32(0x00000E70u));
+                        // Stage the PPC-native OS bootstrap at low-RAM 0x1B400
+                        // by mirroring the bytes already staged in the guest
+                        // native image at SysBase+0x1B400. Without this the
+                        // OSINLOW event path reaches its terminal
+                        // `movea.l $2ae.w,a0; jmp $a(a0)` (0x1B412+0xA ==
+                        // 0x1B41C) and finds the low-RAM entry empty, so the
+                        // 68K->PPC bootstrap handoff cannot start. OSINJECT is
+                        // the single natural point to do the mirror: it built
+                        // the stub at low-RAM 0x0 from SysBase+0x200 and sealed
+                        // the trap pointers into the low-RAM trap table.
+                        {
+                            UINT32 Ns;
+                            UINT32 NsSrc = PPC_OS_RUNTIME_GUEST_BASE + 0x1B400u;
+                            for (Ns = 0; Ns < 0x200u; Ns += 4) {
+                                CpuWrite32(0x0001B400u + Ns,
+                                           CpuRead32(NsSrc + Ns));
+                            }
+                            Print(L"  STAGE-NATIVE low-RAM 0x1B400 <- SysBase+"
+                                  L"0x1B400 (%u bytes)\n",
+                                  0x200u);
+                            Print(L"    [0x1B400]=0x%08x [0x1B404]=0x%08x "
+                                  L"[0x1B408]=0x%08x [0x1B40C]=0x%08x\n"
+                                  L"    [0x1B410]=0x%08x [0x1B414]=0x%08x "
+                                  L"[0x1B418]=0x%08x [0x1B41C]=0x%08x\n"
+                                  L"    [0x1B420]=0x%08x [0x1B424]=0x%08x "
+                                  L"[0x1B428]=0x%08x [0x1B42C]=0x%08x\n",
+                                  CpuRead32(0x0001B400u),
+                                  CpuRead32(0x0001B404u),
+                                  CpuRead32(0x0001B408u),
+                                  CpuRead32(0x0001B40Cu),
+                                  CpuRead32(0x0001B410u),
+                                  CpuRead32(0x0001B414u),
+                                  CpuRead32(0x0001B418u),
+                                  CpuRead32(0x0001B41Cu),
+                                  CpuRead32(0x0001B420u),
+                                  CpuRead32(0x0001B424u),
+                                  CpuRead32(0x0001B428u),
+                                  CpuRead32(0x0001B42Cu));
+                        }
+                        // EXPERIMENT (reversible): the ROM A207 handler
+                        // 0x4087BAA0 ends with `move.l #$aa55aa55,d0; rts`
+                        // (0x4087BAEE: 203C AA55 AA55), so the OSINLOW stub's
+                        // `bne 0x5C` after A207 is ALWAYS taken and the loader
+                        // idle-loops forever (EVTQ empty, [a0+0x42]=0, per the
+                        // A207CAP capture). A207 never returns 0 no matter what
+                        // is queued. Patch the 6-byte tail verb to
+                        // `sub.l d0,d0; rts; nop; nop` so A207 returns D0=0 and
+                        // the stub reaches the 0x28 gate. Coupled with the arm-
+                        // site prefill of [frame+0x42]=1 (below), the stub's
+                        // event path + A003 + [0x2AE] jump will actually run.
+                        if (g_DrA207Steer != 0) {
+                            CpuWrite32(0x4087BAEEu, 0x4E404E75u);
+                            CpuWrite32(0x4087BAF2u, 0x4E714E71u);
+                            Print(L"  A207STEER patched 0x4087BAEE -> "
+                                  L"sub.l d0,d0; rts (D0=0)\n");
+                        }
+                        // DIAG: the 0x81E2 JST stub family reads the trap
+                        // handler table pointer from low-RAM base slots
+                        // (0x2010/0x2054/0x2064/...). Dump every base slot,
+                        // the RomTbl entries the stub offsets (0x64-0x70)
+                        // would hit, and the current mirror contents so the
+                        // correct [0x2054] value can be derived.
+                        {
+                            UINT32 Slot, RtE;
+                            UINT32 Rtbl = 0x40800000u +
+                                          CpuRead32(0x40800022);
+                            Print(L"  DRSEED-DIAG RomTbl=0x%08x\n", Rtbl);
+                            for (Slot = 0x00002010u; Slot <= 0x00002090u;
+                                 Slot += 4) {
+                                Print(L"  DRSEED-DIAG [0x%04x]=0x%08x\n",
+                                      Slot, CpuRead32(Slot));
+                            }
+                            for (RtE = 0x19u; RtE <= 0x1Du; RtE++) {
+                                Print(L"  DRSEED-DIAG RomTbl[0x%02x]=0x%08x "
+                                      L"mirror[0x%02x]=0x%08x\n",
+                                      RtE, CpuRead32(Rtbl + 4 * RtE),
+                                      RtE, CpuRead32(0x00000E00u + 4 * RtE));
+                            }
+                            Print(L"  DRSEED-DIAG RomTbl[0x1a0]=0x%08x "
+                                  L"[0x40800064]=0x%08x [0x40800070]=0x%08x\n",
+                                  CpuRead32(Rtbl + 4 * 0x1A0u),
+                                  CpuRead32(0x00000064u | 0x40800000u),
+                                  CpuRead32(0x00000070u | 0x40800000u));
+                        }
+                        // The DR cannot service 68K A-traps in the injected
+                        // low-RAM stub: its trap dispatch re-reads the resume-pc
+                        // slot [r28+0x28], and with r28 pinned to the ROM
+                        // handoff block (0x4080AABC) that slot is read-only ROM
+                        // data (0x2649D7EB) -> the 68K is marched to garbage.
+                        // NOTE: r28 is pinned to 0x4080AABC only during this
+                        // handoff; keep the native DR path and observe. If the
+                        // A-trap dispatch still reads a ROM slot, the SheepShaver
+                        // answer is patching the trap table / EMUL_OP dispatch,
+                        // NOT diverting to a hand-rolled 68K interpreter.
+                        DrC68kTrapRequest = 1;
                         Print(L"  OSINJECT stub from guest 0x%x+0x200 -> low-RAM 0x0 "
-                              L"(0xA0 bytes); word0=%08x 0x2AE ptr=0x%08x\n",
-                              SysBase, StubWord0, CpuRead32(0x000002AE));
+                              L"(0xA0 bytes); word0=%08x 0x2AE ptr=0x%08x "
+                              L"0x698 resume=0x%08x sel=0x%08x "
+                              L"(native-DR phase marker)\n",
+                              SysBase, StubWord0, CpuRead32(0x000002AE),
+                              CpuRead32(0x00000698), CpuRead32(0x00000004));;
+                        {
+                            // Dump the low-RAM 68K OS-boot world at the exact
+                            // handoff: 0x0..0x100 (the injected stub + vectors)
+                            // and 0xA000..0xB000 (KDP/DR-emulator + relocated
+                            // boot area that the 68K then marches through).
+                            UINT32 A;
+                            for (A = 0x00000000u; A < 0x00000100u; A += 16) {
+                                Print(L"  OSINLOW[0x%04x] %08x %08x %08x %08x\n",
+                                      A, CpuRead32(A), CpuRead32(A + 4),
+                                      CpuRead32(A + 8), CpuRead32(A + 12));
+                            }
+                            for (A = 0x0000A000u; A < 0x0000B000u; A += 16) {
+                                Print(L"  OSINLOW[0x%04x] %08x %08x %08x %08x\n",
+                                      A, CpuRead32(A), CpuRead32(A + 4),
+                                      CpuRead32(A + 8), CpuRead32(A + 12));
+                            }
+                        }
+                        // DIAG: does the staged System data fork actually carry
+                        // the OS bootstrap that low-RAM [0x2AE] (0x1B412) points
+                        // at? The OSINJECT copy only stages the 0xA0-byte stub +
+                        // [0x2AE] + trap tables; the [0x2AE]+0xA jump needs real
+                        // code at file offset 0x1B412. Dump the source region
+                        // (read-only) so we know whether restaging it into low
+                        // RAM is viable.
+                        {
+                            UINT32 A;
+                            Print(L"  OSSTAGE-DIAG SysBase=0x%08x stub0=0x%08x "
+                                  L"[0x2AE]=0x%08x\n",
+                                  SysBase, StubWord0, CpuRead32(0x000002AE));
+                            for (A = 0x00000000u; A < 0x00000100u; A += 4) {
+                                Print(L"  OSSTAGE-DIAG src+0x%04x=0x%08x\n",
+                                      A, CpuRead32(SysBase + A));
+                            }
+                            for (A = 0x00001B000u; A < 0x00001B080u; A += 4) {
+                                Print(L"  OSSTAGE-DIAG src+0x%05x=0x%08x\n",
+                                      A, CpuRead32(SysBase + A));
+                            }
+                            for (A = 0x00001B400u; A < 0x00001B480u; A += 4) {
+                                Print(L"  OSSTAGE-DIAG src+0x%05x=0x%08x\n",
+                                      A, CpuRead32(SysBase + A));
+                            }
+                        }
                     } else {
                         Print(L"  OSINJECT SKIP: staged OS runtime empty at 0x%08x "
                               L"(word0=%08x)\n", SysBase, StubWord0);
@@ -6000,18 +6504,48 @@ UINTN TbProbe = 0;
                 }
             }
         }
+        // DR service 0x116 (called at 0x4080AA36 `dc.w 0x60ff; dc.w 0x116`,
+        // return address a6 = 0x4080AA3C, 68K a6 = r22, D0 = r8): the caller
+        // tests D0 bit0 (`btst.b #0,d0`) and, when SET, relocates its image to
+        // low RAM and `jmp (pc,d3.l)`s into the 0xAA5A mirror -- which our boot
+        // never stages, so the 68K marches through zeros.  Force bit0 CLEAR so
+        // the driver keeps executing out of ROM (0x4080AA5C onward).
+        if (g_DrRelocGate == 0 && g_DrYieldSeen &&
+            (g_PpcContext.Gpr[22] == 0x4080AA3Cu ||
+             g_PpcContext.Gpr[24] == 0x4080AA3Cu ||
+             g_PpcContext.Gpr[24] == 0x4080AA3Eu)) {
+            g_DrRelocGate = 1;
+            g_PpcContext.Gpr[8] &= ~1u;
+            Print(L"  DRSRV116-GATE r24(68Kpc)=0x%08x a6=0x%08x: cleared D0 "
+                  L"bit0 (skip low-RAM relocation)\n",
+                  g_PpcContext.Gpr[24], g_PpcContext.Gpr[22]);
+        }
         if (Dr68KLowProbed == 0 && g_DrYieldSeen && g_DrBootPcSeeded &&
             (Current >= 0x40B60000 && Current < 0x40B82000)) {
             UINT32 Pc24 = g_PpcContext.Gpr[24];
+            static UINT32 PcRing[16];
+            static UINT32 PcRingN = 0;
+            PcRing[PcRingN++ & 15] = Pc24;
             if (Dr68KLast >= 0x40800000 && Pc24 < 0x40000000) {
                 UINTN A;
+                UINTN I;
                 Dr68KLowProbed = 1;
+                for (I = 0; I < 16; I++) {
+                    UINT32 Rv = PcRing[(PcRingN + I) & 15];
+                    if (Rv != 0)
+                        Print(L"  PRELOW[-%02u] 68Kpc=0x%08x\n", 16 - I, Rv);
+                }
                 Print(L"  DR68K-LOW[1] exec=%u PPC=0x%08x r24(68Kpc)=0x%08x r27=0x%04x "
                       L"r23=0x%08x r29=0x%08x r31=0x%08x r1=0x%08x LR=0x%08x CTR=0x%08x\n",
                       Executed, Current, Pc24, g_PpcContext.Gpr[27] & 0xFFFF,
                       g_PpcContext.Gpr[23], g_PpcContext.Gpr[29],
                       g_PpcContext.Gpr[31], g_PpcContext.Gpr[1],
                       g_PpcContext.Lr, g_PpcContext.Ctr);
+                for (A = 0x0000A000u; A < 0x0000AC00u; A += 16) {
+                    Print(L"  LOWA[0x%08x] %08x %08x %08x %08x\n",
+                          A, CpuRead32(A), CpuRead32(A + 4),
+                          CpuRead32(A + 8), CpuRead32(A + 12));
+                }
                 for (A = 0x00000000u; A < 0x00002000u; A += 16) {
                     Print(L"  LOW[0x%08x] %08x %08x %08x %08x\n",
                           A, CpuRead32(A), CpuRead32(A + 4),
@@ -6089,6 +6623,19 @@ UINTN TbProbe = 0;
                           A, CpuRead32(A), CpuRead32(A + 4),
                           CpuRead32(A + 8), CpuRead32(A + 12));
                 }
+                // ROM dump: the 0x4080AFBE 68K boot routine that walks the
+                // descriptor table and the 0x4080E1xx descriptor/blob region
+                // it jumps into (to find the intended low-RAM 0x112 glue).
+                for (A = 0x4080AF60u; A < 0x4080B040u; A += 16) {
+                    Print(L"  ROMBOOT [%08x] %08x %08x %08x %08x\n",
+                          A, CpuRead32(A), CpuRead32(A + 4),
+                          CpuRead32(A + 8), CpuRead32(A + 12));
+                }
+                for (A = 0x4080E000u; A < 0x4080E300u; A += 16) {
+                    Print(L"  ROMDESC [%08x] %08x %08x %08x %08x\n",
+                          A, CpuRead32(A), CpuRead32(A + 4),
+                          CpuRead32(A + 8), CpuRead32(A + 12));
+                }
             }
         }
         // Post-inject 68K boot-step trace: from the OS-handoff `jmp (a4)` (68K
@@ -6142,6 +6689,46 @@ UINTN TbProbe = 0;
                 TrapTraceD0[TrapTraceIdx] = g_PpcContext.Gpr[8] & 0xFFFFFFFF;
                 TrapTraceA0[TrapTraceIdx] = g_PpcContext.Gpr[16] & 0xFFFFFFFF;
                 TrapTracePpc[TrapTraceIdx] = Current;
+                if ((Pc24 == 0x4080AD50u || (TrapTraceIdx == 1 && TrapTraceDumpedApex == 0)) &&
+                    TrapTraceDumpedApex == 0) {
+                    TrapTraceDumpedApex = 1;
+                    Print(L"  APEX r1=0x%08x r16=0x%08x r17=0x%08x r18=0x%08x r19=0x%08x "
+                          L"r20=0x%08x r21=0x%08x r22=0x%08x r23=0x%08x\n",
+                          g_PpcContext.Gpr[1], g_PpcContext.Gpr[16],
+                          g_PpcContext.Gpr[17], g_PpcContext.Gpr[18],
+                          g_PpcContext.Gpr[19], g_PpcContext.Gpr[20],
+                          g_PpcContext.Gpr[21], g_PpcContext.Gpr[22],
+                          g_PpcContext.Gpr[23]);
+                    Print(L"  APEX r24=0x%08x r25=0x%08x r26=0x%08x r28=0x%08x r29=0x%08x "
+                          L"r30=0x%08x r31=0x%08x LR=0x%08x CTR=0x%08x\n",
+                          g_PpcContext.Gpr[24], g_PpcContext.Gpr[25],
+                          g_PpcContext.Gpr[26], g_PpcContext.Gpr[28],
+                          g_PpcContext.Gpr[29], g_PpcContext.Gpr[30],
+                          g_PpcContext.Gpr[31], g_PpcContext.Lr, g_PpcContext.Ctr);
+                    Print(L"  APEX MSR=0x%08x SRR0=0x%08x SRR1=0x%08x SPRG0=0x%08x "
+                          L"SPRG1=0x%08x SPRG2=0x%08x SPRG3=0x%08x\n",
+                          g_PpcContext.Msr, g_PpcContext.Srr0, g_PpcContext.Srr1,
+                          g_PpcContext.Spr[272], g_PpcContext.Spr[273],
+                          g_PpcContext.Spr[274], g_PpcContext.Spr[275]);
+                    {
+                        UINT32 A;
+                        Print(L"  APEX vec0x30=0x%08x vec0x28=0x%08x vec0x2C=0x%08x "
+                              L"vec0x34=0x%08x vec0x70=0x%08x\n",
+                              CpuRead32(0x00000030), CpuRead32(0x00000028),
+                              CpuRead32(0x0000002C), CpuRead32(0x00000034),
+                              CpuRead32(0x00000070));
+                        for (A = 0x000002E0u; A < 0x00000300u; A += 16) {
+                            Print(L"  APEX LOW[0x%04x] %08x %08x %08x %08x\n",
+                                  A, CpuRead32(A), CpuRead32(A + 4),
+                                  CpuRead32(A + 8), CpuRead32(A + 12));
+                        }
+                        for (A = 0x0000FB80u; A < 0x0000FBA0u; A += 16) {
+                            Print(L"  APEX LOW[0x%04x] %08x %08x %08x %08x\n",
+                                  A, CpuRead32(A), CpuRead32(A + 4),
+                                  CpuRead32(A + 8), CpuRead32(A + 12));
+                        }
+                    }
+                }
                 TrapTraceIdx++;
             }
         }
@@ -6158,6 +6745,40 @@ UINTN TbProbe = 0;
                       T, TrapTracePc[T], TrapTraceOp[T],
                       (TrapTraceOp[T] >> 8) & 0xFF,
                       TrapTraceD0[T], TrapTraceA0[T], TrapTracePpc[T]);
+            }
+        }
+        // Reset-vector entry probe: if the guest PPC ever jumps to the Mach
+        // reset vector (0xFFF00100) or the ROM reset entry in the middle of
+        // the run, that is the smoking gun for a guest-requested platform
+        // reset (the interpreter otherwise never leaves the ROM program).
+        if (g_PpcContext.Pc == 0xFFF00100u ||
+            (g_PpcContext.Pc >= 0xFFF00000u && g_PpcContext.Pc < 0xFFF01000u)) {
+            Print(L"  RESETVEC-ENTRY PC=0x%08x exec=%u SRR0=0x%08x SRR1=0x%08x "
+                  L"r1=0x%08x r24=0x%08x r27=0x%04x MSR=0x%08x\n",
+                  (UINT32)g_PpcContext.Pc, Executed, g_PpcContext.Srr0,
+                  g_PpcContext.Srr1, g_PpcContext.Gpr[1],
+                  g_PpcContext.Gpr[24] & 0xFFFFFFFF,
+                  g_PpcContext.Gpr[27] & 0xFFFF, g_PpcContext.Msr);
+        }
+        // A-line exec trace: once the first A-line trap has been dumped, print
+        // the next instructions verbatim so the DR's real trap-dispatch stream
+        // (and whatever ends it) is visible in the log.
+        if (g_DrYieldSeen) {
+            static UINT32 AtraceOn = 0, AtraceN = 0;
+            if (AtraceOn == 0 && TrapTraceDumpDone && TrapTraceIdx > 0) {
+                UINT32 Pc24 = g_PpcContext.Gpr[24] & 0xFFFFFFFF;
+                if (Pc24 >= 0x40800000u && Pc24 < 0x40840000u)
+                    AtraceOn = 1;
+            }
+            if (AtraceOn && AtraceN < 800) {
+                Print(L"  ATRACE[%03u] ppc=0x%08x r24=0x%08x op=0x%04x "
+                      L"r28=0x%08x r29=0x%08x r31=0x%08x LR=0x%08x\n",
+                      AtraceN, (UINT32)Current,
+                      g_PpcContext.Gpr[24] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[27] & 0xFFFF,
+                      g_PpcContext.Gpr[28], g_PpcContext.Gpr[29],
+                      g_PpcContext.Gpr[31], g_PpcContext.Lr);
+                AtraceN++;
             }
         }
         // Single-shot base-drift probe: catch the FIRST moment the DR's memory
@@ -6250,13 +6871,435 @@ UINTN TbProbe = 0;
         // the DR emulator range instructions with the 68K PC/opcode pair so the
         // exact word stream the DR re-executes from the resume is recoverable
         // and can be matched against the ROM bytes at the 68K PC. Bounded.
-        if (g_DrPostYieldWindow && g_DrPostYieldWindow < 6000 &&
+        // All trace blocks are additionally gated on the yield count so they
+        // keep tracing across many yield cycles: the window band recurs every
+        // yield, and the higher bound lets the trap-stub/JSR phase (reached
+        // several yields in) still be observed.
+        if (g_DrYieldCount < 64 && g_DrPostYieldWindow && g_DrPostYieldWindow < 6000 &&
             (Current >= 0x40B67A00 && Current < 0x40B82000)) {
+            UINT32 Y68K1 = g_PpcContext.Gpr[24];
+            UINT32 Yop1 = CpuRead16(Y68K1);
+            UINT32 Yop2 = CpuRead16(Y68K1 + 2);
             g_DrPostYieldWindow++;
-            if ((g_DrPostYieldWindow & 3) == 0) {
-                Print(L"  Y80[%u] PPC=0x%08x r24(68Kpc)=0x%08x r27=0x%04x r1=0x%08x\n",
-                      g_DrPostYieldWindow, Current, g_PpcContext.Gpr[24],
-                      g_PpcContext.Gpr[27] & 0xFFFF, g_PpcContext.Gpr[1]);
+            if (g_DrPostYieldWindow < 1240 && (g_DrPostYieldWindow & 3) == 0) {
+                Print(L"  Y80[%u] PPC=0x%08x r24(68Kpc)=0x%08x op=0x%04x nxt=0x%04x "
+                      L"r27=0x%04x r29=0x%08x r1=0x%08x\n",
+                      g_DrPostYieldWindow, Current, Y68K1, Yop1, Yop2,
+                      g_PpcContext.Gpr[27] & 0xFFFF, g_PpcContext.Gpr[29],
+                      g_PpcContext.Gpr[1]);
+                Print(L"  POSTY80[%u] PPC=0x%08x r29=0x%08x r1=0x%08x\n",
+                      g_DrPostYieldWindow, Current, g_PpcContext.Gpr[29],
+                      g_PpcContext.Gpr[1]);
+            }
+            // Decode the spill band: once the 68K PC first enters the low-RAM
+            // zone (>= 0xA800), capture every subsequent instr's op + the PPC
+            // handler address so the run-off path is seen word-for-word.
+            if (Y68K1 >= 0x0000A800u && Y68K1 < 0x0000C000u && g_DrSpillDump < 96) {
+                Print(L"  Y85[%u] 68Kpc=0x%04x op=0x%04x nxt=0x%04x r27=0x%04x "
+                      L"PPC=0x%08x r14=0x%08x r29=0x%08x CR=0x%08x\n",
+                      g_DrSpillDump, Y68K1, Yop1, Yop2,
+                      g_PpcContext.Gpr[27] & 0xFFFF, Current, g_PpcContext.Gpr[14],
+                      g_PpcContext.Gpr[29], g_PpcContext.Cr);
+                g_DrSpillDump++;
+            }
+// JSR-derail fine trace: log EVERY post-yield window (not every
+            // 4th) across the DR fetch/dispatch region so the exact PPC block
+            // that fetches the jsr operand (0x4087BAA6 4EBA 0E5A), loads the
+            // displacement, and computes the target is seen instruction-by-
+            // instruction. Range 0x40B67B00-0x40B67DC0 covers the main opcode
+            // fetch loop (0x40B67B60-0x40B67C5C) and the branch-relative
+            // target helpers (0x40B67C60-0x40B67D80).
+            if (g_DrJsrTrace < 2500u && g_DrPostYieldWindow >= 600u &&
+                g_DrPostYieldWindow <= 820u &&
+                ((Current >= 0x40B67B00u && Current <= 0x40B67D80u) ||
+                 (Current >= 0x40B694C0u && Current <= 0x40B69530u) ||
+                 (Current >= 0x40B97940u && Current <= 0x40B97988u) ||
+                 (Current >= 0x40B90380u && Current <= 0x40B903C8u))) {
+                UINT32 Insw;
+                g_DrJsrTrace++;
+                Insw = CpuRead32(Current);
+                Print(L"  JSX[%u] PPC=0x%08x ins=0x%08x r24=0x%08x op=0x%04x nxt=0x%04x "
+                      L"r6=0x%08x r27=0x%08x r29=0x%08x r3=0x%08x r4=0x%08x "
+                      L"r16=0x%08x r1=0x%08x LR=0x%08x CTR=0x%08x CR=0x%08x\n",
+                      g_DrJsrTrace, Current, Insw, Y68K1, Yop1, Yop2,
+                      g_PpcContext.Gpr[6], g_PpcContext.Gpr[27] & 0xFFFF,
+                      g_PpcContext.Gpr[29], g_PpcContext.Gpr[3],
+                      g_PpcContext.Gpr[4], g_PpcContext.Gpr[16],
+                      g_PpcContext.Gpr[1],
+                      g_PpcContext.Lr, g_PpcContext.Ctr, g_PpcContext.Cr);
+                if (g_DrJsrTrace == 1) {
+                    UINT32 A;
+                    Print(L"  DRCODE dump 0x40B65000..0x40B67A00 (decoded ROM, handler region):\n");
+                    for (A = 0x40B65000u; A < 0x40B67A00u; A += 16) {
+                        Print(L"  DRCODE[%08x] %08x %08x %08x %08x\n",
+                              A, CpuRead32(A), CpuRead32(A + 4),
+                              CpuRead32(A + 8), CpuRead32(A + 12));
+                    }
+                }
+            }
+            // CRASH-ZONE fine trace: when the DR post-yield count is in the
+            // [2214..2240] range (corresponds to Y80[553..560], the zone where
+            // QEMU terminates on -no-reboot runs), log EVERY yield (not every
+            // 4th) so we see the exact last instruction before the crash.
+            if (g_DrPostYieldWindow >= 2214u && g_DrPostYieldWindow <= 2240u) {
+                Print(L"  CRASHZONE[%u] PPC=0x%08x r24=0x%08x op=0x%04x "
+                      L"r29=0x%08x r1=0x%08x LR=0x%08x CR=0x%08x\n",
+                      g_DrPostYieldWindow, Current, Y68K1, Yop1,
+                      g_PpcContext.Gpr[29], g_PpcContext.Gpr[1],
+                      g_PpcContext.Lr, g_PpcContext.Cr);
+            }
+        }
+        // Wild-trap-target probe: the OS-injection boot stub's first A-trap
+        // ($A9A0 at low-RAM 0xC) dispatches the 68K to a garbage PC (0x2649D7EB)
+        // instead of a real ROM/trap-table handler. Catch the FIRST wild 68K PC
+        // in the post-handoff phase and dump the DR gd word-fetch slots
+        // (gd = r31 = 0xB000) plus the System TVector trap-table region
+        // (low-RAM 0x2AE -> 0x1B412) to see which slot feeds the dispatch.
+        if (DrWildTrapProbed == 0 && g_DrYieldSeen) {
+            UINT32 Pc24 = g_PpcContext.Gpr[24] & 0xFFFFFFFF;
+            if (Pc24 >= 0x00010000u && Pc24 < 0x40000000u) {
+                UINT32 A;
+                DrWildTrapProbed = 1;
+                // A-trap service slots: [gd+0x720] (r3 vs [r28+0x28] guard),
+                // [gd+0x7B0] (trap-table base r6), [gd+0x804] (swfn r5).
+                Print(L"  WILDTRAP r24(68Kpc)=0x%08x PPC=0x%08x op=0x%04x exec=%u\n",
+                      Pc24, Current, g_PpcContext.Gpr[27] & 0xFFFF, Executed);
+                Print(L"  WILDTRAP trap-slots [0xB720]=0x%08x [0xB7B0]=0x%08x "
+                      L"[0xB804]=0x%08x r31=0x%08x\n",
+                      CpuRead32(0x0000B720), CpuRead32(0x0000B7B0),
+                      CpuRead32(0x0000B804), g_PpcContext.Gpr[31] & 0xFFFFFFFF);
+                Print(L"  WILDTRAP [r28+0x28]=0x%08x r28=0x%08x\n",
+                      CpuRead32((g_PpcContext.Gpr[28] & 0xFFFFFFFF) + 0x28),
+                      g_PpcContext.Gpr[28] & 0xFFFFFFFF);
+                Print(L"  WILDTRAP r1=%08x r6=%08x r7=%08x r8=%08x r9=%08x r10=%08x r14=%08x\n",
+                      g_PpcContext.Gpr[1] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[6] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[7] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[8] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[9] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[10] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[14] & 0xFFFFFFFF);
+                Print(L"  WILDTRAP r16=%08x r17=%08x r18=%08x r19=%08x r20=%08x r21=%08x r22=%08x\n",
+                      g_PpcContext.Gpr[16] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[17] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[18] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[19] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[20] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[21] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[22] & 0xFFFFFFFF);
+                Print(L"  WILDTRAP r23=%08x r26=%08x r28=%08x r29=%08x r30=%08x r31=%08x LR=%08x CTR=%08x\n",
+                      g_PpcContext.Gpr[23] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[26] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[28] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[29] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[30] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[31] & 0xFFFFFFFF,
+                      g_PpcContext.Lr, g_PpcContext.Ctr);
+                // DR gd word-fetch slots and ECB (0xB000..0xB800)
+                for (A = 0x0000B000u; A < 0x0000B800u; A += 16) {
+                    Print(L"  WILDTRAP gd[0x%04x] %08x %08x %08x %08x\n",
+                          A, CpuRead32(A), CpuRead32(A + 4),
+                          CpuRead32(A + 8), CpuRead32(A + 12));
+                }
+                // TVector trap table (low-RAM 0x2AE -> 0x1B412) + surrounds
+                for (A = 0x0001AFA0u; A < 0x0001BC00u; A += 16) {
+                    Print(L"  WILDTRAP tv[0x%04x] %08x %08x %08x %08x\n",
+                          A, CpuRead32(A), CpuRead32(A + 4),
+                          CpuRead32(A + 8), CpuRead32(A + 12));
+                }
+            }
+        }
+        // A-trap service decision probe: DR opcode entry[A-line]->0x40B6971C:
+        //   lwz r3,0x720(r31)  lwz r5,0x28(r28)  rlwinm r7,r29,0x1f,0x14,0x1d
+        //   lwz r6,0x7b0(r31)  bne cr7,0x40b6d770 (r3!=r5 -> swfn path)
+        //   lwzx r24,r6,r7                          (r3==r5 -> trap table read)
+        // Capture the guard inputs on the FIRST A-line trap more to reveal the
+        // expected [gd+0x720]/[gd+0x7B0]/[r28+0x28] wiring.
+        if (DrTrapDecide == 0) {
+            if (Current == 0x40B69738 || Current == 0x40B6972C ||
+                Current == 0x40B69794 || Current == 0x40B69788) {
+                DrTrapDecide = 1;
+                Print(L"  TRAPDECIDE PPC=0x%08x exec=%u r3=0x%08x r5=0x%08x r6=0x%08x "
+                      L"r7=0x%08x r28=0x%08x r24=0x%08x r29=0x%08x r31=0x%08x\n",
+                      Current, Executed,
+                      g_PpcContext.Gpr[3] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[5] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[6] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[7] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[28] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[24] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[29] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[31] & 0xFFFFFFFF);
+                Print(L"  TRAPDECIDE [0xB720]=0x%08x [0xB7B0]=0x%08x [r28+0x28]=0x%08x "
+                      L"opCpu=0x%04x\n",
+                      CpuRead32(0x0000B720), CpuRead32(0x0000B7B0),
+                      CpuRead32((g_PpcContext.Gpr[28] & 0xFFFFFFFF) + 0x28),
+                      CpuRead16((g_PpcContext.Gpr[24] & 0xFFFFFFFF) - 2));
+            }
+        }
+        // A207 dispatch path: DR block 0x40B69660 reads the trap handler via
+        // `lwz r6,0x7b4(r31)` (NOT 0x7b0 like the A9A0 block at 0x40B69720) then
+        // `lwzx r24,r6,r7`. Capture the table base r6=[0xB7B4] and index r7 on
+        // the first A207 dispatch to confirm the second table wiring.
+        if (DrTrapDecideB == 0) {
+            if (Current == 0x40B6966C || Current == 0x40B69678 ||
+                Current == 0x40B695EC || Current == 0x40B695F8) {
+                DrTrapDecideB = 1;
+                Print(L"  TRAPDECIDE2 PPC=0x%08x exec=%u r3=0x%08x r5=0x%08x r6=0x%08x "
+                      L"r7=0x%08x r28=0x%08x r24=0x%08x r29=0x%08x r31=0x%08x\n",
+                      Current, Executed,
+                      g_PpcContext.Gpr[3] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[5] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[6] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[7] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[28] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[24] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[29] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[31] & 0xFFFFFFFF);
+                Print(L"  TRAPDECIDE2 [0xB720]=0x%08x [0xB7B0]=0x%08x [0xB7B4]=0x%08x "
+                      L"[r28+0x28]=0x%08x opCpu=0x%04x\n",
+                      CpuRead32(0x0000B720), CpuRead32(0x0000B7B0),
+                      CpuRead32(0x0000B7B4),
+                      CpuRead32((g_PpcContext.Gpr[28] & 0xFFFFFFFF) + 0x28),
+                      CpuRead16((g_PpcContext.Gpr[24] & 0xFFFFFFFF) - 2));
+            }
+        }
+        // A207 trap dispatch net-leak compensation. The DR's native trap
+        // dispatch (block 0x40B69660) treats the A-line trap as a table call:
+        // r1 (the 68K A7) doubles as the DR's scratch frame pool (stwu
+        // r5,-0x20/-0x1c(r1) per dispatch; resume-pc saved at 0x1c(r1)), all
+        // unwound on its resume path. When our injected OSINLOW loop re-enters
+        // low RAM after the A207 chain, the dispatch leftovers (the 68K
+        // exception SR+PC, the 0x81E2 stub `2F30` arg cells, and the DR's
+        // scratch frames) are NOT unwound: r1 ratchets -0x102 per cycle.
+        // Restore the pre-dispatch SP at the OSINLOW landing -- an exception-
+        // return-equivalent -- so the boot loop stops burning the stack.
+        // Recorded at the dispatch block where r24 still = the past-trap 68K
+        // PC; the clamp only fires after r24 has entered the ROM handler and
+        // come back to low RAM (so a transient mid-dispatch low r24 cannot
+        // trigger it). Pre-dispatch SP is the post-LEA frame base that the
+        // OSINLOW work frame lives above, so clamping is safe.
+        {
+            if (Current == 0x40B6966C &&
+                (g_PpcContext.Gpr[24] & 0xFFFFFFFF) < 0x100u &&
+                CpuRead16((g_PpcContext.Gpr[24] & 0xFFFFFFFF) - 2) == 0xA207u) {
+                if (g_DrA207Land < 4) {
+                    Print(L"  A207ARM r24=0x%08x r1=0x%08x opm2=0x%04x "
+                          L"state=%u win=%u\n",
+                          g_PpcContext.Gpr[24] & 0xFFFFFFFF,
+                          g_PpcContext.Gpr[1],
+                          CpuRead16((g_PpcContext.Gpr[24] & 0xFFFFFFFF) - 2),
+                          g_DrA207ArmState, g_DrPostYieldWindow);
+                }
+                g_DrA207ArmPc = g_PpcContext.Gpr[24] & 0xFFFFFFFF;
+                g_DrA207ArmSp = g_PpcContext.Gpr[1];
+                g_DrA207ArmState = 1;
+                if (g_DrA207Land < 2) {
+                    UINT32 gi;
+                    UINT32 A0L = g_DrA207ArmSp & 0xFFFF;
+                    Print(L"  A207GPR-A r24=0x%08x r1=0x%08x win=%u a0frm=0x%04x\n",
+                          g_PpcContext.Gpr[24] & 0xFFFFFFFF,
+                          g_PpcContext.Gpr[1], g_DrPostYieldWindow, A0L);
+                    for (gi = 0; gi < 16; gi++) {
+                        Print(L"   A r%02u=0x%08x r%02u=0x%08x\n", gi,
+                              g_PpcContext.Gpr[gi],
+                              gi + 16,
+                              g_PpcContext.Gpr[gi + 16]);
+                    }
+                }
+                if (g_DrA207Steer != 0) {
+                    // Pre-fill the OSINLOW event gate [a0+0x42] so that, with
+                    // the A207 handler returning D0=0, the stub's
+                    // `move.w 0x42(a0),0x16(a0)` falls through to the event
+                    // path instead of `beq 0x66`. a0 == post-LEA SP == ArmSp.
+                    CpuWrite16((g_DrA207ArmSp & 0xFFFF) + 0x42, 1);
+                    // Event-select word [a0+0x44]: the stub's event gate copies
+                    // move.w 0x44(a0),0x18(a0), then `move.l d1,a1` +
+                    // `movea.l (a1),a1` derefs the event record. OSADV shows
+                    // [0x44]=0x0000, so the deref at 0x36 reads through a
+                    // 0 QNULL and faults back to the ratchet. Seed 0x44=1 so
+                    // the gate consumes a genuine record and falls to the
+                    // `[0x2AE]` native jump (option 1: real event).
+                    CpuWrite16((g_DrA207ArmSp & 0xFFFF) + 0x44, 1);
+                    // Resume-pc slot [r28+0x28]: the DR dispatch reads the
+                    // post-trap 68K PC back from [r28+0x28] and lands r24 there.
+                    // It reads 0 (A207CAP: LAND r24=0x00000000, [0xB028]=0), so
+                    // the stub restarts from low-RAM 0 instead of continuing at
+                    // 0x26 -> OSADV(0x28)/event path never run. Seed it with the
+                    // past-trap pc (r24==0x26 at ARM) so the DR resumes at the
+                    // `bne 0x5C` after the trap.
+                    UINT32 R28S = g_PpcContext.Gpr[28] & 0xFFFFFFFF;
+                    if (g_DrA207Land < 4) {
+                        Print(L"  A207RRES-A r28=0x%08x [r28+0x28]=0x%08x "
+                              L"r24=0x%08x -> seed 0x26\n",
+                              R28S, CpuRead32(R28S + 0x28),
+                              g_PpcContext.Gpr[24] & 0xFFFFFFFF);
+                    }
+                    CpuWrite32(R28S + 0x28, 0x00000026u);
+                    if (g_DrA207Land < 3) {
+                        Print(L"  A207STEER gate [0x%04x+0x42]=1 win=%u\n",
+                              (g_DrA207ArmSp & 0xFFFF), g_DrPostYieldWindow);
+                    }
+                }
+            }
+            if (g_DrA207ArmState != 0) {
+                UINT32 Pc24 = g_PpcContext.Gpr[24] & 0xFFFFFFFF;
+                if (g_DrA207ArmState == 1 && Pc24 >= 0x40800000u) {
+                    g_DrA207ArmState = 2;
+                } else if (g_DrA207ArmState == 2 && Pc24 < 0x100u) {
+                    UINT32 LandR1 = g_PpcContext.Gpr[1];
+                    g_DrA207ArmState = 0;
+                    if (g_DrA207Land < 4) {
+                        Print(L"  A207RRES-L r28=0x%08x [0xB028]=0x%08x "
+                              L"r24=0x%08x r1=0x%08x\n",
+                              g_PpcContext.Gpr[28] & 0xFFFFFFFF,
+                              CpuRead32(0x0000B028u), Pc24, LandR1);
+                    }
+                    if (g_DrA207Land < 2) {
+                        UINT32 gi;
+                        UINT32 A0L = g_DrA207ArmSp & 0xFFFF;
+                        Print(L"  A207GPR-L r24=0x%08x r1=0x%08x win=%u a0frm=0x%04x\n",
+                              Pc24, LandR1, g_DrPostYieldWindow, A0L);
+                        for (gi = 0; gi < 16; gi++) {
+                            Print(L"   L r%02u=0x%08x r%02u=0x%08x\n", gi,
+                                  g_PpcContext.Gpr[gi],
+                                  gi + 16,
+                                  g_PpcContext.Gpr[gi + 16]);
+                        }
+                        Print(L"   L SR(r25)=0x%08x CR=0x%08x LR=0x%08x\n",
+                              g_PpcContext.Gpr[25], g_PpcContext.Cr,
+                              g_PpcContext.Lr);
+                    }
+                    if (g_DrA207Cap == 0) {
+                        UINT32 OsA0 = g_DrA207ArmSp & 0xFFFF;
+                        UINT32 i;
+                        g_DrA207Cap = 1;
+                        Print(L"  A207CAP[1] win=%u r1=0x%08x d0g0=0x%08x "
+                              L"r8=0x%08x a0=0x%04x\n",
+                              g_DrPostYieldWindow, LandR1,
+                              g_PpcContext.Gpr[0] & 0xFFFFFFFF,
+                              g_PpcContext.Gpr[8] & 0xFFFFFFFF, OsA0);
+                        Print(L"    record "
+                              L"0x00=0x%08x 0x04=0x%08x 0x08=0x%08x "
+                              L"0x0C=0x%08x\n",
+                              CpuRead32(OsA0 + 0x00), CpuRead32(OsA0 + 0x04),
+                              CpuRead32(OsA0 + 0x08), CpuRead32(OsA0 + 0x0C));
+                        Print(L"    0x10=0x%08x 0x14=0x%08x 0x18=0x%08x "
+                              L"0x1C=0x%08x\n",
+                              CpuRead32(OsA0 + 0x10), CpuRead32(OsA0 + 0x14),
+                              CpuRead32(OsA0 + 0x18), CpuRead32(OsA0 + 0x1C));
+                        Print(L"    gates [0x12]=0x%04x [0x16]=0x%04x "
+                              L"[0x1Cw]=0x%04x [0x42]=0x%04x "
+                              L"[0x44]=0x%04x [0x20]=0x%04x "
+                              L"[0x24]=0x%04x [0x2C]=0x%04x [0x2E]=0x%04x\n",
+                              CpuRead16(OsA0 + 0x12), CpuRead16(OsA0 + 0x16),
+                              CpuRead16(OsA0 + 0x1C), CpuRead16(OsA0 + 0x42),
+                              CpuRead16(OsA0 + 0x44), CpuRead16(OsA0 + 0x20),
+                              CpuRead16(OsA0 + 0x24), CpuRead16(OsA0 + 0x2C),
+                              CpuRead16(OsA0 + 0x2E));
+                        Print(L"    evtq 0x4A=0x%08x 0x4E=0x%08x "
+                              L"0x66=0x%08x 0x6E=0x%08x\n",
+                              CpuRead32(0x0000014Au), CpuRead32(0x0000014Eu),
+                              CpuRead32(0x00000166u), CpuRead32(0x0000016Eu));
+                        Print(L"    [0x2AE]=0x%08x [0x160C]=0x%08x "
+                              L"[0x1610]=0x%08x\n",
+                              CpuRead32(0x000002AEu), CpuRead32(0x0000160Cu),
+                              CpuRead32(0x00001610u));
+                        for (i = 0; i < 16; i++) {
+                            Print(L"    0x1B%03x=0x%08x\n",
+                                  0x400 + i * 4, CpuRead32(0x0001B400u + i * 4));
+                        }
+                    }
+                    if (g_DrA207Base == 0) {
+                        g_DrA207Base = LandR1;
+                    }
+                    if (g_DrA207Land < 12) {
+                        g_DrA207Land++;
+                        Print(L"  A207LAND[%u] r1=0x%08x Base=0x%08x "
+                              L"pc24=0x%08x ArmSp=0x%08x win=%u\n",
+                              g_DrA207Land, LandR1, g_DrA207Base, Pc24,
+                              g_DrA207ArmSp, g_DrPostYieldWindow);
+                    }
+                    if (LandR1 < g_DrA207Base) {
+                        g_PpcContext.Gpr[1] = g_DrA207Base;
+                        if (g_DrA207ArmLogged == 0) {
+                            g_DrA207ArmLogged = 1;
+                            Print(L"  DR-A207-UNWIND SP 0x%08x -> 0x%08x "
+                                  L"(trap pc 0x%08x win=%u fire=%u)\n",
+                                  LandR1, g_DrA207Base, g_DrA207ArmPc,
+                                  g_DrPostYieldWindow, g_DrA207Land);
+                        }
+                    }
+                }
+            }
+        }
+        // OSINLOW A207-return probe: 68K PC 0x28 is the point AFTER the A207
+        // trap returned (`bne 0x5C` at 0x26 skipped) where the OSINLOW copies
+        // [a0+0x42] -> [a0+0x16]: the loop is still alive only if [a0+0x42]==0.
+        // a0 == the post-LEA SP, which the A207 arm site recorded as
+        // g_DrA207ArmSp (0x9E6E in steady state). Dump the return state.
+        if (g_DrOsAdvance < 10 &&
+            (g_PpcContext.Gpr[24] & 0xFFFFFFFF) == 0x28u) {
+            UINT32 OsA0 = g_DrA207ArmSp & 0xFFFF;
+            g_DrOsAdvance++;
+            Print(L"  OSADV[%u] win=%u d0g0=0x%08x r1=0x%08x a0=0x%04x "
+                  L"[0x12]=0x%04x [0x16]=0x%04x [0x1C]=0x%04x "
+                  L"[a0+42]=0x%04x [a0+44]=0x%04x [0x2AE]=0x%08x "
+                  L"r8=0x%04x r9=0x%04x r11=0x%04x r13=0x%04x r15=0x%04x\n",
+                  g_DrOsAdvance, g_DrPostYieldWindow,
+                  g_PpcContext.Gpr[0] & 0xFFFFFFFF,
+                  g_PpcContext.Gpr[1] & 0xFFFFFFFF, OsA0,
+                  CpuRead16(OsA0 + 0x12), CpuRead16(OsA0 + 0x16),
+                  CpuRead16(OsA0 + 0x1C),
+                  CpuRead16(OsA0 + 0x42), CpuRead16(OsA0 + 0x44),
+                  CpuRead32(0x000002AEu),
+                  g_PpcContext.Gpr[8] & 0xFFFF, g_PpcContext.Gpr[9] & 0xFFFF,
+                  g_PpcContext.Gpr[11] & 0xFFFF, g_PpcContext.Gpr[13] & 0xFFFF,
+                  g_PpcContext.Gpr[15] & 0xFFFF);
+        }
+        // the PPC scheduler's DRYIELD-rfi path (0x40B6E8C8 -> 0x40B67B60)
+        // continues to re-arm the DR dispatch loop natively. This is the
+        // SheepShaver model -- the ROM's DR emulator drives the OS loader.
+        //
+        // r28 re-arm: the ROM's OS-transfer glue pins r28 to the ROM handoff
+        // block (0x4080AABC) right before the 0x4ED4 jmp into the injected
+        // low-RAM stub. The DR's A-trap dispatch (0x40B69720: `lwz r5,0x28(r28)`
+        // vs `lwz r3,0x720(r31)`; bne->swfn 0x40B6D770) compares [r28+0x28]
+        // against [gd+0x720] and, on mismatch, calls the software-function
+        // path whose PC-relative fetch `lwzx r24,r28,r7` reads the resume-pc
+        // slot [r28+0x28]. With r28 pinned to ROM that slot is read-only ROM
+        // data (0x2649D7EB) -> wild PC. SheepShaver never lets the DR run with
+        // r28 pointing at ROM: its gd (r31) is KernelDataAddr+0x1000 and the
+        // resume-pc slot lives in writable guest RAM. Re-arm r28=0xB000 (the
+        // same host-mem base DRYIELD-RESUME uses throughout the ROM-boot phase)
+        // whenever the native DR is driving the low-RAM OS stub, so the guard
+        // [r28+0x28]=[0xB028]=[gd+0x720]=0 passes and the native trap-table
+        // read (r24=[r6+r7], r6=[gd+0x7B0]) services the A-trap as in boot.
+        if (DrC68kTrapRequest == 1 &&
+            (g_PpcContext.Gpr[24] & 0xFFFFFFFF) < 0x100u) {
+            if ((g_PpcContext.Gpr[28] & 0xFFFFFFFF) != 0x0000B000) {
+                g_PpcContext.Gpr[28] = 0x0000B000;
+                if (DrOsInjected && NativeDrR28ArmLogged == 0) {
+                    NativeDrR28ArmLogged = 1;
+                    Print(L"  DR-R28ARM 68Kpc=0x%08x -> r28=0x0000B000 (gd host-mem "
+                          L"base for native A-trap dispatch)\n",
+                          g_PpcContext.Gpr[24] & 0xFFFFFFFF);
+                }
+            }
+            if (NativeDrHandoffLogged == 0) {
+                NativeDrHandoffLogged = 1;
+                Print(L"  C68K-HANDOFF-SKIP exec=%u r1=0x%08x r16=0x%08x "
+                      L"r17=0x%08x r18=0x%08x r22=0x%08x r8=0x%08x "
+                      L"r24(68Kpc)=0x%08x (native DR continues)\n",
+                      Executed, g_PpcContext.Gpr[1] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[16] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[17] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[18] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[22] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[8] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[24] & 0xFFFFFFFF);
+                Print(L"  C68K-HANDOFF-SKIP NEXT DR dispatch 0x40B67B60 "
+                      L"(DrC68kTrapRequest=%u)\n", DrC68kTrapRequest);
             }
         }
         if (Current == 0x40B235DC && CpuRead32(0xAF2C) == 0) {

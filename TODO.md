@@ -46,6 +46,24 @@ only as a later legacy-runtime fallback for the Classic app layer.
 
 ### Recent work
 
+- **PPC-NATIVE PIVOT LANDED + NANOKERNEL MILESTONES (2026-09-10):**
+  `#define USE_PPC_NATIVE_DR 1` in interpreter.c removes the C-68K intercept
+  (the `0x40B67C60` hijack), so the ROM's own PPC DR emulator drives the 68K
+  stream. Verified live in a 900 s QEMU soak: the boot is no longer stuck in
+  the old 68K idle deadlock (STOP/BRA parked loop). The guest now runs through
+  (1) NK init boot text **"Hello from the replacement multitasking
+  NanoKernel. Version:...", coherence group, address spaces, BATs, ready
+  queues, blue task, timeslicing, idle task** (raw boot_printf stream,
+  arguments not yet rendered), (2) **"converting PMDTs to areas"** - VMM PMD
+  slot walk (16 x 256 MB slots, PMDENTRY probe) carving ~60 blocks via the
+  DIALLOC free-list walker (ALLOCRET 0x9240->0x7140) with area records
+  (MERGE/AREASKIP/AREANEW), and (3) **task creation + PPC/68K interleave:**
+  RETTASK (scheduler context-restore @0x40B24518, ECB with DEAD-pattern stack,
+  68K pc atom 0x4080002A) and DRYIELD (trap 0x40B6E8C8 rfi -> 68K dispatch at
+  0x40B80004) round-trips, with the 68K compat layer executing low-memory
+  code around 0xAA00-0xAB00 (r1=0x9FF8). No panic/crash throughout. Still to
+  reach: boot volume / driver I/O / Finder.
+
 - **STAGED PPC DR BOOTSTRAP, PHASE 1 (2026-08-31): the ROM's own PPC DR now
   runs the 68K boot stub past the `0x60FF` branches into the A-line trap
   dispatch.** Direction chosen by user: run the guest `Mac OS ROM`'s embedded
@@ -1008,11 +1026,60 @@ service stubs; we have no mapping there.
 - [x] Immediate-return semantics for `Bcc.L` into the mirror region
   (`M68kExecuteBranch`): resume at the instruction after the branch.
   (Earlier redirect-to-A6 approach ping-ponged forever between glue blocks.)
-- [ ] Identify each call site's expected service and result: register
-  arguments (D1 held 0x68 in early samples), expected D0 return values,
-  stack effects. Catalog call sites from trace68k.log + PC ring dumps.
-- [ ] Implement minimal service stubs so init loops that poll for results
-  terminate (memory manager sizing, hardware probe results).
+- [x] LINE-F fast-callout: `M68kRaiseException` fast-returns past `FFFF<sel>`
+  pairs (restore SR/SSP, PC=PC+4) so the DR boot's inline script services
+  fire in order (0x9760/0x9420/0x8B9C at 0x4080E1C4/C8/CC). 
+- [x] A71E boot-read gate (9.0.4 HDD boot): handler 0x40833776's status
+  sub 0x408347C0 fails with D0=-113 when low-RAM byte 0x4 != 3; the ROM
+  handler stack does not balance for an inline A-line word (double-push in
+  `M68kLineFService`; final RTS pops a bogus return and parks at low-RAM
+  0x88-0xCC). Serviced in-stub (`NkService` + D0=0): boot now advances past
+  0x4080E348 instead of the zero walk. Live HFS probe read of
+  `System Folder:System` (7,302,922 bytes) also wired into the A71E stub.
+- [x] NEW BLOCKER (M5): after the A71E gate the DR boot breaches the
+  FFFF-desert into 0x4080E32E+ and spins forever in a fixed-point bit-scan
+  at 0x4080E01C-E04A (anchored on junk op 0xED49 from data-walk, A1=
+  0x0E005021, D2=0x0C400001, D0=0x6B) — entered via real ROM trap words
+  A71E(D0=$224)/A647(D0=$AA6B) + 0x2188/0x02B6 table ops in the E340
+  region. The walker's D0/D1-based termination gates need real service
+  results (AA6B = memory-size/info probe?), or the walk must be driven by
+  the 0x4080ACxx dispatcher instead of straight-line script execution.
+  -- RESOLVED: A647 (sel $AA6B) is now serviced inline (D0=0, also 0x71E)
+  like A71E was; the ROM's own trap table mapped A647 to the desert
+  (0x4080E07A) whose MOVE.L (A0),D2/BSR 0xE01C scan spins forever. With
+  A647 returning success (BRA+6->RTS path at 0x4080E364), the desert-scan
+  never executes.
+- [x] With A71E+A647 gates, the boot now reaches the 68K->PPC EMULATOR
+  handoff: BOOTTAIL@0x40B126F0, KDP PA_ConfigInfo/EmulatorKernelTrapTable
+  = 0x40B6E8C0, EMULWIN/EMUTRAP patched trap window (0x0FFF0000..), ~6.36M
+  loads into the 0x68FFE000 KD block. Run parks there (no further activity
+  after "DRBOOT ctx ... [B2C4](68Kpc)=0x4").
+- [ ] M6 (PPC emulator bootstrap): the run stops inside the emulator-window
+  / XLM trap path (PC=0x40B6E8C0, EMUTRAP patched `b 0x36f900`, SRR0=
+  0x40B126E8, LR=0x40B126F4, DEC=0xFFFE847x). Need to see why the emulated
+  XLM window does not progress / what it waits on (KDPROF top offsets
+  +0x044/+0x2B0/+0x294 = hot poll fields?).
+- [x] DESERT-END gate (2026-09-09): the E184..E2A8 DR script is legitimately
+  *executed* (walker JMPs into it at 0x4080AD90 `4EF0 (A0)`; `0000` clauses
+  accumulate D0; `FFFF` pairs = LINE-F services 9760/9420/8B9C/0308..; `RTE`
+  at low vector 0x112 mid-script). Past E2AA the ROM is pure FFFF desert that
+  real HW never reaches; the LINE-F fast-return walked it forever. FIX:
+  on first LINE-F with PC >= 0x4080E2AA, branch to the chunk-loader at
+  0x4080E33C with 0x4080015C synthesized as the return address. The loader
+  runs and its RTS lands in the low-RAM copy phase (SS up to ~460: lowmem
+  0xDD0 ROMbase seeds, `4880 BccL` dispatch); boot re-runs DR phases with
+  changing state (A0=0xC34/A1=0x408049B2 next round).
+- [x] STOP-WAKE (2026-09-09): 68000 STOP now wakes on a pending level-1 VIA
+  tick (SR=0x2018 = IPL 0; real-STOP semantics: resume above SR IPM). The 68K
+  side still re-parks immediately: terminal state is a clean interrupt-driven
+  idle — 68K spins `BRA *` @0x408047AE while the PPC side bounces the
+  decrementer (VECDISP vec 0x900 -> handler 0x40B13200, DEC=0x1000000) and
+  rfi's back to the same emulator-window PC 0x40B67B60 (Y80, r27=0).
+- [ ] M7 (idle deadlock): both sides loop forever — 68K waits at 0x408047AE,
+  PPC repeats the 0x40B67B60 window on every decrementer. Nothing schedules
+  the next boot task. Next: decode what the NK dispatch (handler 0x40B13200)
+  or the Y80 emulator-window contract (r27=0?) is waiting for so a new boot
+  task is scheduled (device probes / next DR stage).
 - [ ] Handle computed dispatches through the mirror region: the glue at
   `0x408A8D7C-90` builds a handler pointer (`move.l a6,d0; lea base,A1;
   movea.l 0(a0),a2; jmp (a2)`) — if the table it reads is uninitialized,

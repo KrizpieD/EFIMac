@@ -1274,6 +1274,19 @@ BootDecodeChrpRom (
         return FALSE;
     }
 
+    Print(L"RAWPARM parcels-offset=0x%X parcels-size=0x%X file-size=0x%X\n",
+          ParcelsOffset, ParcelsSize, (UINT32)Size);
+    Print(L"RAWHEAD %02X%02X%02X%02X-%02X%02X%02X%02X-%02X%02X%02X%02X-%02X%02X%02X%02X\n",
+           Buffer[0], Buffer[1], Buffer[2], Buffer[3],
+           Buffer[4], Buffer[5], Buffer[6], Buffer[7],
+           Buffer[8], Buffer[9], Buffer[10], Buffer[11],
+           Buffer[12], Buffer[13], Buffer[14], Buffer[15]);
+    Print(L"RAWLZSS %02X%02X%02X%02X-%02X%02X%02X%02X-%02X%02X%02X%02X-%02X%02X%02X%02X\n",
+           Buffer[0x340C4], Buffer[0x340C5], Buffer[0x340C6], Buffer[0x340C7],
+           Buffer[0x340C8], Buffer[0x340C9], Buffer[0x340CA], Buffer[0x340CB],
+           Buffer[0x340CC], Buffer[0x340CD], Buffer[0x340CE], Buffer[0x340CF],
+           Buffer[0x340D0], Buffer[0x340D1], Buffer[0x340D2], Buffer[0x340D3]);
+
     // The flat image is 4 MB; the compressor may emit a few bytes past the
     // window, so hold a small slack beyond the mapped size.
     Pages = (PPC_ROM_MAX_SIZE + 0x10000) / EFI_PAGE_SIZE;
@@ -1295,6 +1308,22 @@ BootDecodeChrpRom (
 
     Print(L"New World ROM decompressed: %d bytes of parcels to flat image\n",
           (UINT64)ParcelsSize);
+
+    {
+        INTN i;
+        Print(L"FLATBOOT [0000AF60]");
+        for (i = 0; i < 32; i++) {
+            Print(L"%08X", BootReadBe32(Rom + 0xAF60 + (UINTN)i * 4));
+            if ((i & 3) == 3) Print(L"\n");
+            else if ((i & 3) != 0 || i == 0) Print(L" ");
+        }
+        Print(L"FLATDESC [0000E180]");
+        for (i = 0; i < 96; i++) {
+            Print(L"%08X", BootReadBe32(Rom + 0xE180 + (UINTN)i * 4));
+            if ((i & 3) == 3) Print(L"\n");
+            else if ((i & 3) != 0 || i == 0) Print(L" ");
+        }
+    }
 
     *Out = Rom;
     *OutSize = PPC_ROM_MAX_SIZE;
@@ -2340,6 +2369,19 @@ PpcPatchNewWorldRom (
     // 0xFFxxxxxx addresses and propagate sentinel garbage into every
     // downstream MixedMode call.
     RomRelocateJumpTables(Rom, g_BootContext.RomSize, RomBase);
+
+    // 68K boot-driver relocation gate. The driver at guest 0x4080AA36 calls
+    // DR service 0x116 (a6 = return 0x4080AA3C) and, when D0 bit0 is SET,
+    // relocates its image pointer and `jmp (pc,d3.l)`s into the low-RAM mirror
+    // at 0xAA5A (guest 0x4080AA56-0x4080AA5A). Our boot never stages that
+    // low-RAM copy, so the 68K marches through zeros. Turn the gate's
+    // `btst.b #0,d0 / beq.s` (0x67 0x1A) into an unconditional `bra.s`
+    // (0x60 0x1A) so the driver always continues in ROM at 0x4080AA5C.
+    if (g_BootContext.RomSize >= 0xAA42 &&
+        Rom[0xAA40] == 0x67 && Rom[0xAA41] == 0x1A) {
+        Rom[0xAA40] = 0x60;   // beq.s +0x1A -> bra.s +0x1A
+        Print(L"  68K patch: skip low-RAM relocation (0xAA40 beq->bra)\n");
+    }
 
     // 68K boot HWInfo gate. On real hardware the Open Firmware trampoline
     // builds the IRP's HWInfo record and signs it with 'Hnfo' before the
