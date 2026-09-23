@@ -1589,6 +1589,201 @@ PpcInstallSystemRom (
                 }
             }
         }
+
+        // -- 68K RAM-Rom window (New World) --------------------------------
+        // On real hardware the ROM's decompressor writes the 68K RAM-Rom
+        // image into top-of-space RAM (68K code fetches at 0x8103xxxx), then
+        // the 68K bootstrap resumes at 0x810303B0.  Nothing owns that window
+        // here, so those writes were silently dropped and the 68K fetch read
+        // zeros -> DR dispatched into empty space -> stub blr through LR=0 ->
+        // GUEST STOP at PC 0.  Install a WRITABLE zeroed region so the ROM's
+        // own decompressor can populate it.  16 MB is far larger than the
+        // decompressed RAM-Rom and covers both plausible bases (0x81000000 /
+        // 0x81030000).
+        {
+            UINTN RrPages = 0x01000000 / EFI_PAGE_SIZE;
+            EFI_PHYSICAL_ADDRESS RrBase = 0;
+            EFI_STATUS RrStatus =
+                BS->AllocatePages(AllocateAnyPages, EfiBootServicesData,
+                                  RrPages, &RrBase);
+            if (!EFI_ERROR(RrStatus)) {
+                UINT8* Rr = (UINT8*)(UINTN)RrBase;
+                ZeroMem(Rr, 0x01000000);
+                RrStatus = PpcAddGuestMemoryRegion(
+                    Rr, 0x81000000u, 0x01000000u, FALSE);
+                if (EFI_ERROR(RrStatus)) {
+                    BS->FreePages(RrBase, RrPages);
+                    Print(L"68K RAM-Rom window map failed: %r\n", RrStatus);
+                } else {
+                    Print(L"68K RAM-Rom window: guest 0x81000000 +16MB\n");
+                }
+            }
+            // "-- 68K secondary native-workspace window ------------------------
+            // The OS's 68K boot references additional high-68K workspace at
+            // 0x52xxxxxx-0x7C8xxxxx (native transcode tables / context) that a
+            // real Mac has in RAM.  Install second writable mapping of the same
+            // staged System source so the DRAME's table walks find content
+            // instead of zeros.
+            {
+                UINTN NsPages = 0x01000000 / EFI_PAGE_SIZE;
+                EFI_PHYSICAL_ADDRESS NsBase = 0;
+                EFI_STATUS NsStatus =
+                    BS->AllocatePages(AllocateAnyPages, EfiBootServicesData,
+                                      NsPages, &NsBase);
+                if (!EFI_ERROR(NsStatus)) {
+                    UINT8* Ns = (UINT8*)(UINTN)NsBase;
+                    ZeroMem(Ns, 0x01000000);
+                    NsStatus = PpcAddGuestMemoryRegion(
+                        Ns, 0x52000000u, 0x01000000u, FALSE);
+                    if (EFI_ERROR(NsStatus)) {
+                        BS->FreePages(NsBase, NsPages);
+                        Print(L"68K workspace window map failed: %r\n", NsStatus);
+                    } else {
+                        Print(L"68K workspace window: guest 0x52000000 +16MB\n");
+                    }
+                }
+            }
+            // "-- 68K system-global alias window ------------------------------
+            // The 68K boot builds and calls its native-emulator bridge at
+            // 0x80BD0000-0x80BDFFFF (the OS copies glue there, then JSRs into
+            // it to invoke PPC-side routines).  Nothing owns that address in
+            // a flat map, so writes were dropped and the JSR executed zeros.
+            // Install a third writable zeroed region to hold that page.
+            {
+                UINTN SgPages = 0x01000000 / EFI_PAGE_SIZE;
+                EFI_PHYSICAL_ADDRESS SgBase = 0;
+                EFI_STATUS SgStatus =
+                    BS->AllocatePages(AllocateAnyPages, EfiBootServicesData,
+                                      SgPages, &SgBase);
+                if (!EFI_ERROR(SgStatus)) {
+                    UINT8* Sg = (UINT8*)(UINTN)SgBase;
+                    ZeroMem(Sg, 0x01000000);
+                    SgStatus = PpcAddGuestMemoryRegion(
+                        Sg, 0x80000000u, 0x01000000u, FALSE);
+                    if (EFI_ERROR(SgStatus)) {
+                        BS->FreePages(SgBase, SgPages);
+                        Print(L"68K sys-globals window map failed: %r\n", SgStatus);
+                    } else {
+                        UINTN SgI;
+                        Print(L"68K sys-globals window: guest 0x80000000 +16MB\n");
+                        // Seed the native-bridge page with a benign 68K
+                        // RTS stub so a 68K bootstrap JSR into 0x80BDxxxx
+                        // returns instead of executing zeros (data-march).
+                        for (SgI = 0; SgI < 0x30000 / 2; SgI++) {
+                            PpcWriteGuestByte(0x80BD0000u + (UINT32)SgI*2,     0x4E);
+                            PpcWriteGuestByte(0x80BD0000u + (UINT32)SgI*2 + 1, 0x75);
+                        }
+                        Print(L"68K sys-globals stub seeded @0x80BD0000..0x80BF0000\n");
+                        if (PpcReadGuestByte(0x80BD0006u) != 0x4E ||
+                            PpcReadGuestByte(0x80BD0007u) != 0x75) {
+                            Print(L"68K sys-globals readback FAILED "
+                                  L"(0x%02x 0x%02x) - writes dropped?\n",
+                                  PpcReadGuestByte(0x80BD0006u),
+                                  PpcReadGuestByte(0x80BD0007u));
+                        } else {
+                            Print(L"68K sys-globals readback OK: 0x4E75\n");
+                        }
+                    }
+                }
+            }
+            // "-- DRAME lazy-translation cache windows -------------------
+            // The ROM's PPC 68K emulator dispatches each guest op through
+            // per-opcode cells it builds lazily in low RAM pages around
+            // 0x0170xxxx (first-level) and 0x0284xxxx (second-level).  On
+            // real hardware those live inside the low-RAM bank; our 16 MB
+            // boot bank stops at 0x01000000, so both cell windows were
+            // unmapped: reads returned zeros, writes were dropped, and the
+            // lazy cells could never be populated.  Install a writable
+            // zeroed region covering 0x01000000-0x04000000 so the DRAME's
+            // JIT writes (and the host's trampolines) actually land.
+            {
+                UINTN DrPages = 0x03000000 / EFI_PAGE_SIZE;
+                EFI_PHYSICAL_ADDRESS DrBase = 0;
+                EFI_STATUS DrStatus =
+                    BS->AllocatePages(AllocateAnyPages, EfiBootServicesData,
+                                      DrPages, &DrBase);
+                if (!EFI_ERROR(DrStatus)) {
+                    UINT8* Dr = (UINT8*)(UINTN)DrBase;
+                    ZeroMem(Dr, 0x03000000);
+                    DrStatus = PpcAddGuestMemoryRegion(
+                        Dr, 0x01000000u, 0x03000000u, FALSE);
+                    if (EFI_ERROR(DrStatus)) {
+                        BS->FreePages(DrBase, DrPages);
+                        Print(L"DRAME cache window map failed: %r\n", DrStatus);
+                    } else {
+                        Print(L"DRAME cache window: guest 0x01000000 +48MB\n");
+                    }
+                }
+            }
+
+            {
+                // Mirror the DRAME's ROM cell-template shapes into the lazy-cell
+                // banks the machine jumps into, so a start/secondary cell
+                // contains real translated PPC (the operand-class walker shapes
+                // at 0x40B67C60..) instead of zeros.  The whole span is copied
+                // contiguously so its short relative branches (b at +0x1c,
+                // bgtctr/bgelr via CR/CTR/LR) stay correct.  Longer-range exits
+                // (b +0x5494 to the hub) land past the copy, so each descent
+                // escape (`bgelr cr2` = 0x4CA80020 and `b hub` = 0x48005494)
+                // is repointed at a local 4-word shim at 0x032C1000 that sets
+                // LR to the ROM cell-processor continuation (0x40B6D7CC, the
+                // "next 68K op" entry) and blr's there.  Op 0x0058 (ORI #imm)
+                // is exactly the 2-byte-immediate walker shape that starts here.
+                UINT32 SrcBase = PPC_NEW_WORLD_ROM_GUEST_BASE + 0x367C60u;
+                UINT32 DstBase[] = { 0x017080A2u, 0x02847F05u, 0x032C0000u };
+                UINT32 Span = 0x200u;
+                const UINT32 ShimBase = 0x032C1000u;
+                UINT32 C, D, I;
+                for (C = 0; C < sizeof(DstBase)/sizeof(DstBase[0]); C++) {
+                    for (I = 0; I < Span; I += 4) {
+                        PpcWriteGuestByte(DstBase[C] + I,     PpcReadGuestByte(SrcBase + I));
+                        PpcWriteGuestByte(DstBase[C] + I + 1, PpcReadGuestByte(SrcBase + I + 1));
+                        PpcWriteGuestByte(DstBase[C] + I + 2, PpcReadGuestByte(SrcBase + I + 2));
+                        PpcWriteGuestByte(DstBase[C] + I + 3, PpcReadGuestByte(SrcBase + I + 3));
+                    }
+                    // Repoint every descent escape to the shim.
+                    for (I = 0; I < Span; I += 4) {
+                        UINT32 Word = ((UINT32)PpcReadGuestByte(DstBase[C] + I) << 24) |
+                                      ((UINT32)PpcReadGuestByte(DstBase[C] + I + 1) << 16) |
+                                      ((UINT32)PpcReadGuestByte(DstBase[C] + I + 2) << 8) |
+                                      ((UINT32)PpcReadGuestByte(DstBase[C] + I + 3));
+                        if (Word == 0x4CA80020u || Word == 0x48005494u) {
+                            INT64 Dist = (INT64)(ShimBase - (DstBase[C] + I));
+                            UINT32 B = 0x48000000u | (UINT32)((Dist >> 2) & 0x03FFFFFFu);
+                            PpcWriteGuestByte(DstBase[C] + I,     (UINT8)(B >> 24));
+                            PpcWriteGuestByte(DstBase[C] + I + 1, (UINT8)(B >> 16));
+                            PpcWriteGuestByte(DstBase[C] + I + 2, (UINT8)(B >> 8));
+                            PpcWriteGuestByte(DstBase[C] + I + 3, (UINT8)B);
+                        }
+                    }
+                }
+                // The shim: set LR to the machine's cell-processor continuation
+                // (0x40B6D7CC, the next-68K-op entry) then blr there.
+                {
+                    const UINT32 Sh[] = { 0x3D8040B6u, 0x618CD7CCu,
+                                          0x7D8C03A6u, 0x4E800020u };
+                    for (D = 0; D < sizeof(Sh)/sizeof(Sh[0]); D++) {
+                        PpcWriteGuestByte(ShimBase + D * 4,     (UINT8)(Sh[D] >> 24));
+                        PpcWriteGuestByte(ShimBase + D * 4 + 1, (UINT8)(Sh[D] >> 16));
+                        PpcWriteGuestByte(ShimBase + D * 4 + 2, (UINT8)(Sh[D] >> 8));
+                        PpcWriteGuestByte(ShimBase + D * 4 + 3, (UINT8)Sh[D]);
+                    }
+                }
+                Print(L"DRAME cells seeded from ROM+0x367C60 (%d words each), "
+                      L"descent->shim 0x%08X\n", Span / 4, ShimBase);
+                for (D = 0; D < sizeof(DstBase)/sizeof(DstBase[0]); D++) {
+                    UINT32 A = DstBase[D];
+                    Print(L"  seed@0x%08X: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n",
+                          A,
+                          PpcReadGuestByte(A),     PpcReadGuestByte(A + 1),
+                          PpcReadGuestByte(A + 2), PpcReadGuestByte(A + 3),
+                          PpcReadGuestByte(A + 4), PpcReadGuestByte(A + 5),
+                          PpcReadGuestByte(A + 6), PpcReadGuestByte(A + 7),
+                          PpcReadGuestByte(A + 8), PpcReadGuestByte(A + 9),
+                          PpcReadGuestByte(A + 10), PpcReadGuestByte(A + 11));
+                }
+            }
+        }
     }
 
     if (RomAddress != NULL) { *RomAddress = GuestBase; }

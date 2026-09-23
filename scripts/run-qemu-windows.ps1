@@ -41,7 +41,7 @@ Copy-Item -Force $Efi (Join-Path $Esp "EFI\BOOT\BOOTX64.EFI")
 
 # Stage an Old World ROM dump at \System\MacOS\ROM (first-priority ROM source).
 if ($OldWorldRom -ne "") {
-    $OldWorldRom = (Resolve-Path $OldWorldRom).Path
+    $OldWorldRom = (Get-Item -LiteralPath $OldWorldRom).FullName
     New-Item -ItemType Directory -Force -Path (Join-Path $Esp "System\MacOS") | Out-Null
     Copy-Item -Force $OldWorldRom (Join-Path $Esp "System\MacOS\ROM")
     Write-Output "Staged Old World ROM: $OldWorldRom -> esp\System\MacOS\ROM"
@@ -62,7 +62,7 @@ $QArgs = @(
 if ($MacDisc -ne "") {
     # Stage the disc into a space-free path (Start-Process splits arguments on
     # spaces, so paths under "New folder (2)" would otherwise break QEMU).
-    $MacDisc = (Resolve-Path $MacDisc).Path
+    $MacDisc = (Get-Item -LiteralPath $MacDisc).FullName
     $StageDir = Join-Path $env:TEMP "opencode\mac_disc"
     New-Item -ItemType Directory -Force -Path $StageDir | Out-Null
     $StageName = [regex]::Replace((Split-Path $MacDisc -Leaf), '[^A-Za-z0-9._-]', '_')

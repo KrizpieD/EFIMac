@@ -2763,6 +2763,34 @@ M68kExecuteInstruction (
         return 0;
     }
 
+    // ---- Native-emulator vector zone skip --------------------------------
+    // On a real PowerPC Mac the DRAME keeps its vector/table page allocated
+    // in the OS's high native zone (here 0x60xxxxxx-0x7Dxxxxxx, next to the
+    // staged System image / exception vectors).  A 68K control-transfer into
+    // that zone is the OS requesting a PPC-side native routine; there is no
+    // 68K code to fetch there.  Handle the call as a benign return-to-caller
+    // so bootstrap continues instead of executing zeros (data-march).
+    if (g_M68kContext.PC >= 0x60000000u &&
+        g_M68kContext.PC < 0x7E000000u) {
+        static UINTN NativeSkipCount = 0;
+        UINT32 Sp = g_M68kContext.Supervisor ? g_M68kContext.SSP
+                                             : g_M68kContext.A[7];
+        NativeSkipCount++;
+        if (NativeSkipCount <= 8) {
+            Print (L"  68K NATIVE-ZONE PC=0x%08x SP=0x%08x SR=0x%04x "
+                   L"D0=0x%08x -> pop ret=0x%08x\n",
+                   g_M68kContext.PC, Sp, g_M68kContext.SR, g_M68kContext.D[0],
+                   M68kReadLong (Sp));
+        }
+        g_M68kContext.PC = M68kReadLong (Sp);
+        if (g_M68kContext.Supervisor) {
+            g_M68kContext.SSP += 4;
+        } else {
+            g_M68kContext.A[7] += 4;
+        }
+        return 0;
+    }
+
     // Fetch the 16-bit opcode word
     UINT16 Opcode = M68kFetchWord (g_M68kContext.PC);
     g_M68kContext.PC += 2;
@@ -5122,40 +5150,45 @@ M68kExecuteFromPPC (
     BOOLEAN DoTrace = (TotalExecuted < 20000);
 
     while (Count < MaxBatch && !g_M68kContext.Halted && !g_M68kContext.Stopped) {
-        // Runaway guard: PC must be in low RAM or the ROM region. Anything
-        // else means we jumped into unmapped memory and are executing
-        // garbage; report the last PCs and stop instead of marching forever.
+        // Runaway guard: PC must be in low RAM or the ROM/RAM-Rom regions.
+        // Anything else means we jumped into unmapped memory and are
+        // executing garbage; report and stop instead of marching forever.
+        // NOTE: intentionally NOT latched - report every occurrence so a
+        // zone drift is visible to the CELLMISS harness decision logic.
         {
             UINT32 PcNow = g_M68kContext.PC;
             BOOLEAN Ok = (PcNow < 0x01000000u) ||
                          (PcNow >= 0x40800000u && PcNow < 0x41000000u) ||
+                         (PcNow >= 0x80000000u && PcNow < 0x90000000u) || // 68K RAM-Rom + sys-globals
                          (PcNow >= 0xA8000000u && PcNow < 0xAC000000u) ||
                          (PcNow >= 0xFFC00000u);   // classic ROM alias
-            if (!Ok && !RunawayReported) {
-                UINTN K;
-                RunawayReported = TRUE;
-                Print (L"  68K RUNAWAY PC=0x%08x SP=0x%08x SR=0x%04x "
-                       L"D0=0x%08x D1=0x%08x A2=0x%08x A4=0x%08x "
-                       L"A5=0x%08x A6=0x%08x\n",
-                       PcNow,
-                       g_M68kContext.Supervisor ? g_M68kContext.SSP : g_M68kContext.A[7],
-                       g_M68kContext.SR, g_M68kContext.D[0], g_M68kContext.D[1],
-                       g_M68kContext.A[2], g_M68kContext.A[4],
-                       g_M68kContext.A[5], g_M68kContext.A[6]);
-                Print (L"  68K RUNAWAY last 256 PCs:");
-                for (K = 0; K < 256; K++) {
-                    UINTN Idx = (g_LastPcIdx + 256 - 1 - K) % 256;
-                    Print (L" %08x/%04x", g_LastPcRing[Idx], g_LastOpRing[Idx]);
-                    if ((K & 15) == 15) Print (L"\n   ");
-                }
-                Print (L"\n");
-                {
-                    UINT32 SpNow = g_M68kContext.Supervisor ?
-                                   g_M68kContext.SSP : g_M68kContext.A[7];
+            if (!Ok) {
+                static UINTN RunAwayCount = 0;
+                RunAwayCount++;
+                if (RunAwayCount <= 4) {
                     UINTN K;
-                    Print (L"  68K RUNAWAY stack@SP:");
+                    Print (L"  68K RUNAWAY PC=0x%08x SP=0x%08x SR=0x%04x "
+                           L"D0=0x%08x D1=0x%08x D2=0x%08x D3=0x%08x "
+                           L"D4=0x%08x D5=0x%08x D6=0x%08x D7=0x%08x\n",
+                           PcNow,
+                           g_M68kContext.Supervisor ? g_M68kContext.SSP : g_M68kContext.A[7],
+                           g_M68kContext.SR, g_M68kContext.D[0], g_M68kContext.D[1],
+                           g_M68kContext.D[2], g_M68kContext.D[3], g_M68kContext.D[4],
+                           g_M68kContext.D[5], g_M68kContext.D[6], g_M68kContext.D[7]);
+                    Print (L"  68K RUNAWAY A0=0x%08x A1=0x%08x A2=0x%08x "
+                           L"A3=0x%08x A4=0x%08x A5=0x%08x A6=0x%08x\n",
+                           g_M68kContext.A[0], g_M68kContext.A[1], g_M68kContext.A[2],
+                           g_M68kContext.A[3], g_M68kContext.A[4], g_M68kContext.A[5],
+                           g_M68kContext.A[6]);
+                    Print (L"  68K RUNAWAY last 96 PCs:");
+                    for (K = 0; K < 96 && K < 256; K++) {
+                        UINTN Idx = (g_LastPcIdx + 256 - 1 - K) % 256;
+                        Print (L" %08x/%04x", g_LastPcRing[Idx], g_LastOpRing[Idx]);
+                        if ((K & 7) == 7) Print (L"\n   ");
+                    }
+                    Print (L"\n  68K RUNAWAY glue@0x80BD0000: ");
                     for (K = 0; K < 16; K++) {
-                        Print (L" %08x", M68kReadLong (SpNow + (UINT32)(K * 4)));
+                        Print (L" %04x", M68kReadWord (0x80BD0000u + (UINT32)(K*2)));
                     }
                     Print (L"\n");
                 }

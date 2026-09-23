@@ -1,3 +1,4 @@
 build/
 mac_discs/
 mac_roms/
+tool_scripts/__pycache__/

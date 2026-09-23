@@ -1,6 +1,6 @@
 import sys
 
-ROM = r"C:\Users\clayc\AppData\Local\Temp\opencode\rom_flat_4mb.bin"
+ROM = r"C:\Users\clayc\AppData\Local\Temp\opencode\flat_rom.bin"
 ROM_BASE = 0x40800000
 data = open(ROM, "rb").read()
 
