@@ -1,10 +1,16 @@
 /* EFI-Mac setup front-end.
  *
  * Configuration persistence (a single NVRAM variable), the boot gate
- * (5-second countdown with the classic Macintosh face, F8 opens setup)
- * and the interactive configuration menu. All output goes through the
- * EFI text console, so it renders on the GOP display and on the serial
- * console alike.
+ * (5-second countdown with a splash, F8 opens setup) and the interactive
+ * configuration menu.
+ *
+ * All output goes through the EFI text console. Note that
+ * PpcInitializeUefiInterface has already swapped ST->ConOut for a shim that
+ * only implements OutputString, and that writes to the 16550 COM1 serial
+ * port; SetCursorPosition, ClearScreen and SetAttribute are no-ops and
+ * QueryMode reports a fixed 80x25. So none of the text below reaches the
+ * GOP display - the splash and the menu are serial-only, and the boot gate
+ * runs long before the GOP protocol is located in main.c.
  */
 
 #include <efi.h>
@@ -21,25 +27,33 @@ static EFI_GUID g_UiConfigGuid = PPC_CONFIG_VARIABLE_GUID;
 // The UEFI scan code for Enter (gnu-efi's eficon.h stops at SCAN_ESC).
 #define UI_SCAN_ENTER   0x000D
 
-// ASCII "Macintosh" face shown during the boot countdown: the classic
-// compact-Mac silhouette with a smiling screen and a floppy drive slot.
+// Splash shown during the boot countdown. The source artwork is a 42x100
+// six-shade halftone; this is that artwork box-filtered 2:1 down to 50x21 so
+// it fits the 25-row text console. Each 2x2 source cell collapses to the
+// darkest shade present, which keeps the thin outlines of the eyes and the
+// nose diagonal readable at half scale.
 static CONST CHAR16* UiMacFace[] = {
-    L"              .----------------------------------.",
-    L"             /                                    \\",
-    L"            |   .----------------------------.     |",
-    L"            |  (                              )    |",
-    L"            |   |    .------------------.    |     |",
-    L"            |   |   |    (o)    (o)     |    |     |",
-    L"            |   |   |       ----        |    |     |",
-    L"            |   |   |     \\_____/       |    |     |",
-    L"            |   |    '------------------'    |     |",
-    L"            |   |    .------------------.    |     |",
-    L"            |   |   |  |  |  |  |  |   |     |     |",
-    L"            |   |    '------------------'    |     |",
-    L"            |  (                              )    |",
-    L"            |   '----------------------------'     |",
-    L"             \\                                    /",
-    L"              '----------------------------------'"
+    L"***************************@@*====================",
+    L"*************************@@@======================",
+    L"************************@@@=======================",
+    L"*************@@********@@@========@@+=============",
+    L"*************@@*******#@@=========@@+=============",
+    L"*************@@*******@@==========@@+=============",
+    L"*************%%******@@%==========%%+=============",
+    L"*********************@@===========================",
+    L"********************@@@===========================",
+    L"********************@@============================",
+    L"********************@@============================",
+    L"*******************#@@@@@@@@@@@===================",
+    L"*******************#@@@@@@@@@@@===================",
+    L"****************************@@====================",
+    L"*********@******************@@==========+@========",
+    L"********#@@@@@%#***********#@@=====+%@@@@@+=======",
+    L"*************%@@@@@@@@@@@@@@@@@@@@@@@@============",
+    L"***************************#@@====================",
+    L"****************************@@====================",
+    L"****************************@@====================",
+    L"****************************@@#==================="
 };
 #define UI_MAC_FACE_LINES  (sizeof(UiMacFace) / sizeof(UiMacFace[0]))
 
@@ -263,22 +277,26 @@ PpcBootGateWait (
         ST->ConOut->ClearScreen(ST->ConOut);
     }
 
-    // Title and hint.
+    // Title. The F8 prompt rides along on the countdown line below, so there
+    // is no separate hint row to spend on this.
     UiSetAttr(EFI_TEXT_ATTR(EFI_LIGHTCYAN, EFI_BACKGROUND_BLACK));
-    UiDrawCentered(1, L"EFI-Mac  -  PowerPC Mac OS Boot Loader");
+    UiDrawCentered(0, L"EFI-Mac  -  PowerPC Mac OS Boot Loader");
     UiSetAttr(EFI_TEXT_ATTR(EFI_WHITE, EFI_BACKGROUND_BLACK));
-    UiDrawCenteredPrint(2, L"Press F8 within %d seconds to enter setup",
-                   (UINTN)PPC_BOOT_GATE_TIMEOUT_SECONDS);
 
-    // The classic Macintosh face.
-    UINTN FaceRow = 4;
+    // The splash, anchored under the title. The two status rows below are
+    // pinned to the bottom of the console so the art keeps a stable position.
+    UINTN FaceRow = 1;
     for (UINTN I = 0; I < UI_MAC_FACE_LINES; I++) {
         UiDrawCentered(FaceRow + I, UiMacFace[I]);
     }
 
-    // Configuration summary under the face.
-    UINTN SummaryRow = FaceRow + (UINTN)UI_MAC_FACE_LINES + 1;
-    if (SummaryRow < Rows) {
+    // Configuration summary and countdown, pinned to the bottom two rows. On a
+    // console too short for the full splash the bottom of the art gets clipped
+    // by UiDrawCentered's row guard, which is the right thing to lose: the
+    // countdown still has to be readable.
+    UINTN CountdownRow = (Rows > 0) ? Rows - 1 : 0;
+    UINTN SummaryRow   = (Rows > 1) ? Rows - 2 : CountdownRow;
+    {
         CHAR16 Summary[96];
         UnicodeSPrint(Summary, sizeof(Summary),
                       L"RAM %d MB   Video %s   Boot device %s",
@@ -291,12 +309,6 @@ PpcBootGateWait (
                           : L"Selected");
         UiSetAttr(EFI_TEXT_ATTR(EFI_LIGHTGRAY, EFI_BACKGROUND_BLACK));
         UiDrawCentered(SummaryRow, Summary);
-    }
-
-    // Countdown row (guard against short consoles).
-    UINTN CountdownRow = SummaryRow + 1;
-    if (CountdownRow >= Rows) {
-        CountdownRow = (Rows > 0) ? Rows - 1 : 0;
     }
 
     // One-second periodic timer drives the countdown.
