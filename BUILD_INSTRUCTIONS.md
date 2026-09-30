@@ -1,18 +1,18 @@
-# EFI-Mac-Emulator - Build Instructions
+# EFIMac — Build Instructions
 
 ## Status
 
 **The project builds.** `make` (or `scripts/build-windows.sh`) produces a valid
-PE32+ UEFI application image (`build/EFI-Mac-Emulator.efi`). The application is
-a heavy bootloader for classic Mac OS: it initializes the UEFI environment, runs
-a 35-check PowerPC CPU self-test (including the FPU core), sets up the guest
-memory map (RAM, low-memory globals, system ROM, staging areas), executes a
-PowerPC program from guest RAM, initializes graphics/audio/storage/network, runs
-the boot memory-map self-test (7/7 with the demo ROM, 5/5 with a real ROM) and
-the System Folder / driver staging self-test (7/7), installs a real New World
-ROM from a Mac OS 8.5+/9 disc when attached, then reports ready. The full boot
-sequence has been verified under QEMU + OVMF on a Windows host (CPU 35/35, boot
-5/5 with the 9.2.2 disc, system files 7/7).
+PE32+ UEFI application image (`build/EFI-Mac-Emulator.efi` — the EFIMac heavy
+bootloader). The application initializes the UEFI environment, runs a 35-check
+PowerPC CPU self-test (including the FPU core), sets up the guest memory map
+(RAM, low-memory globals, system ROM, staging areas), initializes
+graphics/audio/storage/network, installs a real New World ROM from a Mac OS
+8.5+/9 disc when attached, stages the System Folder and drivers, and then
+executes the installed firmware continuously: the nano-kernel boots through
+init, PMDT->areas, and task creation to the live DR console wait. The full boot
+sequence has been verified under QEMU + OVMF on a Windows host (CPU 35/35,
+system files 7/7, NK milestones live).
 
 ## Overview
 
@@ -149,9 +149,11 @@ powershell -ExecutionPolicy Bypass -File scripts/run-qemu-windows.ps1
 Select-String -Path "$env:TEMP\opencode\boot_out.txt" -Pattern "self-test complete"
 ```
 
-Expect CPU self-test 35/35 and the system-files self-test 7/7; the boot
-self-test is 7/7 with no Mac disc (demo ROM) or 5/5 with a Mac OS 8.5+/9 disc
-attached (real New World ROM), then a clean handoff to the OVMF UI.
+Expect CPU self-test 35/35 and the system-files self-test 7/7; with a Mac OS
+8.5+/9 disc the real New World ROM installs and the guest firmware runs
+continuously (nano-kernel milestones: "Hello from the replacement multitasking
+NanoKernel", "converting PMDTs to areas", scheduler ticks, DR console wait). Use
+`-NoReboot -StallSeconds 0` to stay in the console phase.
 
 ## Directory Structure
 

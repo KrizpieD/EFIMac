@@ -255,6 +255,17 @@ M68kWriteByte (
     IN UINT8  Value
     )
 {
+    // Byte-granularity 68K stores were the one path not covered by the NK
+    // dispatch-table watchpoint in M68kWriteLong; a 68K routine could build the
+    // table a byte at a time. Log table-page writes here too.
+    if (Address >= 0x00012000u && Address < 0x00013000u) {
+        static UINTN DispTabB68 = 0;
+        if (DispTabB68 < 40) {
+            DispTabB68++;
+            Print (L"68K DISPTABB [0x%08x] <- 0x%02x @68KPC=0x%08x\n",
+                   Address, Value, g_M68kContext.PC);
+        }
+    }
     PpcWriteGuestByte (Address, Value);
 }
 
@@ -300,6 +311,25 @@ M68kWriteLong (
     IN UINT32 Value
     )
 {
+    {
+        // NK dispatch table at 0x12E88. The PPC store path (CpuWrite32) is
+        // watched separately and recorded ZERO hits across a full 900 s boot, so
+        // if anything populates this table it must be the 68K side (e.g. a block
+        // move out of ROM into low RAM). This is the only remaining candidate
+        // writer, so log it here with the 68K PC and address registers.
+        if (Address >= 0x00012E88u && Address < 0x00012F88u) {
+            static UINTN DispTabW68 = 0;
+            if (DispTabW68 < 40) {
+                DispTabW68++;
+                Print (L"68K DISPTABW [%08x] <- 0x%08x @68KPC=0x%08x "
+                       L"A0=%08x A1=%08x A7=%08x\n",
+                       Address, Value, g_M68kContext.PC,
+                       g_M68kContext.A[0], g_M68kContext.A[1],
+                       M68kGetStackPointer ());
+            }
+        }
+        LowRamCensus (Address, Value, g_M68kContext.PC | 0x68000000u);
+    }
     {
         static UINTN RomWatchHits = 0;
         if (RomWatchHits < 8 &&

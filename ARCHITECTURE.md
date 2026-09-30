@@ -1,8 +1,13 @@
-# EFI Mac OS Boot Layer — Architecture
+# EFIMac — Heavy Bootloader for Classic Mac OS — Architecture
 
 This document describes how the project actually works today: a heavy UEFI
 bootloader that stages a classic PowerPC Mac boot environment from UEFI standard
-protocols, plus the design decisions behind it.
+protocols, then executes the installed firmware and the OS it boots on a
+PowerPC interpreter. Design decisions are noted as they were made.
+
+> EFIMac is a *bootloader*, not an emulator. The guest firmware runs for real in
+> a continuous interpreter loop; UEFI protocols act as the x86_64 hardware layer
+> underneath the guest's expected device windows.
 
 ## Overview
 
@@ -22,9 +27,12 @@ This project supplies that firmware-side environment as an EFI application:
 3. **Firmware is installed into the guest image.** A ROM is loaded (boot-volume
    path, ESP file, or HFS `Mac OS ROM` discovery), mapped read-only into the
    guest map, and identified as Old World / New World / demo.
-4. **A PowerPC interpreter executes guest code.** Fixed 32-bit opcodes are
-   decoded and interpreted against guest memory (with a multi-region map and
-   read-only ROM enforcement), including a full FPU core and exception support.
+4. **A continuous PowerPC interpreter executes the guest.** A fetch-decode-step
+   loop runs the installed firmware for real against a multi-region guest memory
+   map: fixed 32-bit opcodes, GPR/SPR/FPU state, big-endian loads/stores with
+   read-only ROM enforcement, a timebase/decrementer scheduler tick, and
+   exception delivery through the firmware's own vector table (`VecTbl` in
+   SPRG3).
 
 ## Boot Flow
 
@@ -36,20 +44,16 @@ efi_main (src/main.c)
   PpcRunSelfTest                  # 35 checks incl. FPU core
   PpcInitializeMemoryManager      # 256 MB guest RAM @ 0x10000000
   PpcSetGuestMemory               # wire UEFI pages into interpreter
-  [RAM-resident PPC program demo] # addi/mullw/stw through the memory path
   PpcInitializeHardwareAbstraction# GOP, Block I/O, SNP, audio ring
   PpcInitializeBootloader
   PpcSetupBootEnvironment
   PpcInitializeGraphics           # GOP mode + guest framebuffer window
-  [Graphics self-checks]          # full-screen frames verified on the GOP buffer
   PpcInstallLowMemory             # 16 KB globals @ 0x0
   PpcInstallSystemRom             # \System\MacOS\ROM -> HFS "Mac OS ROM" -> demo
-  PpcRunBootSelfTest              # region map, read-only ROM, reset vector
-  PpcPrepareSystemForBoot         # PC = reset vector, MSR = ME|RI, boot info block
+  PpcPrepareSystemForBoot         # PC = entry, MSR, boot info block
   PpcLocateSystemFolder / PpcLoadSystemFiles / PpcScanExtensionsDirectory /
     PpcLoadDrivers                # stage System, Finder, Mac OS ROM, Extensions
-  PpcRunSystemFilesSelfTest       # staged bytes read back via interpreter
-  PpcGetBootInfo -> status report
+  PpcBootFirmware                 # continuous PpcRunGuest loop (see below)
 ```
 
 ## ROM Sourcing and Types
@@ -70,15 +74,12 @@ Priority order (implemented in `PpcInstallSystemRom` /
 
 `BootIdentifyRomType` classifies by signature: a leading `<CHRP-BOOT>\r` means
 New World (PPC, Mac OS 8.5+), otherwise Old World, and the guest boot-info block
-records the type. The boot self-test adapts to the ROM: the `ROM1` magic and
-reset-vector execution checks run only for the demo ROM, while a real ROM is
-verified for region presence (and the CHRP signature when New World) plus
-read-only enforcement.
+records the type.
 
 ## Guest Memory Map
 
 Managed by `PpcAddGuestMemoryRegion` (multi-region map in the interpreter,
-read-only flag per region):
+read-only flag per region). Regions the firmware sees once booting:
 
 | Region              | Guest address | Size       | Access |
 |---------------------|---------------|------------|--------|
@@ -88,11 +89,14 @@ read-only flag per region):
 | Audio ring buffer   | `0x18800000`  | 8 KB       | R/W    |
 | System area         | `0x20000000`  | 16 MB      | R/W    |
 | Driver area         | `0x21000000`  | 32 MB      | R/W    |
-| System ROM          | `0xFFF00000`  | 4 MB       | R (ROM) |
+| System ROM         | `0xFFF00000`  | 4 MB       | R (ROM) |
 
-The bootloader-defined boot-info block in low memory (magic `"EFI!"` at `0x0`,
-then RAM base/size, ROM base/size, ROM type) is entirely host-defined — it is
-not a real Mac OS ROM globals table.
+During a real boot the nano-kernel runs with `KDP = 0xA000` (also SPRG0/SPRG4),
+the scheduler/DR working set lives around `0x40B00000` (firmware overlays in the
+`0x40B00000..0x40B7xxxx` band), and the SCC console device is at `0x20000`.
+This is a *host-defined* environment, not a byte-for-byte real Mac; the goal is
+that the firmware's own environment expectations (low-memory globals layout,
+KDP, VecTbl, SCC) are met so the ROM behaves as it would on hardware.
 
 ## In-Emulator HFS Reader
 
@@ -137,19 +141,64 @@ extents).
 - **Network:** `PpcInitializeNetwork` starts and initializes every Simple
   Network Protocol interface, snapshots real mode (MAC, media state), and
   transmits a real frame via `Transmit`/`GetStatus`.
+- **Console (SCC):** the guest console device is emulated as a Zilog 8530 SCC at
+  guest `0x20000`. `[base+2]` reads status (`0x04` Tx-buffer-empty, bit 0
+  Rx-data-ready), `[base+6]` reads/receives data; puts from the UEFI console
+  queue bytes into an Rx FIFO that raised `RxDataReady`. The boot console drains
+  this during the banner flush. A host-to-guest console input path
+  (`PpcSccPutChar`) feeds the queue.
 - **Audio:** no UEFI audio standard exists, so the device is a fixed ring buffer
   in guest RAM; the host reads PCM samples back and advances a play cursor.
 
-## PowerPC Interpreter
+## PowerPC Interpreter and Guest Execution
 
 `src/cpu/interpreter.c` decodes and executes fixed 32-bit big-endian PowerPC
 opcodes with a register file (32 GPRs, CR, CTR, LR, MSR, SRR0/1, FP registers +
 FPSCR), big-endian guest memory access, FPU core (opcodes 48-63, gated on
-MSR[FP] with the FP-unavailable exception at `0x800`), and exception dispatch
-(program `0x700`, FP `0x800`). Execution today is block-at-a-time
-(`PpcExecuteBlock`): small hand-checked programs run from guest RAM and the
-demo ROM's reset vector. There is no MMU, no timer/interrupt injection, and no
-continuous fetch-execute loop — the ROM window is never executed for real.
+MSR[FP] with the FP-unavailable exception), and a continuous fetch-execute loop.
+
+Implemented guest-facing behavior:
+
+- **Timebase/decrementer tick.** Each instruction advances `TBL/TBU` and `DEC`
+  by `PPC_TIMEBASE_SCALE`; a negative DEC with `MSR.EE` set and the NK's
+  `mtspr`-armed decrementer raises the decrementer exception. The NK scheduler
+  run-loop, park/wake, and `g_BootDecGate` deferral policy are handled in this
+  loop so the boot-tail handoff is never preempted before the stack is
+  established.
+- **Exception delivery through the firmware's vector table.** The firmware's
+  `VecTbl` base is read from SPRG3; entries for vectors `0x100..0xF00` are
+  dispatched as the firmware's own firmware-vector stubs would, including the
+  interrupted `r1`/`r7`/LR deposit into `[KDP-0x4]` / `[KDP-0x10]` / SPRG1/2 the
+  NK's `InterruptSave` expects. Installed vectors seen in real boots:
+  `0x500 external 0x40B14880`, `0x700 program/KCall 0x40B14700`, `0x900
+  decrementer 0x40B13200`, `0xC00 syscall 0x40B14AC0`, etc.
+- **Device windows.** Loads/stores outside guest regions decode as device
+  accesses; the SCC at `0x20000` is one (see above). Unmapped reads return 0.
+- **Fabricated external interrupt through the D0 level-9 dispatch.** Because the
+  guest's IRQ routing (`[KDP-0x824]`) is not set up at the stalled phase, the
+  emulator raises the EXT vector itself, right at the idle give-up
+  (`0x40B24F04`, EE cleared in the sell phase), and lets the firmware's own D0
+  handler run: KCALLSAVE (`0x40B13D40`) → level-9 ISR (`0x40B148E0`) → the ISR's
+  dispatch rfi (`0x40B14A04`). To make the dispatch land correctly the emulator
+  seeds the interrupt dispatch tables the guest's code reads: A-table
+  `0x6C00`/P-table `0x6D00`/stack-table `0x6D20` (`B[0]=0xA000`), `P[0] = Next`
+  (the preempted task's sell-glue continuation `0x40B24F08`), the IC mirrors
+  (`[IC+0x20]=3` events, `[IC+0x24]=1`, `[IC+0x38]=2`, `[IC+0x44]=0x3FFFFFFF`,
+  `[IC+0x4C]=0x75C0`) and `[KDP-0x338]=0x81C0`. The ISR's SRR1 source slot
+  (`0x40B1499C`) is not stable on this harness, so the emulator forces
+  `SRR1=0x9002` (EE on) on every fabricated dispatch rfi. This yields a clean,
+  repeatable task switch into the resumed give-up — stable over 180 s soaks.
+  It does not yet advance boot (the resumed idle task re-sells forever); see
+  Open Work.
+- **Instrumentation.** The interpreter carries a debug logging path
+  (milestone prints, probe lines, a 4096-entry PC/register tail ring for
+  pre-panic trace) used heavily to chase the boot; several probe families are
+  capped/log-only so production boots stay deterministic.
+
+The guest currently runs the firmware on a **flat alias**: there is no
+BAT/SDR1 translation model implemented yet, so firmware that would enable
+translation runs on the direct map. This is acceptable while the nano-kernel
+boots; implementing the real MMU model remains for later work.
 
 ## Build and Run
 
@@ -245,8 +294,30 @@ produced these locked-in facts used by the fixes:
 
 ## Open Work
 
-See [TODO.md](TODO.md). Short list, in order: (1) finish the PPC-native pivot —
-restore the OS's own DR emulator and complete the PPC environment needed to run
-it (translation, KernelData/hardware seeds, device registers); (2) validate
-across the new matrix (New World 9.2.2, Mac OS 8.1, and the `mac_roms` Old World
-ROMs); (3) only later, legacy 68K runtime support for the Classic app layer.
+See [TODO.md](TODO.md). Current direction (user-selected), in order:
+
+1. **Advance boot past the idle sell.** The fabricated EXT dispatch (above) is
+   stable but resuming the idle give-up re-sells forever. Candidate fixes under
+   investigation, in order of preference: (a) trace the give-up's wake-event
+   mask and the warm/CSR branch at `0x40B126E8` to deliver the exact event the
+   NK "Resuming" tail blocks on (candidate: a DEC/1 s timeout or an unemulated
+   KDP service); (b) pivot the dispatch target to the console/shield task's
+   real SCC dequeue (`0x40B26548`/`0x40B263E0`) with its saved GPR context
+   restored; (c) emulate real give-up wake semantics in the `0x2E` stub
+   (block, check the pending-event mask, return woken/nonzero when an event is
+   queued).
+2. **Machine-level interrupt machinery.** Once the event that unblocks boot is
+   identified, implement the classic PowerPC interrupt controller (Grand
+   Central / VIA-style device IRQ sources) and route the SCC Rx interrupt into
+   the nano-kernel's external (`0x500`) vector instead of a fabricated raise.
+   Reference implementations: DingusPPC (`cpu/grandcentral.c`,
+   `devices/psa/..`, SCC model) and SheepShaver's IRQ model.
+3. **UEFI <-> PPC interface layer.** Treat UEFI protocols as the guest's device
+   layer: I/O, interrupts, memory, and display plumbing between the x86_64/UEFI
+   host and the guest firmware environment.
+4. **MMU/translation.** Implement the firmware's BAT/SDR1 translation handshake
+   (or a correct flat alias) so firmware that arms translation proceeds as on
+   hardware.
+5. **Validate the matrix.** New World 9.2.2, Mac OS 8.1, and the `mac_roms`
+   Old World ROMs end-to-end. Legacy 68K support stays as a runtime-only
+   fallback for the Classic app layer, not a boot path.

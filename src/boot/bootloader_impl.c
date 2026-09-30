@@ -1741,27 +1741,52 @@ PpcInstallSystemRom (
                         PpcWriteGuestByte(DstBase[C] + I + 2, PpcReadGuestByte(SrcBase + I + 2));
                         PpcWriteGuestByte(DstBase[C] + I + 3, PpcReadGuestByte(SrcBase + I + 3));
                     }
-                    // Repoint every descent escape to the shim.
+                    // Repoint every descent escape to an inline 4-word shim.
+                // Each escape word is replaced by:
+                //   lis   r12,0x40B6       3D8040B6
+                //   ori   r12,r12,0xD7CC   618CD7CC
+                //   mtlr  r12              7D8803A6
+                //   blr                     4E800020
+                // which sets LR to the ROM cell-processor continuation
+                // (0x40B6D7CC, next-68K-op entry) and blr's there.  Inline
+                // loads/mtlr/blr are alignment-immune and reach the ROM
+                // exactly (no relative-branch arithmetic on possibly 2-
+                // aligned cell addresses).
+                {
+                    const UINT32 InSh[] = { 0x3D8040B6u, 0x618CD7CCu,
+                                            0x7D8803A6u, 0x4E800020u };
+                    static const UINT32 EscSet[9] = {
+                        0x4CA80020u, 0x48005494u, 0x48005450u, 0x48005410u,
+                        0x480053D0u, 0x48005390u, 0x48005350u, 0x4800530Cu,
+                        0x480052DCu };
                     for (I = 0; I < Span; I += 4) {
                         UINT32 Word = ((UINT32)PpcReadGuestByte(DstBase[C] + I) << 24) |
                                       ((UINT32)PpcReadGuestByte(DstBase[C] + I + 1) << 16) |
                                       ((UINT32)PpcReadGuestByte(DstBase[C] + I + 2) << 8) |
                                       ((UINT32)PpcReadGuestByte(DstBase[C] + I + 3));
-                        if (Word == 0x4CA80020u || Word == 0x48005494u) {
-                            INT64 Dist = (INT64)(ShimBase - (DstBase[C] + I));
-                            UINT32 B = 0x48000000u | (UINT32)((Dist >> 2) & 0x03FFFFFFu);
-                            PpcWriteGuestByte(DstBase[C] + I,     (UINT8)(B >> 24));
-                            PpcWriteGuestByte(DstBase[C] + I + 1, (UINT8)(B >> 16));
-                            PpcWriteGuestByte(DstBase[C] + I + 2, (UINT8)(B >> 8));
-                            PpcWriteGuestByte(DstBase[C] + I + 3, (UINT8)B);
+                        {
+                            UINT32 E;
+                            for (E = 0; E < 9; E++) {
+                                if (Word == EscSet[E]) {
+                                    UINT32 J;
+                                    for (J = 0; J < 4; J++) {
+                                        UINT32 Bw = InSh[J];
+                                        PpcWriteGuestByte(DstBase[C] + I + J * 4,     (UINT8)(Bw >> 24));
+                                        PpcWriteGuestByte(DstBase[C] + I + J * 4 + 1, (UINT8)(Bw >> 16));
+                                        PpcWriteGuestByte(DstBase[C] + I + J * 4 + 2, (UINT8)(Bw >> 8));
+                                        PpcWriteGuestByte(DstBase[C] + I + J * 4 + 3, (UINT8)Bw);
+                                    }
+                                }
+                            }
                         }
                     }
+                }
                 }
                 // The shim: set LR to the machine's cell-processor continuation
                 // (0x40B6D7CC, the next-68K-op entry) then blr there.
                 {
                     const UINT32 Sh[] = { 0x3D8040B6u, 0x618CD7CCu,
-                                          0x7D8C03A6u, 0x4E800020u };
+                                          0x7D8803A6u, 0x4E800020u };
                     for (D = 0; D < sizeof(Sh)/sizeof(Sh[0]); D++) {
                         PpcWriteGuestByte(ShimBase + D * 4,     (UINT8)(Sh[D] >> 24));
                         PpcWriteGuestByte(ShimBase + D * 4 + 1, (UINT8)(Sh[D] >> 16));
@@ -2661,6 +2686,23 @@ PpcPatchNewWorldRom (
     RomWriteEmulatorDispatchHelper(Rom, 0x36F7C0);
     RomWriteEmulatorClassHelper(Rom, 0x36F7D0);
 #endif // FAITHFUL handoff retired
+
+    // ---------------------------------------------------------------------
+    // DR BANNER/ECHO RING SCC-FEED SHIM (2026-09, v2): REVERTED. The v1/v2
+    // experiments replaced the empty-ring `beq 0x40B26520` at 0x40B2644C and
+    // tried to feed queued SCC bytes into the banner-echo loop at 0x40B26450.
+    // That is the WRONG consumer: 0x40B10310 is ROM banner text that the loop
+    // prints (per the disassembly: `lbzu r29,1(r8)` walks the banner, parks on
+    // the null), and SCC input is consumed by the GETCH resume handler
+    // (0x40B2756C) after the wait at 0x40B2751C. v1 hijacked real banner chars
+    // (Hello 2->0, GETCH 16->0); v2 let a zero ring byte become a feed source,
+    // so the guest echoed ~3.9 MB of ROM for the whole 600 s soak and never
+    // reached the GETCH wait (AUTORESUME/GETCH = 0). Restore the original
+    // `beq` so the known-good baseline (Hello 2 / AUTORESUME 4 / GETCH 16,
+    // parking at 0x40B265CC with [r1+EDC]=3) is preserved; the real fix must
+    // be in the GETCH resume path or execute-line's line-ready gate.
+    // ---------------------------------------------------------------------
+    RomPatchWriteWord32(Rom, 0x32644C, 0x418200D4); // beq 0x40B26520 (original)
 
     // The ROM's control-flow dispatch glue bakes a family of
     // `rlwimi r29,...` words that force bit 20 (0x100000) of the

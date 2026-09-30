@@ -4,10 +4,11 @@
 
 The boot layer is functional as a UEFI application: it builds, boots under
 QEMU/OVMF, runs its self-tests, stages System Folder files and drivers from real
-classic Mac discs, and detects and installs a genuine New World `Mac OS ROM`
-from a Mac OS 8.5+/9 disc. **It does not yet boot a Mac OS guest** — there is no
-MMU or continuous execution, so the installed ROM is not run for real. This
-guide covers what works today and how to exercise it.
+classic Mac discs, and executes a genuine New World `Mac OS ROM` continuously —
+the nano-kernel boots through init, PMDT→areas, and task creation to the live
+DR console wait. It does not yet reach the OS desktop: the SCC receive
+interrupt path and MMU/translation model are still to come. This guide covers
+what works today and how to exercise it.
 
 ## What You Need
 
@@ -54,7 +55,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-qemu-windows.ps1
 The serial log lands at `$env:TEMP\opencode\boot_out.txt`. Check the result:
 
 ```powershell
-Select-String -Path "$env:TEMP\opencode\boot_out.txt" -Pattern "self-test complete|Boot state"
+Select-String -Path "$env:TEMP\opencode\boot_out.txt" -Pattern "Hello from the replacement|Boot state"
 ```
 
 What to expect:
@@ -62,13 +63,17 @@ What to expect:
 - PowerPC CPU self-test 35/35 (includes the FPU core).
 - With a Mac OS 8.5+ disc attached: the real New World ROM is found and
   installed (`System ROM loaded from HFS volume 'Power Mac G4 Install':
-  2763530 bytes` → `System ROM installed: ... (New World)`), and the boot
-  memory-map self-test passes 5/5.
-- Without such a disc: the demo ROM is installed and the boot self-test passes
-  7/7.
+  2763530 bytes` → `System ROM installed: ... (New World)`), then the guest
+  firmware executes continuously.
+- The nano-kernel milestone stream appears: `Hello from the replacement
+  multitasking NanoKernel`, `converting PMDTs to areas`, scheduler ticks, and
+  the DR console wait (`0x40B27530`/`0x40B265CC` shows in the milestone
+  timeline).
 - System Folder staging: System, Finder, and up to 64 Extensions are staged from
   the disc; the system-files self-test passes 7/7.
-- The app reports `Boot state: ready=1 ...` and returns cleanly to the firmware.
+- The app reports `Boot state: ready=1 ...` and keeps executing the guest (use
+  `-NoReboot` to sit in the console wait; `-StallSeconds` controls the
+  no-output stall detector — pass `0` because the NK console phase is silent).
 
 ## Providing a ROM
 
@@ -92,14 +97,16 @@ The log will print `System ROM installed: ... (Old World)`.
 - In-emulator HFS reading of System 7 / Mac OS 8 / Mac OS 9 disc images:
   catalog lookup, auto block-size, multi-extent files.
 - Real New World ROM discovery + install at `0xFFF00000` (read-only) with CHRP
-  signature verification.
+  signature verification, plus continuous guest execution: nano-kernel init,
+  PMDT→areas, task creation, and the DR console wait.
 - System Folder / driver staging into guest staging areas with read-back
   verification.
 
 ## Limitations
 
-- The guest OS does not boot: the ROM is installed but not executed (no MMU, no
-  continuous fetch/execute, no Mac device register emulation).
+- The OS desktop is not reached: the SCC receive interrupt → DRAM input ring
+  path and the MMU/translation model are not yet implemented; the guest sits in
+  the DR console read wait.
 - System 7 requires a user-supplied Old World ROM; a New World `Mac OS ROM`
   cannot serve System 7.
 - HFS filename bytes are MacRoman/Latin-1; names with high-bit characters print
@@ -111,7 +118,8 @@ The log will print `System ROM installed: ... (Old World)`.
 
 1. **No serial log / app not running**: confirm OVMF is present and the image is
    named `EFI\BOOT\BOOTX64.EFI` on a FAT partition (the run script does this).
-2. **Demo ROM installed unexpectedly**: the disc either has no `Mac OS ROM` (a
+   Pass `-NoReboot` and `-StallSeconds 0` when chasing the NK console phase.
+2. **No nano-kernel milestones**: the disc either has no `Mac OS ROM` (a
    pre-8.5 disc) or it was not detected. Check the log lines around `System ROM
    not found` / `Mac OS ROM file not found`.
 3. **System 7 disc staged nothing**: System 7.5.3's `Finder` is a genuine

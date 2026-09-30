@@ -83,6 +83,15 @@ PpcSccPutChar (
     IN UINT8 Char
     );
 
+// Execute the SCC FIFO + NK external-interrupt-controller device self-test
+// (queue/level primitives + KDP-slot install). Part of the aggregate CPU
+// self-test; runs on the host with no guest state.
+VOID
+PpcRunSccDeviceSelfTest (
+    OUT UINTN* Passed,
+    OUT UINTN* Failed
+    );
+
 // Effective -> physical address translation (DingusPPC-faithful MMU). Returns
 // TRUE and fills *Pa on a BAT or SDR1 page-table hit; FALSE on a miss. The
 // call site decides whether translation applies based on MSR[IR] (instruction)
@@ -99,6 +108,23 @@ PpcTranslateEffective (
 VOID
 PpcUpdateBat (
     IN UINT32 SprNum
+    );
+
+// Low-RAM write census (diagnostic). Called from every guest store path
+// (CpuWrite32, CpuWrite32Rev, M68kWriteLong) with the effective address, the
+// value about to be stored and the writing PC (the 68K path ORs 0x68000000 into
+// the PC so the two are distinguishable in the report).
+#define LOW_CENSUS_PAGES 128
+extern UINT32 g_LowPageWrites[LOW_CENSUS_PAGES];
+extern UINT32 g_LowPageFirstPc[LOW_CENSUS_PAGES];
+extern UINT32 g_LowPageFirstAddr[LOW_CENSUS_PAGES];
+extern UINT8  g_LowPageSeen[LOW_CENSUS_PAGES];
+
+VOID
+LowRamCensus (
+    IN UINT32 A,
+    IN UINT32 V,
+    IN UINT32 Pc
     );
 
 #endif // __PPC_INTERPRETER_H__

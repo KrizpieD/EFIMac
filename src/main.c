@@ -95,7 +95,8 @@ efi_main (
   Print(L"UEFI watchdog cancelled\n");
   
   // Print welcome message
-  Print(L"EFI Mac OS Boot Layer v0.2-A207G1 [%x]\n", 0x81AD3A13);
+  Print(L"EFI Mac OS Boot Layer v0.2-A207G1 [%x]\n", 0x7FD78473);
+  Print(L"BUILD-MARKER D1 identity probe active\n");
   Print(L"Heavy bootloader for classic Mac OS (System 7, Mac OS 8/9) via UEFI\n");
   Print(L"Initializing PowerPC environment...\n");
   

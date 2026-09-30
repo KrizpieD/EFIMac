@@ -444,6 +444,16 @@ PpcRunSelfTest (
 
     PpcSetMemoryAccess(NULL, NULL);
 
+    {
+        // SCC FIFO + interrupt-controller device self-test (host-side, no
+        // guest state), folded into the aggregate CPU self-test counters.
+        UINTN SccPassed = 0;
+        UINTN SccFailed = 0;
+        PpcRunSccDeviceSelfTest(&SccPassed, &SccFailed);
+        g_SelfTestPasses   += SccPassed;
+        g_SelfTestFailures += SccFailed;
+    }
+
     Print(L"--- Self-test complete: %d passed, %d failed ---\n",
           g_SelfTestPasses, g_SelfTestFailures);
 
@@ -499,6 +509,20 @@ PpcReadGuestWord (
            ((UINT32)PpcReadGuestByte(Address + 1) << 16) |
            ((UINT32)PpcReadGuestByte(Address + 2) << 8)  |
            ((UINT32)PpcReadGuestByte(Address + 3));
+}
+
+// Write a 32-bit big-endian word to guest memory through the interpreter's
+// active memory path (writes to unmapped pages are dropped).
+static VOID
+PpcWriteGuestWord (
+    IN UINT32 Address,
+    IN UINT32 Value
+    )
+{
+    PpcWriteGuestByte(Address,     (UINT8)(Value >> 24));
+    PpcWriteGuestByte(Address + 1, (UINT8)(Value >> 16));
+    PpcWriteGuestByte(Address + 2, (UINT8)(Value >> 8));
+    PpcWriteGuestByte(Address + 3, (UINT8)(Value));
 }
 
 EFI_STATUS
@@ -584,6 +608,19 @@ PpcHandleException (
             // system-call handler reads it for the syscall number (`cmpwi
             // r0,-3` at 0x40B14AC0) and stores it to [ECB+0x104] for the
             // dispatch table index.
+            //
+            // The NanoKernel's InterruptSave called from the vector handlers
+            // (0x40B14700 -> bl 0x40B13D40) restores r7 from [KDP-0x10] and
+            // r1 from [KDP-0x4] at the END of the register save (lwz r7,-0x10
+            // (r1); lwz r1,-0x4(r1); bclr), so the firmware vector stub must
+            // have deposited the interrupted r7 and r1 into those KDP slots
+            // before the handler is entered. Without that deposit the handler
+            // resumes with whatever stale value occupied [SPRG0-4] (the DR
+            // swap's task_r1 slot, seeded to 0xA000 only at DR-boot), and e.g.
+            // a twi fault mid-boot resumes with r1 = a task pointer instead of
+            // the interrupted stack pointer. Mirror the stub deposits here.
+            PpcWriteGuestWord(g_PpcContext.Spr[272] - 0x04, g_PpcContext.Gpr[1]);  // [KDP-4]  = interrupted r1
+            PpcWriteGuestWord(g_PpcContext.Spr[272] - 0x10, g_PpcContext.Gpr[7]);  // [KDP-0x10] = interrupted r7
             g_PpcContext.Spr[273] = g_PpcContext.Gpr[1];   // SPRG1 = user r1
             g_PpcContext.Spr[274] = g_PpcContext.Lr;       // SPRG2 = user LR
             g_PpcContext.Gpr[1]   = g_PpcContext.Spr[272]; // r1 = KDP (SPRG0)

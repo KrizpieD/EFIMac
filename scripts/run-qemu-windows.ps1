@@ -23,7 +23,21 @@ param(
     [string]$MacDisc = "",
     [string]$OldWorldRom = "",
     [switch]$NoReboot,
-    [int]$Seconds  = 25
+    [int]$Seconds  = 25,
+
+    # ---- Early exit -------------------------------------------------------
+    # A boot soak is a ceiling, not a target: once the guest has crashed, or has
+    # stopped emitting serial output, the remaining window yields nothing and
+    # costs real wall-clock time on every iteration. These switches end the run
+    # as soon as the outcome is already determined. -Seconds stays the ceiling.
+    [switch]$NoStopOnMarker,          # disable all early-exit detection
+    [int]$StallSeconds = 60,          # stop after this long with no serial output
+    [string[]]$StopOnPattern = @(),   # extra progress markers; stop when one appears
+    [string[]]$TimelinePattern = @(), # report first-seen wall-clock time for each
+    [string[]]$FatalMarkers = @(
+        "GUEST STOP",                 # guest hit a reserved/unsupported opcode
+        "budget stop"                 # emulator's own instruction-budget stop
+    )
 )
 
 $ErrorActionPreference = "Stop"
@@ -103,6 +117,17 @@ $stream = $null
 $resetReasons = New-Object System.Collections.Generic.List[string]
 $iterations = $Seconds * 4
 $elapsed = 0
+
+# Early-exit state. We tail the serial log incrementally rather than re-reading
+# it, so the check costs one Read per poll regardless of log size.
+$scanPos = 0
+$lastGrowth = 0
+$stopReason = $null
+# Timeline state: the serial log carries no timestamps of its own, so record
+# first-seen wall-clock offsets here. This is what tells us how long a probe
+# window actually needs to be instead of guessing with -Seconds.
+$seenAt = @{}
+$timeline = New-Object System.Collections.Generic.List[string]
 for ($i = 0; $i -lt $iterations; $i++) {
     if ($p.HasExited) {
         # Double-check: a spurious HasExited at startup (Process handle quirk)
@@ -148,10 +173,66 @@ for ($i = 0; $i -lt $iterations; $i++) {
     }
     $elapsed = [math]::Floor($i / 4)
     Start-Sleep -Milliseconds 250
+
+    # --- Serial-log tailing: timeline + early exit ------------------------
+    # Read the new bytes once and serve both consumers from the same chunk, so
+    # the offset only ever advances a single time per poll.
+    $chunk = $null
+    $len = 0
+    try { $len = (Get-Item -LiteralPath $BootOut -ErrorAction Stop).Length }
+    catch { $len = 0 }
+    if ($len -lt $scanPos) { $scanPos = 0 }   # log truncated / restarted
+    if ($len -gt $scanPos) {
+        try {
+            $fs = [IO.File]::Open($BootOut, 'Open', 'Read', 'ReadWrite')
+            try {
+                [void]$fs.Seek($scanPos, 'Begin')
+                $buf = New-Object byte[] ($len - $scanPos)
+                $got = $fs.Read($buf, 0, $buf.Length)
+            } finally { $fs.Close() }
+            $chunk = [Text.Encoding]::UTF8.GetString($buf, 0, $got)
+        } catch { }
+        $scanPos = $len
+        $lastGrowth = $elapsed
+    }
+
+    # Timeline is observational, so it records even when early exit is disabled.
+    if ($null -ne $chunk) {
+        foreach ($m in $TimelinePattern) {
+            if (-not $seenAt.ContainsKey($m) -and $chunk.Contains($m)) {
+                $seenAt[$m] = $elapsed
+                $timeline.Add(("  t+{0,4}s  {1}" -f $elapsed, $m))
+            }
+        }
+    }
+
+    if (-not $NoStopOnMarker -and $null -eq $stopReason) {
+        if ($null -ne $chunk) {
+            foreach ($m in $FatalMarkers) {
+                if ($chunk.Contains($m)) { $stopReason = "fatal marker '$m'"; break }
+            }
+            if ($null -eq $stopReason) {
+                foreach ($m in $StopOnPattern) {
+                    if ($chunk.Contains($m)) { $stopReason = "milestone '$m'"; break }
+                }
+            }
+        } elseif ($StallSeconds -gt 0 -and ($elapsed - $lastGrowth) -ge $StallSeconds) {
+            $stopReason = "no serial output for $StallSeconds s (stalled)"
+        }
+    }
+    if ($null -ne $stopReason) { break }
 }
 if ($qmpClient) { $qmpClient.Close() }
 $resetReasonStr = $resetReasons -join ','
-if (-not $p.HasExited) {
+if ($null -ne $stopReason) {
+    # Outcome already determined: the guest crashed or stalled, so the rest of
+    # the window is dead time. Reclaim QEMU so we never orphan a guest.
+    Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+    $p.WaitForExit(5000) | Out-Null
+    Write-Output "QEMU stopped early after ${elapsed}s: $stopReason"
+    Set-Content -Path (Join-Path $env:TEMP "opencode\qemu_result.txt") `
+                -Value "early seconds=$elapsed reason=$stopReason ceiling=$Seconds resetReasons=[$resetReasonStr]"
+} elseif (-not $p.HasExited) {
     Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
     $p.WaitForExit(5000) | Out-Null
     Write-Output "QEMU ran the full $Seconds s (no early exit)"
@@ -185,3 +266,12 @@ public static class WProc {
 }
 
 Write-Output "Boot log: $BootOut"
+
+if ($TimelinePattern.Count -gt 0 -and $timeline.Count -gt 0) {
+    Write-Output "Timeline (first-seen wall clock):"
+    $timeline | ForEach-Object { Write-Output $_ }
+    $missing = $TimelinePattern | Where-Object { -not $seenAt.ContainsKey($_) }
+    if ($missing) {
+        Write-Output ("  never seen: " + ($missing -join ', '))
+    }
+}

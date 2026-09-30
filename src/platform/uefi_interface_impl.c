@@ -14,6 +14,188 @@ typedef struct {
 // Global UEFI context
 static PPC_UEFI_CONTEXT g_UefiContext = {0};
 
+// ---------------------------------------------------------------------------
+// Fast serial console
+//
+// Diagnostic volume is the dominant cost of a boot soak. Routing it through
+// ST->ConOut->OutputString (OVMF's serial SimpleTextOut instance) measured ~412
+// bytes/s, which stretches every guest timer by orders of magnitude: the
+// timebase advances per *instruction* (PPC_TIMEBASE_SCALE), so a console that
+// blocks inside Print starves the guest clock. A 346 KB run took 840 s.
+//
+// We therefore emit straight to the PC's 16550 COM1 (0x3F8), which is where
+// the harness's -serial stdio captures. The full SimpleTextOutput protocol is
+// still forwarded to OVMF so the real UI (ClearScreen/SetAttribute/QueryMode)
+// keeps working unchanged; only OutputString is intercepted.
+// ---------------------------------------------------------------------------
+#define PPC_UART_BASE      0x3F8
+#define PPC_UART_LSR       (PPC_UART_BASE + 5)
+#define PPC_UART_LSR_THRE  0x20        // transmit holding register empty
+
+static BOOLEAN g_FastConsole = FALSE;
+static SIMPLE_TEXT_OUTPUT_INTERFACE* g_OrigConOut = NULL;
+static SIMPLE_TEXT_OUTPUT_INTERFACE g_FastConOut = {0};
+
+static inline void PpcOutByte (UINT16 Port, UINT8 Value) {
+    __asm__ __volatile__ ("outb %0, %1" :: "a"(Value), "Nd"(Port));
+}
+
+static inline UINT8 PpcInByte (UINT16 Port) {
+    UINT8 Result;
+    __asm__ __volatile__ ("inb %1, %0" : "=a"(Result) : "Nd"(Port));
+    return Result;
+}
+
+static VOID
+PpcSerialPutChar (
+    IN CHAR16 Ch
+    )
+{
+    UINT8 Byte;
+    UINTN ThreSpin;
+    // Only the ASCII range reaches the serial log; anything else (and every
+    // non-printable control char except the usual whitespace) becomes '.'.
+    Byte = (Ch < 0x20 || Ch > 0x7E) ? (UINT8)'.' : (UINT8)Ch;
+    // Bounded THRE wait: never wedge the emulator permanently on the virtual
+    // UART (transport stalls have wedged whole soaks). Exceedance just drops
+    // the character and the log resumes at the next one.
+    for (ThreSpin = 0;
+         (PpcInByte(PPC_UART_LSR) & PPC_UART_LSR_THRE) == 0 && ThreSpin < 200000000u;
+         ThreSpin++) { }
+    if (Byte == (UINT8)'\n') {
+        PpcOutByte(PPC_UART_BASE, (UINT8)'\r');
+        for (ThreSpin = 0;
+             (PpcInByte(PPC_UART_LSR) & PPC_UART_LSR_THRE) == 0 && ThreSpin < 200000000u;
+             ThreSpin++) { }
+    }
+    PpcOutByte(PPC_UART_BASE, Byte);
+}
+
+static EFI_STATUS EFIAPI
+PpcFastConOutReset (
+    IN SIMPLE_TEXT_OUTPUT_INTERFACE* This,
+    IN BOOLEAN Extended
+    )
+{
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI
+PpcFastConOutOutputString (
+    IN SIMPLE_TEXT_OUTPUT_INTERFACE* This,
+    IN CHAR16* String
+    )
+{
+    if (String == NULL) {
+        return EFI_SUCCESS;
+    }
+    while (*String != 0) {
+        PpcSerialPutChar(*String);
+        String++;
+    }
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI
+PpcFastConOutTestString (
+    IN SIMPLE_TEXT_OUTPUT_INTERFACE* This,
+    IN CHAR16* String
+    )
+{
+    CHAR16* P;
+    if (String == NULL) {
+        return EFI_INVALID_PARAMETER;
+    }
+    for (P = String; *P != 0; P++) {
+        // Only ASCII printable bytes plus normal whitespace can survive the
+        // 16550 path; reject the rest.
+        if ((*P < 0x20 && *P != L'\n' && *P != L'\r' && *P != L'\t') || *P > 0x7E) {
+            return EFI_UNSUPPORTED;
+        }
+    }
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI
+PpcFastConOutQueryMode (
+    IN SIMPLE_TEXT_OUTPUT_INTERFACE* This,
+    IN UINTN Mode,
+    OUT UINTN* Columns,
+    OUT UINTN* Rows
+    )
+{
+    *Columns = 80; *Rows = 25;
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI
+PpcFastConOutSetMode (
+    IN SIMPLE_TEXT_OUTPUT_INTERFACE* This,
+    IN UINTN Mode
+    )
+{
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI
+PpcFastConOutSetAttribute (
+    IN SIMPLE_TEXT_OUTPUT_INTERFACE* This,
+    IN UINTN Attribute
+    )
+{
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI
+PpcFastConOutClearScreen (
+    IN SIMPLE_TEXT_OUTPUT_INTERFACE* This
+    )
+{
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI
+PpcFastConOutSetCursorPosition (
+    IN SIMPLE_TEXT_OUTPUT_INTERFACE* This,
+    IN UINTN Column,
+    IN UINTN Row
+    )
+{
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EFIAPI
+PpcFastConOutEnableCursor (
+    IN SIMPLE_TEXT_OUTPUT_INTERFACE* This,
+    IN BOOLEAN Visible
+    )
+{
+    return EFI_SUCCESS;
+}
+
+static VOID
+PpcInstallFastConsole (
+    VOID
+    )
+{
+    if (g_FastConsole || ST == NULL || ST->ConOut == NULL) {
+        return;
+    }
+    g_OrigConOut = ST->ConOut;
+    g_FastConOut.Reset               = PpcFastConOutReset;
+    g_FastConOut.OutputString        = PpcFastConOutOutputString;
+    g_FastConOut.TestString          = PpcFastConOutTestString;
+    g_FastConOut.QueryMode           = PpcFastConOutQueryMode;
+    g_FastConOut.SetMode             = PpcFastConOutSetMode;
+    g_FastConOut.SetAttribute        = PpcFastConOutSetAttribute;
+    g_FastConOut.ClearScreen         = PpcFastConOutClearScreen;
+    g_FastConOut.SetCursorPosition   = PpcFastConOutSetCursorPosition;
+    g_FastConOut.EnableCursor        = PpcFastConOutEnableCursor;
+    g_FastConOut.Mode                = g_OrigConOut->Mode;
+    ST->ConOut = &g_FastConOut;
+    g_FastConsole = TRUE;
+}
+
 EFI_STATUS
 PpcInitializeUefiInterface (
     IN EFI_HANDLE ImageHandle,
@@ -22,7 +204,11 @@ PpcInitializeUefiInterface (
 {
     // Initialize the UEFI interface context
     ZeroMem(&g_UefiContext, sizeof(g_UefiContext));
-    
+
+    // Route all console output straight to the 16550 COM1 port before the
+    // first Print; this is what makes soaks fast.
+    PpcInstallFastConsole();
+
     g_UefiContext.IsInitialized = TRUE;
     g_UefiContext.ImageHandle = ImageHandle;
     g_UefiContext.SystemTable = SystemTable;
