@@ -3745,6 +3745,29 @@ g_DrA207Land = 0;
                       L"r27(op)=0x%04x -> DR dispatch 0x40B67B60\n",
                       g_PpcContext.Gpr[24], g_PpcContext.Gpr[27] & 0xFFFF);
             }
+            if (CurrentAddress == 0x40B24524u && g_PpcContext.Gpr[1] == 0) {
+                // NK task-restore tail (0x40B24518..0x40B24524):
+                //   lwz r0,0x104(r6); lwz r6,0x18(r1); lwz r1,4(r1); rfi
+                // The idle task's saved stack pointer ([ctx+4]) is 0, so every
+                // asynchronous entry into the idle glue -- and into the DEC
+                // handler that preempts it -- runs with r1=0. The NK then
+                // touches [r1-0xB50] (MAC lock), [r1-0x340], [r1-0x438] and
+                // [r1+0xE8C]; with r1=0 the negative offsets wrap to
+                // 0xFFFFF4B0/0xFFFFFCC0 (ROM/MMIO) and the lock test never
+                // clears, so the guest spins in the acquire at 0x40B12700.
+                // Hand the idle task the same kind of low-RAM frame the DR
+                // task uses (0xA000), one region lower so the two task
+                // contexts never share scratch: 0x9000 covers
+                // [0x84B0..0x9F00] including the [r1+0xE8C] tick counter and
+                // stays clear of the KDP/boot-proc frame at 0xA000.
+                static UINT32 IdleSpFixed = 0;
+                g_PpcContext.Gpr[1] = 0x00009000u;
+                if (IdleSpFixed < 4) {
+                    IdleSpFixed++;
+                    Print(L"  IDLESP fix r1=0 -> 0x00009000 (idle task restore @0x40B24524,"
+                          L" resume PC=0x%08x)\n", g_PpcContext.Srr0);
+                }
+            }
             if (CurrentAddress >= 0x40B10000 && CurrentAddress < 0x40B30000) {
                 // The fabricated level-9 dispatch rfi (ISR tail at 0x40B14A04,
                 // resuming our mirror's sell-glue target 0x40B24F08) reads its
@@ -6222,8 +6245,32 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x1B7C0: GetQDGlobals "
     CpuWrite32(0x0000BE0Cu, 0x38600001u);  // li     r3,1
     CpuWrite32(0x0000BE10u, 0x4C000064u);  // rfi
     Print(L"  DRTABLE seed 0xACB8[134] [2E]=0x%08x -> stub 0x%08x (wake-on-pending)\n",
-          CpuRead32(0x0000AD70u),
-          CpuRead32(0x0000AD70u) + 0xB8);
+                  CpuRead32(0x0000AD70u),
+                  CpuRead32(0x0000AD70u) + 0xB8);
+            // NK idle-class task dispatch table at low RAM 0x12E88. The
+            // scheduler's below-priority-9 tail (0x40B22F90..0x40B22FC8) does
+            //   lwz r19,0x64c(r1)            ; byte offset into the table
+            //   lis r20,1; ori r20,r20,0x2e88 ; base 0x12E88
+            //   add r20,r20,r19
+            //   lwz r20,0(r20); add r20,r20,r19; mtlr r20; blr
+            // so each slot holds (entry - idx). Only the OS task-creation phase
+            // fills this table, and the emulated NK never reaches it, so every
+            // slot reads 0 and the idle class blr's to PC=0, tripping the 68K
+            // A-trap guard word (GUEST STOP at PC=0 inst=0xA000). Mirror the
+            // image the way the soft-fn table above is mirrored: every slot gets
+            // the NK idle-task entry the task-restore path itself resumes
+            // (SRR0=0x40B24F04), so entry = slot + idx lands back on it.
+            {
+                UINT32 IdxI, IdleFilled = 0;
+                for (IdxI = 0; IdxI < 256; IdxI++) {
+                    CpuWrite32(0x00012E88u + IdxI * 4, 0x40B24F04u - IdxI * 4);
+                    IdleFilled++;
+                }
+                Print(L"  IDLECLASS seed 0x12E88[%u] slot[0]=0x%08x slot[+4]=0x%08x "
+                      L"slot[+FC]=0x%08x\n",
+                      IdleFilled, CpuRead32(0x00012E88u),
+                      CpuRead32(0x00012E8Cu), CpuRead32(0x00012F84u));
+            }
 
             }
             // The DR's own cold-start continuation (0x40B6E964) reads the 68K
@@ -8120,12 +8167,23 @@ CpuRead32(0x00100000u),
             }
             Print(L"\n");
         }
-        // SBODY: wide tracer over the whole NK idle dispatch tail. The exact-PC
-        // probes at 0x40B22F90/0x40B22FB8 never fired although the tail ring
-        // proves those instructions executed; this range tracer determines
-        // whether the interpreter probes ever see the scheduler body at all.
+        // SBODY: wide tracer over the whole NK idle dispatch tail. It also serves
+        // as the placement probe for scheduler diagnostics: an exact-PC test
+        // placed INSIDE this block fires on the expected iteration, while the
+        // same test placed in the next basic block after it never fires even
+        // though the trace ring proves the instruction executed. Keep new
+        // scheduler probes inside this block.
         if (SchedBodyProbes < 96 && Current >= 0x40B22F18u && Current <= 0x40B22FC8u) {
             SchedBodyProbes++;
+            // NK idle-class dispatch tail (0x40B22F90..0x40B22FC8):
+            //   lwz r19,0x64c(r1); lbz r20,0x14(r30); rlwimi r19,r20,2,0x17,0x1d
+            //   lis r20,1; ori r20,r20,0x2e88; add r20,r20,r19
+            //   stb r21,0x17(r30); lwz r20,0(r20); add r20,r20,r19; mtlr r20; blr
+            // r19 is a byte offset into the table at 0x12E88 and each slot holds
+            // (entry - idx). The table is seeded once at DR bootstrap (see
+            // IDLECLASS above), because only the OS task-creation phase fills it
+            // and the emulated NK never reaches it: an all-zero table sends the
+            // idle class to PC=0 and trips the 68K A-trap guard word.
             // Everything below is folded into this ONE Print call on purpose.
             // Statements appended after this block have empirically stopped
             // executing (the build-2 SPICK@SB/SPDEC@SB additions never fired even
@@ -8446,49 +8504,7 @@ CpuRead32(0x00100000u),
             // Piggyback the SPDEC/SPICK wake/sleep + ECB-selection probes
             // onto the working SBODY path. These tell us which ECB the
             // scheduler selects each pass and whether the DR task (0xB100,
-            // 68K pc saved) is ever runnable or perpetually asleep.
-        }
-        // NK idle-task dispatch table at low RAM 0x12E88: the scheduler's
-        // priority-<9 ("idle class") tail builds the base with
-        // `lis r20,1; ori r20,r20,0x2E88` (0x40B22FA0/FA4) = 0x12E88, indexes
-        // it by idx (class | priority<<4), and blr's to entry+idx. Real boot
-        // populates it through the OS task-creation phase we bypass; a zero
-        // slot sends the idle class to PC=0 (GUEST STOP on the 68K A-trap
-        // guard word). Seed every slot to the ROM idle-task glue 0x40B24F04
-        // (stored target-idx) the first time the <9 dispatch path is about to
-        // run its table load (0x40B22FB8 follows 0x40B22F90 in the same pass).
-        if (Current == 0x40B22FB8) {
-            static UINTN TdispLdProbes = 0;
-            if (TdispLdProbes < 8) {
-                UINT32 TsIdx = g_PpcContext.Gpr[19];
-                UINT32 TsBase = g_PpcContext.Gpr[20];
-                UINT32 TsEnt = CpuRead32(TsBase);
-                TdispLdProbes++;
-                Print(L"  TSRD[%u] @0x40B22FB8 idx(r19)=0x%08x base(r20)=0x%08x "
-                      L"entry=0x%08x ->LR=0x%08x\n",
-                      (UINT32)TdispLdProbes, TsIdx, TsBase, TsEnt, TsEnt + TsIdx);
-                if (TdispLdProbes == 1) {
-                    UINT32 TsD;
-                    for (TsD = 0; TsD < 16; TsD += 4) {
-                        Print(L"  TSTBL [+%02x]=0x%08x 0x%08x 0x%08x 0x%08x\n",
-                              TsD * 4,
-                              CpuRead32(0x00012E88u + TsD * 4),
-                              CpuRead32(0x00012E88u + (TsD + 1) * 4),
-                              CpuRead32(0x00012E88u + (TsD + 2) * 4),
-                              CpuRead32(0x00012E88u + (TsD + 3) * 4));
-                    }
-                }
-            }
-        }
-        // SPDEC: regex over the scheduler's wake/sleep decision tail. The idle
-        // task wakes via the [r30+0x38/0x3C] deadline compare at 0x40B22F24..
-        // 0x40B22F50 (r30 = idle ECB KDP-0x320), and a timed task that is NOT
-        // yet due follows the bgt/@0x40B22F68 to the sleep/return path
-        // 0x40B23010. This dumps which ECB each pass selects so we can see
-        // whether the DR task (0xB100, preempted with 68K pc saved) is ever
-        // scheduled or is perpetually slept.
-        if (Current == 0x40B22F74u || Current == 0x40B23010u ||
-            Current == 0x40B232F8u) {
+            // 68K pc saved) is ever runnable or is perpetually slept.
         }
         // 2nd-call decision point in NKCreateAddressSpaceSub: after the first
         // 0x40b1fbec call built the low AREA, the split logic reaches here
@@ -9407,49 +9423,65 @@ static const UINT32 Ranges[8][2] = {
             // notch per iteration (mr r30,r1; mr r1,r2; mr r2,r5; ...) to
             // fabricate the idle task's GPR image, then yields via sc 0x2E.
             //
-            // The EXT/SCC handler 0x40B14880 must be deferred for the WHOLE
-            // window: it reads [-0x338(r8)] (r8=KDP), and for any level < 2
-            // falls through the [r1+0x5B0] early-exit (lwz r9,0x5b0(r1);
-            // mtlr r9; blr) -- with a mid-rotation r1 that slot holds 0 and
-            // the guest bclr's to PC=0 (GUEST STOP).
+            // Verified behaviour of the DEC path into the idle sell (150 s run,
+            // no GUEST STOP, no NKPANIC):
             //
-            // The DEC handler 0x40B13200 (the real NK scheduler) is the thing
-            // that must get through to preempt the idle sell and dispatch the
-            // ready console task. It only needs the interrupted r1 to be a
-            // non-zero pointer so that [r1-0xB50] (MAC lock), [r1+0x5A0] and
-            // [r1+0xE8C] (tick counter) land in low RAM. r1==0 is fatal: it
-            // wraps [r1-0xB50] to 0xFFFFF4B0 (a high-RAM ROM/MMIO location
-            // that reads as an owned lock and spins forever at the MAC-lock
-            // acquire 0x40B12700). So for DEC, defer only while r1==0; once
-            // the rotation has shuffled a real low-RAM pointer (the freshly
-            // allocated task/ECX blocks 0x76E0..0x7FC0) into r1, deliver.
+            // 1. The DEC handler 0x40B13200 (the real NK scheduler) must get
+            //    through to preempt the idle sell. It only needs the interrupted
+            //    r1 to be a non-zero pointer so [r1-0xB50] (MAC lock),
+            //    [r1+0x5A0] and [r1+0xE8C] (tick counter) land in low RAM;
+            //    r1==0 is fatal, because [r1-0xB50] wraps to 0xFFFFF4B0 (high
+            //    RAM, reads as an owned lock) and the guest spins forever at the
+            //    MAC-lock acquire 0x40B12700.
+            // 2. The NK idle-sell restore at 0x40B24518..0x40B24524
+            //    (lwz r0,0x104(r6); lwz r6,0x18(r1); lwz r1,4(r1); rfi) reloads
+            //    r1 from [r1+4] of the idle context, which is 0, so the DEC
+            //    arrives with r1=0. IDLESP below substitutes 0x9000.
+            // 3. The NK's idle-class dispatch table at 0x12E88 (seeded at DR
+            //    bootstrap, see IDLECLASS) must be populated: unseeded it
+            //    blr's to PC=0 and trips the 68K A-trap guard word. With the
+            //    seed, the scheduler tail loads 0x40B24F04 and blr's there.
+            // 4. The guest re-arms DEC=0x7FFFFFFF itself at idle give-up
+            //    (DECWRITE PC=0x40B230DC), so nothing here fabricates timers.
             //
-            // The guest keeps a second copy of the sell-return glue in low RAM
-            // at ~0xBE00 (LR=0xBDFC, `rfi @0x0000BE00 -> PC=0x40B24FDC`). The
-            // idle sell is entered there mid-rotation with r1 already a rotated
-            // block pointer (0x77E0), and delivering DEC/EXT at that PC hands
-            // the scheduler a bogus current-task frame: it zeroes [KDP-0x14]
-            // (ECBPCWATCH @0x40B24640) and calls TermEntry, whose debugger 'g'
-            // then reads its resume target from [r1+0x904] with the rotated r1
-            // -> [0x80E4]==0 -> mtlr 0 -> blr to PC=0 (GUEST STOP). So defer
-            // only the DECEPTION DEC while the interrupted PC is either the ROM
-            // glue window or the low-RAM sell trampoline; the guest re-arms
-            // DEC=0x7FFFFFFF itself at idle give-up (DECWRITE PC=0x40B230DC).
-            // SCC EXT must NOT be deferred here: it is the legitimate wake that
+            // SCC EXT must NOT be deferred: it is the legitimate wake that
             // dispatches the ready console task out of the idle sell (the guest
             // polls nothing else once all tasks have sold), so a deferred EXT
             // stalls boot forever in the sell glue.
             {
-                UINT64 InSellPhase =
-                    (Current >= 0x40B24F04u && Current <= 0x40B25080u) ||
-                    (Next    >= 0x40B24F04u && Next    <= 0x40B25080u) ||
+                // Only the interpreter's own low-RAM soft-function stub
+                // (0xBD80..0xBE80) must never be preempted: a DEC taken in
+                // the middle of the 0xBDFC stub would resume on a stub
+                // instruction boundary with no valid resume state.
+                //
+                // The ROM idle/debug loop at 0x40B24F04..0x40B25000 is the
+                // NK's real idle task entry: it rotates r1/r2/r5..r30, calls
+                // `sc 0x2E` (li r3,0xC; li r4,1) and spins while the stub
+                // reports "no wake event". Dropping DEC there was an
+                // unconditional deadlock: the wake mask can only be nonzero
+                // while ExceptionPending holds DEC, and the drop clears it
+                // first, so r3 stayed 0 and the guest never left the loop.
+                UINT64 InStubPhase =
                     (Current >= 0x0000BD80u && Current <= 0x0000BE80u) ||
                     (Next    >= 0x0000BD80u && Next    <= 0x0000BE80u);
-                if (InSellPhase != 0 &&
+                if (InStubPhase != 0 &&
                     Pending == PPC_EXCEPTION_DECREMENTER) {
                     g_PpcContext.ExceptionPending = 0;
                     g_PpcContext.Pc = Next;
                     continue;
+                }
+                if (Pending == PPC_EXCEPTION_DECREMENTER &&
+                    ((Current >= 0x40B24F04u && Current <= 0x40B25080u) ||
+                     (Next    >= 0x40B24F04u && Next    <= 0x40B25080u))) {
+                    static UINT32 IdleDecProbe = 0;
+                    if (IdleDecProbe < 6) {
+                        IdleDecProbe++;
+                        Print(L"  IDLEDEC[%u] @0x%08x->0x%08x r1=0x%08x "
+                              L"r31=0x%08x DEC=0x%08x\n",
+                              (UINT32)IdleDecProbe, Current, Next,
+                              g_PpcContext.Gpr[1], g_PpcContext.Gpr[31],
+                              g_PpcContext.Spr[SPR_DEC]);
+                    }
                 }
             }
             if (Pending == PPC_EXCEPTION_DECREMENTER && g_BootDecGate) {
