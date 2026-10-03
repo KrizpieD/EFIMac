@@ -427,7 +427,6 @@ PpcKdProfileDump (
     g_KdProfileEnabled = FALSE;
 }
 static BOOLEAN g_SccRxPending = FALSE;
-static UINTN SccWindowReads = 0;
 static UINT8 g_SccRxFifo[64];
 static UINTN g_SccRxFifoHead = 0;
 static UINTN g_SccRxFifoTail = 0;
@@ -437,7 +436,6 @@ static UINTN g_SccRxFifoTail = 0;
 #define PPC_INT_CTRL_BASE  0xF3000000u
 #define PPC_INT_CTRL_END   0xF3000060u
 static UINTN IntDevLogs = 0;
-static UINTN IntDevWriteLogs = 0;
 static UINTN SccDataReads = 0;
 static UINTN SccStatusReads = 0;
 static UINT32 PpcIntCtrlReadReg (UINT32 Off);   // defined below the MMIO tail
@@ -480,10 +478,6 @@ PpcDefaultReadByte (
     if (Address == 0x00020002 || Address == 0x00020004 ||
         Address == 0x00020000) {
         UINT8 R = 0x04 | (g_SccRxPending ? 0x01 : 0x00);
-        if ((SccStatusReads % 500000) == 0 || SccStatusReads < 10) {
-            Print(L"  [SCC] status@0x20002 -> 0x%02x (pending=%d head=%d tail=%d)\n",
-                  R, g_SccRxPending, g_SccRxFifoHead, g_SccRxFifoTail);
-        }
         SccStatusReads++;
         return R;
     }
@@ -501,18 +495,9 @@ PpcDefaultReadByte (
             UINT8 C = g_SccRxFifo[g_SccRxFifoTail];
             g_SccRxFifoTail = (g_SccRxFifoTail + 1) % sizeof(g_SccRxFifo);
             g_SccRxPending = (g_SccRxFifoHead != g_SccRxFifoTail);
-            if (SccDataReads < 256) {
-                SccDataReads++;
-                Print(L"  [SCC] data@0x%04x -> 0x%02x (head=%d tail=%d LR=0x%08x PC=0x%08x)\n",
-                      Address, C, g_SccRxFifoHead, g_SccRxFifoTail, g_PpcContext.Lr, g_PpcContext.Pc);
-            }
             return C;
         }
         g_SccRxPending = FALSE;
-        if (SccDataReads < 256) {
-            SccDataReads++;
-            Print(L"  [SCC] data@0x%04x -> EMPTY\n", Address);
-        }
         return 0;
     }
     for (I = 0; I < PPC_MAX_GUEST_REGIONS; I++) {
@@ -528,10 +513,6 @@ PpcDefaultReadByte (
         // SCCREADCAP: what does the DR actually READ around the SCC base?
         // GetChar returns -1 without ever touching our 0x20002/0x20006, so
         // capture every byte read in the SCC window with its PC (cap 200).
-        if (SccWindowReads < 200) {
-            Print(L"  SCCRH[%u] addr=0x%05x PC=0x%08x\n",
-                  SccWindowReads++, Address, g_PpcContext.Pc);
-        }
         return 0;
     }
     // -------------------------------------------------------------------
@@ -609,11 +590,6 @@ PpcDefaultWriteByte (
     // Interrupt controller window: absorb writes (events are level-derived
     // from the SCC FIFO, so CLEAR/ack writes need no storage).
     if (Address >= PPC_INT_CTRL_BASE && Address < PPC_INT_CTRL_END) {
-        if (IntDevWriteLogs < 80) {
-            IntDevWriteLogs++;
-            Print(L"  INTDEV-W +0x%02x <- 0x%02x PC=0x%08x\n",
-                  Address - PPC_INT_CTRL_BASE, Value, g_PpcContext.Pc);
-        }
         return;
     }
 }
@@ -744,60 +720,6 @@ PpcMmuReadByte (
 // Tentative definition; the real initialised definition appears further down.
 // (C allows a tentative definition followed by an initialised one.)
 static PPC_CPU_READ_MEMORY g_ReadByte;
-// The dispatch selector that becomes r7's top byte (the status code) is read by
-// `lwz r8,1608(r1)` at 0x40B14704, i.e. slot 0xA648 when r1 is the boot-proc
-// frame base 0x0000A000. Earlier DISPW hits came only from pre-loop boot code,
-// and CpuWrite16/stb never reached that watch, so it could not be trusted to
-// prove absence. This hooks the single byte-level funnel every guest store
-// passes through (all widths, all addressing modes), and stays disarmed until
-// the teardown loop at 0x40B12F78 is actually entered, so only the write that
-// sets the bad value DURING the loop is caught.
-static UINTN   g_DispSlotArmed = 0;
-static UINT32  g_DispSlotAddr  = 0;
-static UINTN   g_DispSlotHits  = 0;
-static UINT8   g_DispSlotPart[8];   // bytes written so far, to reassemble words
-static UINTN   g_DispSlotPartN = 0;
-VOID
-PpcDispSlotArm (VOID)
-{
-    g_DispSlotArmed = 1;
-    g_DispSlotHits  = 0;
-    g_DispSlotPartN = 0;
-}
-static VOID
-PpcDispSlotWrite (UINT32 Ea, UINT8 Value)
-{
-    UINT32 Slot;
-    UINTN  I;
-    if (!g_DispSlotArmed || g_DispSlotAddr == 0) {
-        return;
-    }
-    // Only the 4 bytes of the slot itself (any single-byte write into it).
-    if (Ea < g_DispSlotAddr || Ea >= g_DispSlotAddr + 4) {
-        return;
-    }
-    if (g_DispSlotHits >= 24) {
-        return;
-    }
-    Slot = ((UINT32)g_ReadByte(g_DispSlotAddr) << 24) |
-           ((UINT32)g_ReadByte(g_DispSlotAddr + 1) << 16) |
-           ((UINT32)g_ReadByte(g_DispSlotAddr + 2) << 8) |
-            (UINT32)g_ReadByte(g_DispSlotAddr + 3);
-    g_DispSlotPart[0] = (UINT8)(Slot >> 24);
-    g_DispSlotPart[1] = (UINT8)(Slot >> 16);
-    g_DispSlotPart[2] = (UINT8)(Slot >> 8);
-    g_DispSlotPart[3] = (UINT8)Slot;
-    I = Ea - g_DispSlotAddr;
-    g_DispSlotPart[I] = Value;
-    g_DispSlotHits++;
-    Print(L"  DISPSLOT byte[%u]@%08x <- %02x => slot=%08x @PC=0x%08x"
-          L" r1=%08x r3=%08x r4=%08x r5=%08x LR=0x%08x\n",
-          (UINTN)I, Ea, Value,
-          ((UINT32)g_DispSlotPart[0] << 24) | ((UINT32)g_DispSlotPart[1] << 16) |
-          ((UINT32)g_DispSlotPart[2] << 8) | g_DispSlotPart[3],
-          g_PpcContext.Pc, g_PpcContext.Gpr[1], g_PpcContext.Gpr[3],
-          g_PpcContext.Gpr[4], g_PpcContext.Gpr[5], g_PpcContext.Lr);
-}
 static VOID
 PpcMmuWriteByte (
     IN UINT32 Ea,
@@ -805,7 +727,6 @@ PpcMmuWriteByte (
     )
 {
     UINT32 Pa;
-    PpcDispSlotWrite(Ea, Value);
     if ((g_PpcContext.Msr & PPC_MSR_DR) != 0 &&
         PpcTranslateEffective(Ea, FALSE, &Pa)) {
         PpcDefaultWriteByte(Pa, Value);
@@ -894,14 +815,6 @@ LowRamCensus (
         g_LowPageFirstAddr[Pg] = A;
     }
     // Detailed log for the page that actually holds the dispatch table.
-    if (A >= 0x00012000u && A < 0x00013000u) {
-        static UINTN Detail = 0;
-        if (Detail < 40) {
-            Detail++;
-            Print(L"  LOWWRITE [0x%08x] <- 0x%08x (old 0x%08x) @PC=0x%08x\n",
-                  A, V, CpuRead32(A), Pc);
-        }
-    }
 }
 EFI_STATUS
 PpcSetMemoryAccess (
@@ -1062,7 +975,6 @@ PpcCopyGuestMemory (
 }
 static UINT32 CpuRead16 (UINT32 A) { return ((UINT32)g_ReadByte(A) << 8) | g_ReadByte(A + 1); }
 static UINT32 CpuRead32 (UINT32 A) { return (CpuRead16(A) << 16) | CpuRead16(A + 2); }
-static UINT32 CpuRead8  (UINT32 A) { return (CpuRead16(A) >> 8) & 0xFF; }
 static VOID   CpuWrite16(UINT32 A, UINT32 V) { g_WriteByte(A, (UINT8)(V >> 8)); g_WriteByte(A + 1, (UINT8)V); }
 // ---- PPC-side DR bootstrap (pure PPC; no C-68K) ----
 // On real hardware the guest's 68K BootROM runs first (via the ROM's own PPC
@@ -1095,7 +1007,6 @@ static UINT32 g_DrYieldSeen = 0;
 // Limited ICD dispatch SRR1 origin probe (rfi at 0x40B14A04).
 static UINT32 g_DrRfiIcdDump = 0;
 // One-shot probe of the level-9 ISR's SRR1 source slot [r1-0x964] at 0x40B1499C.
-static UINT32 g_IcdSrr1Probe = 0;
 // Forced-resume counter for the fabricated dispatch rfi's SRR1 (see rfi site).
 static UINT32 g_IcdSrr1Forced = 0;
 // Single-use window tracer: while non-zero, after the DRYIELD-RESUME it prints
@@ -1142,7 +1053,6 @@ static UINT32 g_PollFixed  = 0;       // one-shot: diag poll completion applied
 static UINT32 g_LrWriterProbed = 0;   // one-shot: LR writer of a 0x3C.. handler
 static UINT32 g_HubProbed     = 0;    // one-shot: DR bclrl hub 0x40B6D12C
 static UINT32 g_DrHub2Probed  = 0;    // one-shot: DR hub lwz 0x40B6D114
-static UINT32 g_DrSkipLog     = 0;    // capped log of dead-handler dispatch skips
 static UINT32 g_BigPcProbed   = 0;    // one-shot: 68K pc reaches the 0x81.. hi-space
 static UINT32 g_PcWatchLog    = 0;    // capped per-dispatch log in the 0x81.. zone
 static UINT32 g_ForkResumePc = 0;     // 68K PC (@fork freeze) the DR must resume from
@@ -1160,33 +1070,10 @@ static VOID   TaskStoreWatch(UINT32 A, UINT32 V, UINTN Bytes)
     // byte (the status code). r8 there is only ever 2 or 8; the loop wants 12/20.
     // r1 is the boot-proc frame base (0x0000A000), so the slot is 0xA648. Watch
     // its writer, whichever addressing mode it uses.
-    if (A + Bytes > 0x0000A640u && A < 0x0000A660u) {
-        static UINTN DispW = 0;
-        if (DispW < 40) {
-            DispW++;
-            Print(L"  DISPW [%08x] <- 0x%08x (%uB) old=0x%08x @PC=0x%08x"
-                  L" r1=%08x r3=%08x r4=%08x r5=%08x\n",
-                  A, V, (UINTN)Bytes, CpuRead32(A), g_PpcContext.Pc,
-                  g_PpcContext.Gpr[1], g_PpcContext.Gpr[3],
-                  g_PpcContext.Gpr[4], g_PpcContext.Gpr[5]);
-        }
-    }
     // The boot-proc resume path 0x40B12F80 -> 0x40B23E4C asserts
     // `if (*(UINT8*)(task+0x18) == 0) NKPANIC`, with task=0x7B40 (the "TASK"
     // record holding 0x95BC pointers). Watch every store into that record so
     // the initializer (or the missing write) is visible.
-    if (A + Bytes > 0x00007B40u && A < 0x00007B60u) {
-        static UINTN TaskW = 0;
-        if (TaskW < 80) {
-            TaskW++;
-            Print(L"  TASKW [%08x] <- 0x%08x (%uB) old=0x%08x @PC=0x%08x "
-                  L"r1=%08x r6=%08x r16=%08x r28=%08x r31=%08x\n",
-                  A, V, (UINTN)Bytes, CpuRead32(A), g_PpcContext.Pc,
-                  g_PpcContext.Gpr[1], g_PpcContext.Gpr[6],
-                  g_PpcContext.Gpr[16], g_PpcContext.Gpr[28],
-                  g_PpcContext.Gpr[31]);
-        }
-    }
 }
 static VOID   CpuWrite32(UINT32 A, UINT32 V)
 {
@@ -1197,34 +1084,12 @@ static VOID   CpuWrite32(UINT32 A, UINT32 V)
     // 0x40B10000-0x40F10000, i.e. no ROM code appears to write it. Watching the
     // store path directly finds the writer regardless of addressing mode, and
     // proves absence if nothing ever writes.
-    if (A >= 0x00012E88u && A < 0x00012F88u) {
-        static UINTN DispTabWrites = 0;
-        if (DispTabWrites < 60) {
-            DispTabWrites++;
-            Print(L"  DISPTABW [%08x] <- 0x%08x (old 0x%08x) @PC=0x%08x "
-                  L"r3=%08x r4=%08x r5=%08x r6=%08x r10=%08x r11=%08x\n",
-                  A, V, CpuRead32(A), g_PpcContext.Pc, g_PpcContext.Gpr[3],
-                  g_PpcContext.Gpr[4], g_PpcContext.Gpr[5], g_PpcContext.Gpr[6],
-                  g_PpcContext.Gpr[10], g_PpcContext.Gpr[11]);
-        }
-    }
     // Watch every guest store into the NK code region. The NK relocates and
     // patches itself (see the 0x40B1AEF4 site), so if the self-patch step runs
     // at all it must show up as stores into 0x40B10000-0x40B4FFFF. Zero hits
     // would prove the patch step never executes in this build, leaving stale
     // constants such as the `lis r20,1`/`ori r20,0x2E88` table base at
     // 0x40B22FA0/0x40B22FA4.
-    if (A >= 0x40B10000u && A < 0x40B50000u) {
-        static UINTN RomW = 0;
-        if (RomW < 40) {
-            RomW++;
-            Print(L"  ROMSELFW [0x%08x] <- 0x%08x (old 0x%08x) @PC=0x%08x "
-                  L"r3=%08x r4=%08x r5=%08x r6=%08x r10=%08x r11=%08x\n",
-                  A, V, CpuRead32(A), g_PpcContext.Pc, g_PpcContext.Gpr[3],
-                  g_PpcContext.Gpr[4], g_PpcContext.Gpr[5], g_PpcContext.Gpr[6],
-                  g_PpcContext.Gpr[10], g_PpcContext.Gpr[11]);
-        }
-    }
     LowRamCensus(A, V, g_PpcContext.Pc);
     // Watch the MakeReady sentinel and the queue head it owns. MakeReady at
     // 0x40B22D44 builds a sentinel ECB at r1-0xA84 whose +0x08 slot IS the
@@ -1234,30 +1099,11 @@ static VOID   CpuWrite32(UINT32 A, UINT32 V)
     // candidate head/sentinel pairs (0x9F7C/0x9F84) and (0x6D64/0x6D5C).
     if ((A >= 0x00006D50u && A < 0x00006D80u) ||
         (A >= 0x00009F70u && A < 0x00009FA0u)) {
-        static UINTN SentW = 0;
-        if (SentW < 30) {
-            SentW++;
-            Print(L"  SENTINELW [0x%08x] <- 0x%08x (old 0x%08x) @PC=0x%08x "
-                  L"r1=%08x r6=%08x r30=%08x\n",
-                  A, V, CpuRead32(A), g_PpcContext.Pc, g_PpcContext.Gpr[1],
-                  g_PpcContext.Gpr[6], g_PpcContext.Gpr[30]);
-        }
     }
     // Watch the DR task's priority byte (ECB+0x14 == 0xB114). The scheduler
     // branches `cmplwi prio,9 / bgel 0x40B22D40`, so a priority >= 9 avoids the
     // never-populated 0x12E88 table entirely. The DR task reads 0, so finding
     // who is supposed to set this byte identifies the real missing step.
-    if (A == 0x0000B114u) {
-        static UINTN PrioW = 0;
-        if (PrioW < 30) {
-            PrioW++;
-            Print(L"  PRIOW [B114=ECB+0x14] <- 0x%08x (old 0x%08x) @PC=0x%08x "
-                  L"r3=%08x r4=%08x r5=%08x r6=%08x r10=%08x\n",
-                  V, CpuRead32(A), g_PpcContext.Pc, g_PpcContext.Gpr[3],
-                  g_PpcContext.Gpr[4], g_PpcContext.Gpr[5], g_PpcContext.Gpr[6],
-                  g_PpcContext.Gpr[10]);
-        }
-    }
     // Watch the ECB 68K PC slot (ECB+0x1C4 = 0xB2C4, restored to r24 by
     // ECBTOTASK) and the [KDP-0x14] ECB pointer (0x9FEC).
     if (A == 0x0000B2C4u || A == 0x00009FECu) {
@@ -1272,47 +1118,10 @@ static VOID   CpuWrite32(UINT32 A, UINT32 V)
                   L"r24=%08x\n",
                   g_PpcContext.Pc, g_PpcContext.Gpr[24]);
         }
-        static UINTN EcbPcWatchHits = 0;
-        if (EcbPcWatchHits < 40) {
-            EcbPcWatchHits++;
-            Print(L"  ECBPCWATCH [%08x] <- 0x%08x (old 0x%08x) @PC=0x%08x "
-                  L"r1=%08x r6=%08x r24=%08x\n",
-                  A, V, CpuRead32(A), g_PpcContext.Pc, g_PpcContext.Gpr[1],
-                  g_PpcContext.Gpr[6], g_PpcContext.Gpr[24]);
-        }
         // DR-task sausage dump: when the 68K DR context save stores the 68K PC
         // into ECB+0x1C4 with r6==0xB100 (the DR task ECB), capture the ECB
         // readiness/deadline/links the scheduler will evaluate next, plus the
         // scheduler's current-task slots and the time base for comparison.
-        if (A == 0x0000B2C4u && g_PpcContext.Gpr[6] == 0x0000B100u) {
-            static UINTN DrEcbDumps = 0;
-            if (DrEcbDumps < 6) {
-                UINT32 E6 = g_PpcContext.Gpr[6];
-                UINT32 R1 = g_PpcContext.Gpr[1];
-                DrEcbDumps++;
-                Print(L"  DRECB[%u] @PC=0x%08x TBL=0x%08x%08x DEC=0x%08x "
-                      L"r1=0x%08x LR=0x%08x\n",
-                      (UINT32)DrEcbDumps, g_PpcContext.Pc,
-                      g_PpcContext.TimeBaseH, g_PpcContext.TimeBaseL,
-                      g_PpcContext.Spr[SPR_DEC], R1, g_PpcContext.Lr);
-                Print(L"  DRECB   links[+8/+C]=0x%08x:0x%08x prio[+14]=0x%02x "
-                      L"st[+16/+17]=0x%02x:0x%02x dead[+38/+3C]=0x%08x:0x%08x\n",
-                      CpuRead32(E6 + 0x08), CpuRead32(E6 + 0x0C),
-                      PpcReadGuestByte(E6 + 0x14), PpcReadGuestByte(E6 + 0x16),
-                      PpcReadGuestByte(E6 + 0x17),
-                      CpuRead32(E6 + 0x38), CpuRead32(E6 + 0x3C));
-                Print(L"  DRECB   wake[+30/+34]=0x%08x:0x%08x tt[+18]=0x%02x "
-                      L"prio2[+1C]=0x%08x 68Kpc[+1C4]=0x%08x\n",
-                      CpuRead32(E6 + 0x30), CpuRead32(E6 + 0x34),
-                      PpcReadGuestByte(E6 + 0x18), CpuRead32(E6 + 0x1C),
-                      CpuRead32(E6 + 0x1C4));
-                Print(L"  DRECB   curTask[KDP-254]=0x%08x oscur[0x9FEC]=0x%08x "
-                      L"[KDP+65C]=0x%08x prv[KDP-2E8]=0x%08x:0x%08x\n",
-                      CpuRead32(0x00009DACu), CpuRead32(0x00009FECu),
-                      CpuRead32(0x0000A65Cu), CpuRead32(0x00009D18u),
-                      CpuRead32(0x00009D1Cu));
-            }
-        }
     }
     // Continuation-value watch (PPC side): stores of addresses inside the
     // NK trampoline region — the 68K stack gets its bogus RTS target from
@@ -1329,28 +1138,10 @@ static VOID   CpuWrite32(UINT32 A, UINT32 V)
     // ed.v software-function-slot write watch: catch ANY guest code seeding
     // 0xB800..0x8FF (the DR's software-function pointers), so we can locate
     // the ROM's DR-init that fills them (the B.21 faithful-seeding step).
-    if (A >= 0x0000B800u && A <= 0x0000B8FFu) {
-        static UINTN EdvSeedHits = 0;
-        if (EdvSeedHits < 16) {
-            EdvSeedHits++;
-            Print(L"EDV-SEED [%08x]<-%08x @PC=0x%08x r1=%08x r31=%08x\n",
-                  A, V, g_PpcContext.Pc, g_PpcContext.Gpr[1], g_PpcContext.Gpr[31]);
-        }
-    }
     // 0xACB8 syscall-dispatch table write watch: the NK's software-function
     // dispatch at 0x40B1AED0 reads its target from here (or the KDP PMDT
     // neighbourhood), and no seeder has been observed in any run so far.
     // Catch ANY write so we can identify the ROM routine that populates it.
-    if (A >= 0x0000ACB0u && A <= 0x0000AD8Fu) {
-        static UINTN Acb8WatchHits = 0;
-        if (Acb8WatchHits < 32) {
-            Acb8WatchHits++;
-            Print(L"ACB8WATCH [%08x]<-%08x (old %08x) @PC=0x%08x r1=%08x "
-                  L"r14=%08x r15=%08x r16=%08x\n",
-                  A, V, CpuRead32(A), g_PpcContext.Pc, g_PpcContext.Gpr[1],
-                  g_PpcContext.Gpr[14], g_PpcContext.Gpr[15], g_PpcContext.Gpr[16]);
-        }
-    }
     // NanoKernel guard-fill (poison) stores: the emulated handoff marks the
     // low pages holding the live 68K vector table, KDP, emulator-data area,
     // PSA and 68K stack as free pool, so the guest allocator scrubs them
@@ -1358,13 +1149,6 @@ static VOID   CpuWrite32(UINT32 A, UINT32 V)
     // words below 64K preserves the guest's own data; freed-block bodies
     // keep stale bytes, which the allocator treats as scratch anyway.
     if ((V == 0x68F168F1u || V == 0xD1E2D1E2u) && A < 0x10000u) {
-        static UINTN PpcSprayHits = 0;
-        if (PpcSprayHits < 16) {
-            PpcSprayHits++;
-            Print(L"PPC SPRAYWATCH val=0x%08x -> 0x%08x @PC=0x%08x r10=0x%08x r15=0x%08x\n",
-                  V, A, g_PpcContext.Pc,
-                  g_PpcContext.Gpr[10], g_PpcContext.Gpr[15]);
-        }
         return;
     }
     // Watch writes into the KDP PMDT pointer array (KDP+0x78..KDP+0xFF8).
@@ -1386,39 +1170,11 @@ static VOID   CpuWrite32(UINT32 A, UINT32 V)
     // INTCTLSKIP probe found the guest seeds its OWN low-RAM block address
     // (0x81C0, allocator-returned) into this slot, defeating PpcIntCtrlInstall.
     // Find every writer to learn who brands the slot and what the block holds.
-    if (A == 0x00009CC8u) {
-        static UINTN SlotW = 0;
-        if (SlotW < 30) {
-            SlotW++;
-            Print(L"  KDP338W [%08x] <- %08x (old %08x) @PC=0x%08x "
-                  L"r1=%08x r3=%08x r4=%08x r5=%08x r6=%08x r7=%08x r14=%08x r15=%08x r16=%08x\n",
-                  A, V, CpuRead32(A), g_PpcContext.Pc, g_PpcContext.Gpr[1],
-                  g_PpcContext.Gpr[3], g_PpcContext.Gpr[4], g_PpcContext.Gpr[5],
-                  g_PpcContext.Gpr[6], g_PpcContext.Gpr[7],
-                  g_PpcContext.Gpr[14], g_PpcContext.Gpr[15], g_PpcContext.Gpr[16]);
-            if (V == 0x000081C0u) {
-                Print(L"  KDP338B base=0x81C0: +20=%08x +24=%08x +28=%08x +2C=%08x "
-                      L"+38=%08x +3C=%08x +40=%08x +44=%08x +4C=%08x\n",
-                      CpuRead32(0x81E0), CpuRead32(0x81E4), CpuRead32(0x81E8),
-                      CpuRead32(0x81EC), CpuRead32(0x81F8), CpuRead32(0x81FC),
-                      CpuRead32(0x8200), CpuRead32(0x8204), CpuRead32(0x820C));
-            }
-        }
-    }
     // Watch writes into the NK IC descriptor block in low RAM (0x81C0..0x8220)
     // to see whether the guest ever populates the level-9 dispatch tables
     // (+0x3C/+0x40), priority bound (+0x44) or nesting bound (+0x4C) that the
     // level-9 SCC ISR at 0x40B148E0 reads. All-zero implies the guest expects
     // the emulator (as the device side) to keep these current, not the NK.
-    if (A >= 0x000081C0u && A <= 0x00008220u) {
-        static UINTN IcBlkW = 0;
-        if (IcBlkW < 40) {
-            IcBlkW++;
-            Print(L"  ICBLKW [%08x] <- %08x @PC=0x%08x r1=%08x r8=%08x r9=%08x\n",
-                  A, V, g_PpcContext.Pc, g_PpcContext.Gpr[1],
-                  g_PpcContext.Gpr[8], g_PpcContext.Gpr[9]);
-        }
-    }
     CpuWrite16(A, V >> 16);
     CpuWrite16(A + 2, V);
 }
@@ -1513,13 +1269,6 @@ PpcIntCtrlInstall (
                   PPC_INT_CTRL_BASE, g_PpcContext.Pc);
         }
     } else {
-        static UINT32 IntCtlMissLogs = 0;
-        if (IntCtlMissLogs < 4 && g_PpcContext.Pc != 0) {
-            IntCtlMissLogs++;
-            Print(L"  INTCTLSKIP Kdp=0x%08x slot=0x%08x PC=0x%08x\n",
-                  Kdp, CpuRead32(Kdp < 0x9000u ? 0u : Kdp - 0x338),
-                  g_PpcContext.Pc);
-        }
     }
 }
 // ---------------------------------------------------------------------------
@@ -1721,14 +1470,6 @@ static VOID CpuWrite32Rev (UINT32 A, UINT32 V)
 {
     // Same NK dispatch-table watch as CpuWrite32: byte-reversed stores are a
     // distinct code path and would otherwise slip past that watchpoint.
-    if (A >= 0x00012E88u && A < 0x00012F88u) {
-        static UINTN DispTabWRev = 0;
-        if (DispTabWRev < 40) {
-            DispTabWRev++;
-            Print(L"  DISPTABWR [%08x] <- 0x%08x (old 0x%08x) @PC=0x%08x\n",
-                  A, V, CpuRead32(A), g_PpcContext.Pc);
-        }
-    }
     LowRamCensus(A, V, g_PpcContext.Pc);
     g_WriteByte(A, (UINT8)V); g_WriteByte(A + 1, (UINT8)(V >> 8));
     g_WriteByte(A + 2, (UINT8)(V >> 16)); g_WriteByte(A + 3, (UINT8)(V >> 24));
@@ -1741,7 +1482,6 @@ static VOID CpuWrite16Rev (UINT32 A, UINT32 V)
 // Condition Register / XER helpers
 // ---------------------------------------------------------------------------
 static UINT32 EeMtmsrProbed = 0;
-static UINT32 EeRfiProbed = 0;
 VOID
 PpcSetCrField (
     IN UINT32 Field,
@@ -3771,11 +3511,6 @@ PpcExecuteInstruction (
         (w & 0xFFFF0000u) == PPC_EMUL_OP_MARKER) {
         UINT32 N = w & 0xFFFFu;
         if (N >= 3) {
-            static UINT32 EmulOpFirstFired = 0;
-            if (EmulOpFirstFired == 0) {
-                Print(L"EMULOP marker n=%u sel=%u @PC=%08x\n", N, N - 3, CurrentAddress);
-                EmulOpFirstFired = 1;
-            }
             EmulOpDispatch(N - 3);
         }
         // Markers 0..2 (EMUL_RETURN/EXEC_RETURN/EXEC_NATIVE) are control
@@ -3905,16 +3640,6 @@ PpcExecuteInstruction (
                 // and nothing maps that window, so complete the call to its
                 // own return slot (branch-on-CR recovery at 0x40B6D130).
                 if (DrDead) {
-                    if (g_DrSkipLog < 6) {
-                        g_DrSkipLog++;
-                        Print(L"  DRSKIP[%u] PC=0x%08x handler=0x%08x -> ret "
-                              L"0x40B6D130 r5=0x%08x r31=0x%08x "
-                              L"r24(68Kpc)=0x%08x\n",
-                              g_DrSkipLog, CurrentAddress, Target,
-                              g_PpcContext.Gpr[5] & 0xFFFFFFFF,
-                              g_PpcContext.Gpr[31] & 0xFFFFFFFF,
-                              g_PpcContext.Gpr[24] & 0xFFFFFFFF);
-                    }
                     Target = CurrentAddress + 4;
                 }
                 if (LK(w)) {
@@ -4140,12 +3865,6 @@ g_DrA207Land = 0;
             }
             g_PpcContext.Msr = g_PpcContext.Srr1;
             Next = g_PpcContext.Srr0;
-            if ((g_PpcContext.Msr & PPC_MSR_EE) && EeRfiProbed < 6) {
-                EeRfiProbed++;
-                Print(L"  EE-RFI @0x%08x -> PC=0x%08x MSR=0x%08x DEC=0x%08x NEG=%u\n",
-                      CurrentAddress, Next, g_PpcContext.Msr,
-                      g_PpcContext.Spr[22], g_PpcContext.DecrementerNegative);
-            }
             if ((g_PpcContext.Msr & PPC_MSR_EE) && g_PpcContext.DecrementerNegative &&
                 g_PpcContext.DecrementerWritten &&
                 g_PpcContext.ExceptionPending == 0) {
@@ -4157,28 +3876,6 @@ g_DrA207Land = 0;
         case XO19_BCCTR:  // bctr / bctrl / bcctr / bcctrl
             {
                 UINT32 Target = g_PpcContext.Ctr;
-                if (PpcBranchTaken(BO(w), BI(w)) && Target < 0x10000u) {
-                    // 68K emulator dispatch tables live at ED-relative offsets
-                    // (r31 = EmulatorData). A near-zero CTR here means the
-                    // opcode's handler slot was never initialized.
-                    static UINTN BcctrZeroHits = 0;
-                    UINT32 Ed = g_PpcContext.Gpr[31];
-                    if (BcctrZeroHits < 4) {
-                        BcctrZeroHits++;
-                        Print(L"  BCCTRWILD PC=0x%08x CTR=0x%08x r24(68Kpc)=0x%08x "
-                              L"r3=%08x r4=%08x r25=%08x r27=%08x r28=%08x r29=%08x r31=%08x\n",
-                              CurrentAddress, Target, g_PpcContext.Gpr[24],
-                              g_PpcContext.Gpr[3], g_PpcContext.Gpr[4],
-                              g_PpcContext.Gpr[25], g_PpcContext.Gpr[27],
-                              g_PpcContext.Gpr[28], g_PpcContext.Gpr[29], Ed);
-                        Print(L"  BCCTRWILD [ED+808]=%08x [80C]=%08x [810]=%08x [814]=%08x "
-                              L"[818]=%08x [81C]=%08x w@68Kpc=%04x\n",
-                              CpuRead32(Ed + 0x808), CpuRead32(Ed + 0x80C),
-                              CpuRead32(Ed + 0x810), CpuRead32(Ed + 0x814),
-                              CpuRead32(Ed + 0x818), CpuRead32(Ed + 0x81C),
-                              (CpuRead16(g_PpcContext.Gpr[24]) << 0));
-                    }
-                }
                 if (LK(w)) {
                     g_PpcContext.Lr = CurrentAddress + 4;
                 }
@@ -4312,13 +4009,6 @@ g_DrA207Land = 0;
             // hook below, so NK boot output becomes visible on the host
             // console exactly as it would on a real SCC.
             if (CurrentAddress == 0x40B26500u) {
-                static UINTN SccPollHooks = 0;
-                SccPollHooks++;
-                if (SccPollHooks < 4 || (SccPollHooks & 0xFFFFF) == 1) {
-                    Print(L"  [SCC] poll-hook @0x40B26500 r28=0x%08x "
-                          L"(#%d) -> Tx-ready\n",
-                          g_PpcContext.Gpr[RA(w)], (UINT32)SccPollHooks);
-                }
                 g_PpcContext.Gpr[RT(w)] = 0x04;
             } else {
                 PpcKdProfileLoad(Ea, CurrentAddress);
@@ -5065,7 +4755,6 @@ g_DrA207Land = 0;
                 break;
             case XO_MTSPR:  // mtspr
                 {
-                    static UINT32 DecWriteLog = 0;
                     UINT32 SprNum = SPR(w);
                     UINT32 Value = g_PpcContext.Gpr[RS(w)];
                     switch (SprNum) {
@@ -5096,21 +4785,11 @@ g_DrA207Land = 0;
             g_PpcContext.Spr[SPR_DEC] = Value;
             g_PpcContext.DecrementerNegative = (Value & 0x80000000) ? 1 : 0;
             g_PpcContext.DecrementerWritten = 1;
-            if (DecWriteLog < 40) {
-                DecWriteLog++;
-                Print(L"  DECWRITE PC=0x%08x value=0x%08x\n", g_PpcContext.Pc, Value);
-            }
                         break;
                     case SPR_SDR1:
                         {
-                            static UINT32 Sdr1Writes = 0;
                             g_PpcContext.Spr[SPR_SDR1] = Value;
                             g_PpcContext.Sdr1 = Value;
-                            if (Sdr1Writes < 24) {
-                                Sdr1Writes++;
-                                Print(L"  SDR1W PC=0x%08x SDR1=0x%08x\n",
-                                      g_PpcContext.Pc, Value);
-                            }
                         }
                         break;
                     default:
@@ -5373,17 +5052,9 @@ UINTN TbProbe = 0;
     static UINT32 TraceDumped = 0;
     static UINT32 StoreProbed = 0;
     static UINT32 RamProbed = 0;
-    static UINT32 AllocTraced = 0;
-    static UINT32 FlushProbed = 0;
     static UINT32 HelperDumped = 0;
-    static UINT32 SccPollTraced = 0;
-    static UINT32 HelperStep = 0;
-    static UINT32 TermEntries = 0;
     static UINT32 DbgJumpDumps = 0;
-    static UINT32 AreaNewLogs = 0;
-    static UINT32 AreaLookupLogs = 0;
     static UINT32 WalkTabDumps = 0;
-    static UINT32 EmitLogs = 0;
     static UINT32 PcBootProcLockWord = 0;
     static UINT32 AutoResumed = 0;
     static BOOLEAN AutoResumeArmed = TRUE;
@@ -5393,18 +5064,11 @@ static UINT32 DbgBaseProbed = 0;
 static UINT32 ExtDumped = 0;
 static UINT32 GcPathed = 0;
 static UINT32 GoProbed = 0;
-static UINT32 GcBaseFixes = 0;
-static UINT32 IncludelineProbes = 0;
-    static UINT32 AreaSkipProbe = 0;
     static UINT32 PmdWalked = 0;
-    static UINT32 PmdEntry = 0;
     static UINT32 PmdArrDump = 0;
-    static UINT32 MergeTraced = 0;
     static UINT32 PmdFixed = 0;
-    static UINT32 BootTailProbed = 0;
     static UINT32 Dr68KLowProbed = 0;
     static UINT32 Dr68KLast = 0;
-    static UINT32 DrBrProbe = 0;
     static UINT32 DrA025Probe = 0;
     static UINT32 g_DrBrFixed = 0;
     static UINT32 DrBaseDrift = 0;
@@ -5414,11 +5078,9 @@ static UINT32 IncludelineProbes = 0;
     static UINT32 DrHandoffJmpProbed = 0;
     static UINT32 DrOsInjected = 0;
     static UINT32 DrC68kTrapRequest = 0;
-    static UINT32 NativeDrHandoffLogged = 0;
     static UINT32 DrWildTrapProbed = 0;
     static UINT32 DrTrapDecide = 0;
     static UINT32 DrTrapDecideB = 0;
-    static UINT32 NativeDrR28ArmLogged = 0;
     // Post-inject 68K boot-step trace buffer (see the BOOTSTEP recorder below).
     static UINT32 BootStepIdx = 0;
     static UINT32 BootStepDumpDone = 0;
@@ -5442,37 +5104,18 @@ static UINT32 IncludelineProbes = 0;
     // the emulator-start KCall can establish the 68K boot context.
       
   
-static UINT32 BootTaskCtxProbed = 0;
-    static UINT32 RetToTaskProbed = 0;
-    static UINT32 KCallSaveProbed = 0;
-    static UINT32 TailProbed = 0;
-    static UINT32 EmulStartProbed = 0;
     static UINT32 EmulTrapProbed = 0;
     static UINT32 CallTblProbed = 0;
-    static UINT32 ScSiteCount = 0;
     static UINT32 SyscallDispatchProbed = 0;
-    static UINT32 TrapProbed = 0;
-    static UINT32 EcbProbed = 0;
-    static UINT32 SchedProbes = 0;
     static UINT32 SchedBodyProbes = 0;
-    static UINT32 EmulWindowProbed = 0;
-    static UINT32 InjectedEntryProbed = 0;
     static UINT32 WalkProbed = 0;
-    static UINT32 EeRetProbed = 0;
     static UINT32 PutsProbed = 0;
     static UINT32 g_DumpNkDispatch = 0;
-    static UINT32 DrTrapE0 = 0;
-    static UINT32 DrTrap80 = 0;
-    static UINT32 DrTrap00 = 0;
-    static UINT32 DrTrap1C = 0;
     static CHAR16 PutsBuf[512];
     static UINT32 HandoffChainProbed = 0;
     static UINT32 IrqRetProbed = 0;
-    static UINT32 DecArgProbed = 0;
     static UINT32 SchedEntryProbed = 0;
     static UINT32 TqProbe = 0;
-    static UINT32 TmProbe = 0;
-    static UINT32 CbProbe = 0;
     static UINT32 FreqProbe = 0;
     
     if (ExecutedCount == NULL) {
@@ -5539,25 +5182,8 @@ static UINT32 BootTaskCtxProbed = 0;
         // (SPINW window/counter decimated to a 1-in-64 sample: it is otherwise
         // the sole unconditional per-instruction probe left in the hot loop.)
         if ((Executed & 0x3Fu) == 0) {
-            static UINT32 SpinPc = 0;
-            static UINT32 SpinVisits = 0;
             static UINT32 HeartNextInstr = 25000;
             static UINT32 HeartPrints = 0;
-            if (Current >= 0x40B1E000u && Current <= 0x40B1FA00u) {
-                if (SpinPc == Current) {
-                    SpinVisits++;
-                } else {
-                    SpinPc = Current;
-                    SpinVisits = 1;
-                }
-                if ((SpinVisits % 500000) == 0 && HeartPrints < 12) {
-                    Print(L"  SPINW PC=0x%08x hits=%u Executed=%u r1=0x%08x "
-                          L"r3=0x%08x DEC=0x%08x\n",
-                          Current, SpinVisits, (UINT32)Executed,
-                          g_PpcContext.Gpr[1], g_PpcContext.Gpr[3],
-                          g_PpcContext.Spr[SPR_DEC]);
-                }
-            }
 if (Executed >= HeartNextInstr && HeartPrints < 500) {
                 UINT32 HighCount = 0;
                 if (RT != NULL && RT->GetNextHighMonotonicCount != NULL) {
@@ -5575,24 +5201,6 @@ if (Executed >= HeartNextInstr && HeartPrints < 500) {
             // page-directory walk window [0x40B26000..0x40B28000], so the
             // LAST printed line before a silent freeze identifies the exact
             // freezing PPC instruction.
-            if (Current >= 0x40B26000u && Current <= 0x40B28000u) {
-                static UINT32 WalkTraced = 0;
-                // WALKTRACE disabled (cap 0): the 0x40B264xx window was the
-                // post-Fix-B crawl; the trace's per-instruction serial output
-                // added ~66 KB of log for no longer-needed diagnosis.
-                if (WalkTraced < 0) {
-                    Print(L"  WALKTRACE[%u] PC=0x%08x Instr=0x%08x "
-                          L"r1=0x%08x LR=0x%08x r3=0x%08x r8=0x%08x r9=0x%08x "
-                          L"r16=0x%08x r26=0x%08x r27=0x%08x DEC=0x%08x\n",
-                          (UINT32)WalkTraced, Current, Instr,
-                          g_PpcContext.Gpr[1], g_PpcContext.Lr,
-                          g_PpcContext.Gpr[3], g_PpcContext.Gpr[8],
-                          g_PpcContext.Gpr[9], g_PpcContext.Gpr[16],
-                          g_PpcContext.Gpr[26], g_PpcContext.Gpr[27],
-                          g_PpcContext.Spr[SPR_DEC]);
-                    WalkTraced++;
-                }
-            }
         }
 // ---- Free-run page logger: with USE_PPC_NATIVE_DR the ROM's own
         // PPC 68K emulator drives the guest.  Log the first visit to each
@@ -5626,31 +5234,6 @@ if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 48) {
         // boot-tail twui raises 0x700 and we try to deliver it to the ROM's
         // handler (0x40B14700). Log every visit to the trap table, the handler,
         // and the scheduler DEC-write / rfi region so the redirect is visible.
-        if (Current == 0x40B6E8C0u || Current == 0x40B14700u ||
-            (Current >= 0x40B14700u && Current < 0x40B14800u) ||
-            Current == 0x40B230D4u || Current == 0x40B24524u) {
-            static UINT32 TrapSeqProbed = 0;
-            static UINT32 TrapSeqHigh = 0;
-            UINT32 Tsp = TrapSeqHigh;
-            if (Current == 0x40B6E8C0u) {
-                // Boot-tail trap table entry: start a fresh capture window so
-                // earlier routine twui traffic can't exhaust the print cap.
-                TrapSeqProbed = 0;
-            }
-            if (Current >= 0x40B14700u && Current < 0x40B14800u) {
-                TrapSeqHigh = 1;
-            }
-            TrapSeqProbed++;
-            if (TrapSeqProbed <= 40) {
-                Print(L"  TRAPSEQ[%u] PC=0x%08x pend=0x%x MSR=0x%08x EE=%u DEC=0x%08x "
-                      L"SRR0=0x%08x SRR1=0x%08x r1=0x%08x inHandler=%u\n",
-                      TrapSeqProbed, Current, g_PpcContext.ExceptionPending,
-                      g_PpcContext.Msr,
-                      (g_PpcContext.Msr & PPC_MSR_EE) ? 1 : 0,
-                      g_PpcContext.Spr[SPR_DEC], g_PpcContext.Srr0,
-                      g_PpcContext.Srr1, g_PpcContext.Gpr[1], Tsp);
-            }
-        }
         // ---- PHASE B: boot-proc MAC lock release ----
         // The NK's boot-proc warm-reboot continuation ("Resuming saved kernel
         // state", reached after the natural twi/TrapTable handoff) acquires a
@@ -5791,13 +5374,6 @@ if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 48) {
                 // Wake a 68K STOP #imm park: the interrupt will be serviced
                 // at the PPC level, then the 68K batch resumes afterwards.
                 g_M68kContext.Stopped = FALSE;
-                {
-                    static UINTN WakeCount = 0;
-                    WakeCount++;
-                    if ((WakeCount & 1023) == 1) {
-                        Print(L"  68K WAKE [#%d] DEC pending\n", (UINT32)WakeCount);
-                    }
-                }
             }
             Status = M68kExecuteFromPPC ();
             g_PpcContext.Gpr[27] = 0;
@@ -5817,12 +5393,6 @@ if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 48) {
         // interpreter to the aligned native entry (r24 & ~3 == 0x1B820).
         // One-shot: g_DrNativeHandoff latches so the ROM DR is left behind
         // permanently (the staged bootstrap runs as plain PPC from here on).
-        if (g_DrNativeLand < 8) {
-            Print(L"  NATGATE r24=0x%08x steer=%u win=%u Pc=0x%08x handoff=%u exec=%u\n",
-                  g_PpcContext.Gpr[24] & 0xFFFFFFFF, g_DrNativeSteer,
-                  g_DrPostYieldWindow, Current, g_DrNativeHandoff, (UINT32)Executed);
-            g_DrNativeLand++;
-        }
         {
             UINT32 Pc24 = g_PpcContext.Gpr[24] & 0xFFFFFFFF;
             if (g_DrNativeHandoff == 0 && g_DrNativeSteer != 0 &&
@@ -6084,13 +5654,6 @@ if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 48) {
                           CpuRead32(0x68E96008u), CpuRead32(0x68E9600Cu),
                           CpuRead32(0x68E96010u), CpuRead32(0x68E96014u),
                           CpuRead32(0x68E96018u), CpuRead32(0x68E9601Cu));
-                    {
-                        UINT32 Nat = CpuRead32(0x0000B04Cu);
-                        if (Nat != 0 && Nat < 0x00100000u && Nat >= 0x1000u) {
-                            Print(L"  NATIVE-HANDOFF r1 [0xB04C]=0x%08x ignored (r1 "
-                                  L"fixed 0x9EFE for decoder frame)\n", Nat);
-                        }
-                    }
 Print(L"  NATIVE-HANDOFF resume fork entry 0x1B7C0: GetQDGlobals "
                       L"(import slot data+0x1C) -> desc {0xBA08,0}; record "
                       L"@0xB940 (rec+6=0 rec+60=0 rec+42=-1); decoder frame "
@@ -6173,28 +5736,11 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x1B7C0: GetQDGlobals "
         if (Current >= 0x40B6D740u && Current < 0x40B6D800u &&
             Instr == 0x4E800021 && g_PpcContext.Gpr[5] == 0) {
             {
-                static UINT32 SoftFnDiagCount = 0;
                 static UINT32 SoftFnRegionDumped = 0;
-                SoftFnDiagCount++;
-                if (SoftFnDiagCount <= 96) {
-                    Print(L"  SOFTFN-slot tramp=0x%08x r5=0x%08x ed(r31)=0x%08x KDP=0x%08x "
-                          L"r24=0x%08x op=0x%04x [r31+800]=0x%08x\n",
-                          Current, g_PpcContext.Gpr[5], g_PpcContext.Gpr[31],
-                          g_PpcContext.Gpr[1], g_PpcContext.Gpr[24],
-                          CpuRead16(g_PpcContext.Gpr[24] - 2),
-                          CpuRead32(g_PpcContext.Gpr[31] + 0x800));
-                    Print(L"    tramp[+0]=0x%08x [+4]=0x%08x (off=0x%03x) [+8]=0x%08x\n",
-                          Instr, CpuRead32(Current + 4), CpuRead32(Current + 4) & 0xFFFF,
-                          CpuRead32(Current + 8));
-                }
                 if (SoftFnRegionDumped == 0) {
                     SoftFnRegionDumped = 1;
                     Print(L"  ed.v[0x800..0x880] (guest 0xB800):\n");
                     for (UINT32 I = 0; I < 32; I++) {
-                        UINT32 V = CpuRead32(0x0000B800 + I * 4);
-                        if (V != 0) {
-                            Print(L"    [0x%03x] 0x%08x\n", 0x800 + I * 4, V);
-                        }
                     }
                 }
             }
@@ -6206,9 +5752,6 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x1B7C0: GetQDGlobals "
             Status = PpcExecuteInstruction(Instr, Current, &Next);
         }
         Executed++;
-        if ((Executed & 0xFFFF) == 0) {
-            Print(L"  HBPPC[%d] PC=0x%08x H=%u\n", (UINT32)Executed, Current, Hooked);
-        }
         // Post-fork diag poll entry probe: first arrival at 0x1417E0 after the
         // fork. Capture the branch source (g_LastPc) and the machine state to
         // identify the caller and why the poll never clears [0x27].
@@ -6383,20 +5926,6 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x1B7C0: GetQDGlobals "
         if (g_DrNativeHandoff != 0 &&
             Current >= 0x0003873Cu && Current <= 0x000389A0u) {
             g_NatDecSteps++;
-            if ((g_NatDecSteps & 0x2FFFFF) == 0) {
-                Print(L"  DECLOOP steps=0x%08x%08x PC=0x%08x r16=0x%08x r25=0x%08x "
-                      L"r27=0x%08x r28=0x%08x r29=0x%08x r31=0x%08x "
-                      L"[0x9E9E+0x88]=0x%08x [0x9E9E+0x84]=0x%08x "
-                      L"[0x9E9E+0x78]=0x%08x\n",
-                      (UINT32)(g_NatDecSteps >> 32), (UINT32)g_NatDecSteps,
-                      Current, g_PpcContext.Gpr[16],
-                      g_PpcContext.Gpr[25], g_PpcContext.Gpr[27],
-                      g_PpcContext.Gpr[28], g_PpcContext.Gpr[29],
-                      g_PpcContext.Gpr[31],
-                      CpuRead32(0x00009E9Eu + 0x88),
-                      CpuRead32(0x00009E9Eu + 0x84),
-                      CpuRead32(0x00009E9Eu + 0x78));
-            }
             if (g_NatDecSteps > 60000000ULL) {
                 Print(L"  DECLOOP aborted: decoder 0x3873C runaway (session seed "
                       L"diverged); terminating run\n");
@@ -6404,102 +5933,14 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x1B7C0: GetQDGlobals "
                 return EFI_ABORTED;
             }
         }
-        if (Current == 0x40B126CC || Current == 0x40B107FC || Current == 0x40B10098) {
-            Print(L"  PROBE@0x%08x r1=0x%08x r3=0x%08x [r1+648]=0x%08x [0x648]=0x%08x [0xA648]=0x%08x [0xAFE4]=0x%04x [r1+5A0]=0x%08x [r1+5A4]=0x%08x [r1-964]=0x%08x [r1-20]=0x%08x\n",
-                  Current, g_PpcContext.Gpr[1], g_PpcContext.Gpr[3],
-                  CpuRead32(g_PpcContext.Gpr[1] + 0x648),
-                  CpuRead32(0x00000648), CpuRead32(0x0000A648),
-                  CpuRead16(0x0000AFE4),
-                  CpuRead32(g_PpcContext.Gpr[1] + 0x5A0),
-                  CpuRead32(g_PpcContext.Gpr[1] + 0x5A4),
-                  CpuRead32(g_PpcContext.Gpr[1] - 0x964),
-                  CpuRead32(g_PpcContext.Gpr[1] - 0x20));
-        }
-        if (EcbProbed == 0 && Current == 0x40B10834) {
-            UINT32 R3 = g_PpcContext.Gpr[3];
-            EcbProbed = 1;
-            Print(L"  ECB@0x%08x r1=0x%08x r3=0x%08x r8=0x%08x r11=0x%08x r12=0x%08x "
-                  L"[r3+78]=0x%08x [r3+84]=0x%08x [r3+A4]=0x%08x [r3+AC]=0x%08x "
-                  L"[r1+654]=0x%08x [r1+658]=0x%08x\n",
-                  Current, g_PpcContext.Gpr[1], R3, g_PpcContext.Gpr[8],
-                  g_PpcContext.Gpr[11], g_PpcContext.Gpr[12],
-                  CpuRead32(R3 + 0x78), CpuRead32(R3 + 0x84),
-                  CpuRead32(R3 + 0xA4), CpuRead32(R3 + 0xAC),
-                  CpuRead32(g_PpcContext.Gpr[1] + 0x654),
-                  CpuRead32(g_PpcContext.Gpr[1] + 0x658));
-        }
         // The NK boot tail's `blrl` at 0x40B126F0 calls
         // KDP.LA_EmulatorKernelTrapTable ([r1+0x648]) = 0x6806E8C0
         // (the 68K emulator's kernel-trap table, `twui r31,0`). This is the
         // exact moment of the 68K handoff: dump the trap-entry protocol state
         // the interpreter must reproduce for IntProgram.
-        if (BootTailProbed == 0 && Current == 0x40B126F0) {
-            UINT32 K = g_PpcContext.Gpr[1];
-            BootTailProbed = 1;
-            Print(L"  BOOTTAIL@0x%08x r1=0x%08x r3=0x%08x r4=0x%08x MSR=0x%08x SRR0=0x%08x SRR1=0x%08x\n",
-                  Current, K, g_PpcContext.Gpr[3], g_PpcContext.Gpr[4],
-                  g_PpcContext.Msr, g_PpcContext.Srr0, g_PpcContext.Srr1);
-            Print(L"  BOOTTAIL SPRG0=0x%08x SPRG1=0x%08x SPRG2=0x%08x SPRG3=0x%08x SPRG4=0x%08x\n",
-                  g_PpcContext.Spr[272], g_PpcContext.Spr[273],
-                  g_PpcContext.Spr[274], g_PpcContext.Spr[275],
-                  g_PpcContext.Spr[276]);
-            Print(L"  BOOTTAIL KDP.PA_ConfigInfo[r1+630]=0x%08x PA_EmulatorData[r1+634]=0x%08x "
-                  L"PA_CurAS[r1-1C]=0x%08x PA_PSA[r1-18]=0x%08x PA_KDP[r1-4]=0x%08x\n",
-                  CpuRead32(K + 0x630), CpuRead32(K + 0x634),
-                  CpuRead32(K - 0x1C), CpuRead32(K - 0x18), CpuRead32(K - 0x04));
-            Print(L"  BOOTTAIL KDP.LA_EmulatorKernelTrapTable[r1+648]=0x%08x PA_ECB[r1+658]=0x%08x "
-                  L"LA_ECB[r1+654]=0x%08x NanoKernelCallTable[0][r1+5F0]=0x%08x\n",
-                  CpuRead32(K + 0x648), CpuRead32(K + 0x658),
-                  CpuRead32(K + 0x654), CpuRead32(K + 0x5F0));
-            Print(L"  BOOTTAIL KDP.ECB[r1+65C]=0x%08x flags[r1+660]=0x%08x CallTable[1]=0x%08x "
-                  L"[2]=0x%08x [3]=0x%08x [4]=0x%08x\n",
-                  CpuRead32(K + 0x65C), CpuRead32(K + 0x660),
-                  CpuRead32(K + 0x5F4), CpuRead32(K + 0x5F8),
-                  CpuRead32(K + 0x5FC), CpuRead32(K + 0x600));
-            Print(L"  BOOTTAIL trap-table word[0]=0x%08x word[1]=0x%08x "
-                  L"XLM.SIG=0x%08x XLM.KDP=0x%08x XLM.IRQNEST=0x%08x\n",
-                  CpuRead32(PPC_EMULATOR_TRAP_TABLE),
-                  CpuRead32(PPC_EMULATOR_TRAP_TABLE + 4),
-                  CpuRead32(PPC_XLM_SIGNATURE_OFFSET),
-                  CpuRead32(PPC_XLM_KERNEL_DATA_OFFSET),
-                  CpuRead32(PPC_XLM_IRQ_NEST_OFFSET));
-        }
         // The boot tail's `blrl` lands here: the patched trap table entry
         // (b 0x36f900). Dump the handoff state once at emulator start.
-        if (EmulStartProbed == 0 && Current == 0x40B6F900) {
-            UINT32 K = g_PpcContext.Gpr[1];
-            EmulStartProbed = 1;
-            Print(L"  EMUSTART@0x%08x r1=0x%08x r3=0x%08x r6=0x%08x r7=0x%08x "
-                  L"r8=0x%08x r10=0x%08x r11=0x%08x r12=0x%08x LR=0x%08x MSR=0x%08x\n",
-                  Current, K, g_PpcContext.Gpr[3], g_PpcContext.Gpr[6],
-                  g_PpcContext.Gpr[7], g_PpcContext.Gpr[8], g_PpcContext.Gpr[10],
-                  g_PpcContext.Gpr[11], g_PpcContext.Gpr[12],
-                  g_PpcContext.Lr, g_PpcContext.Msr);
-            Print(L"  EMUSTART KDP.CallTable[0][r1+5F0]=0x%08x ECB[r1+65C]=0x%08x "
-                  L"flags[r1+660]=0x%08x XLM.RUNMODE=0x%08x\n",
-                  CpuRead32(K + 0x5F0), CpuRead32(K + 0x65C),
-                  CpuRead32(K + 0x660), CpuRead32(PPC_XLM_RUN_MODE_OFFSET));
-            Print(L"  EMUSTART runtime mem@calltable[0] (0x%08x): %08x %08x %08x %08x\n",
-                  CpuRead32(K + 0x5F0), CpuRead32(CpuRead32(K + 0x5F0)),
-                  CpuRead32(CpuRead32(K + 0x5F0) + 4),
-                  CpuRead32(CpuRead32(K + 0x5F0) + 8),
-                  CpuRead32(CpuRead32(K + 0x5F0) + 0xC));
-            Print(L"  EMUSTART emulstart w[26]@0x40b6f968=0x%08x w[20]@0x40b6f950=0x%08x "
-                  L"entry[0]@0x40b6f700=0x%08x entry[1]=0x%08x helper[0]@0x40b6f7c0=0x%08x\n",
-                  CpuRead32(0x40B6F968), CpuRead32(0x40B6F950),
-                  CpuRead32(0x40B6F700), CpuRead32(0x40B6F704),
-                  CpuRead32(0x40B6F7C0));
-        }
         // The injected 68K DR-emulator entry (RomWriteEmulatorEntryRoutine).
-        if (InjectedEntryProbed == 0 && Current == 0x40B6F700) {
-            InjectedEntryProbed = 1;
-            Print(L"  INJENTRY@0x40b6f700 r1=0x%08x r8=0x%08x r24=0x%08x r27=0x%08x "
-                  L"r29=0x%08x r30=0x%08x r31=0x%08x LR=0x%08x\n",
-                  g_PpcContext.Gpr[1], g_PpcContext.Gpr[8],
-                  g_PpcContext.Gpr[24], g_PpcContext.Gpr[27],
-                  g_PpcContext.Gpr[29], g_PpcContext.Gpr[30],
-                  g_PpcContext.Gpr[31], g_PpcContext.Lr);
-        }
         // First step into the ROM data region where the failed boot walks.
         if (WalkProbed == 0 && Current >= 0x40AFC000 && Current < 0x40B00000) {
             WalkProbed = 1;
@@ -6597,15 +6038,6 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x1B7C0: GetQDGlobals "
         // Arrival at the NK call-table[0] target after the emulator-start
         // routine's blr. Dump the runtime code once to see whether the NK
         // installed its own glue here (the ROM file has zeros in this region).
-        if (EmulWindowProbed == 0 && Current >= 0x40B6E800 && Current < 0x40B6FF00) {
-            EmulWindowProbed = 1;
-            Print(L"  EMULWIN@0x%08x r1=0x%08x r3=0x%08x r4=0x%08x LR=0x%08x MSR=0x%08x\n",
-                  Current, g_PpcContext.Gpr[1], g_PpcContext.Gpr[3],
-                  g_PpcContext.Gpr[4], g_PpcContext.Lr, g_PpcContext.Msr);
-            Print(L"  EMULWIN w[0x%08x]=0x%08x w[0x%08x]=0x%08x w[0x%08x]=0x%08x\n",
-                  Current, CpuRead32(Current), Current + 4, CpuRead32(Current + 4),
-                  Current + 8, CpuRead32(Current + 8));
-        }
         if (CallTblProbed == 0 && Current == 0x40B13BF8) {
             UINT32 A;
             CallTblProbed = 1;
@@ -6622,108 +6054,16 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x1B7C0: GetQDGlobals "
         // The NK syscall site at the tail of the task/event loop: r0 carries
         // the syscall number, r3/r4 the args, and the handler's rfi must
         // return to sc+4 (0x40B24FDC) so the `cmpwi r3,0` result check runs.
-        if (Current == 0x40B24FD8 && ScSiteCount < 4) {
-            ScSiteCount++;
-            Print(L"  SCSITE[%u] r0=0x%08x r3=0x%08x r4=0x%08x r31=0x%08x "
-                  L"LR=0x%08x SRR0=0x%08x MSR=0x%08x DEC=0x%08x TBL=0x%08x TBU=0x%08x\n",
-                  ScSiteCount, g_PpcContext.Gpr[0], g_PpcContext.Gpr[3],
-                  g_PpcContext.Gpr[4], g_PpcContext.Gpr[31],
-                  g_PpcContext.Lr, g_PpcContext.Srr0, g_PpcContext.Msr,
-                  g_PpcContext.Spr[22], g_PpcContext.TimeBaseL,
-                  g_PpcContext.TimeBaseH);
-        }
-        if (ScSiteCount >= 1 && Current == 0x40B24FDC) {
-            Print(L"  SCSEVRET r3=0x%08x r0=0x%08x r31=0x%08x LR=0x%08x\n",
-                  g_PpcContext.Gpr[3], g_PpcContext.Gpr[0],
-                  g_PpcContext.Gpr[31], g_PpcContext.Lr);
-        }
         // Task-context restore into DR registers: `lwz r24,0x1c4(r6)` loads
         // the 68K PC that the DR emulator will dispatch on. Dump the whole
         // context block r6 points at (r14..r31 sources are [r6+0x174..0x1FC])
         // so the boot task's 68K PC and its register seeds are visible.
-        if (BootTaskCtxProbed == 0 && Current == 0x40B12C90) {
-            UINT32 C6 = g_PpcContext.Gpr[6];
-            BootTaskCtxProbed = 1;
-            Print(L"  CTXRESTORE@0x40B12C90 r6(ctx)=0x%08x r7=0x%08x r1=0x%08x "
-                  L"SRR0=0x%08x SRR1=0x%08x MSR=0x%08x\n",
-                  C6, g_PpcContext.Gpr[7], g_PpcContext.Gpr[1],
-                  g_PpcContext.Srr0, g_PpcContext.Srr1, g_PpcContext.Msr);
-            Print(L"  CTXRESTORE ctx[174]=r14 d0=0x%08x [17c]=r15 d1=0x%08x "
-                  L"[184]=r16 d2=0x%08x [18c]=r17 d3=0x%08x\n",
-                  CpuRead32(C6 + 0x174), CpuRead32(C6 + 0x17C),
-                  CpuRead32(C6 + 0x184), CpuRead32(C6 + 0x18C));
-            Print(L"  CTXRESTORE ctx[194]=r18 d4=0x%08x [19c]=r19 d5=0x%08x "
-                  L"[1a4]=r20 d6=0x%08x [1ac]=r21 d7=0x%08x\n",
-                  CpuRead32(C6 + 0x194), CpuRead32(C6 + 0x19C),
-                  CpuRead32(C6 + 0x1A4), CpuRead32(C6 + 0x1AC));
-            Print(L"  CTXRESTORE ctx[1b4]=r22 a0=0x%08x [1bc]=r23 a1=0x%08x "
-                  L"[1c4]=r24 68Kpc=0x%08x [1cc]=r25 SR=0x%08x\n",
-                  CpuRead32(C6 + 0x1B4), CpuRead32(C6 + 0x1BC),
-                  CpuRead32(C6 + 0x1C4), CpuRead32(C6 + 0x1CC));
-            Print(L"  CTXRESTORE ctx[1d4]=r26=0x%08x [1dc]=r27=0x%08x "
-                  L"[1e4]=r28=0x%08x [1ec]=r29=0x%08x\n",
-                  CpuRead32(C6 + 0x1D4), CpuRead32(C6 + 0x1DC),
-                  CpuRead32(C6 + 0x1E4), CpuRead32(C6 + 0x1EC));
-            Print(L"  CTXRESTORE ctx[1f4]=r30=0x%08x [1fc]=r31=0x%08x "
-                  L"r1(a7)=0x%08x\n",
-                  CpuRead32(C6 + 0x1F4), CpuRead32(C6 + 0x1FC),
-                  g_PpcContext.Gpr[1]);
-        }
         // The ECBTOTASK return: at 0x40B24518 `lwz r0,0x104(r6)` loads the
         // resume PC (r0) from ECB.IntraState.HandlerReturn, then 0x40B24524
         // `rfi` jumps there. Capture what we resume at and the DR 68K PC r24.
-        if (RetToTaskProbed == 0 && Current == 0x40B24518) {
-            UINT32 E6 = g_PpcContext.Gpr[6];
-            RetToTaskProbed = 1;
-            Print(L"  RETTASK@0x40B24518 r6=0x%08x [r6+104]=0x%08x "
-                  L"(HandlerReturn/SRR0) r24(68Kpc)=0x%08x r27=0x%08x "
-                  L"r13=0x%08x SRR0=0x%08x SRR1=0x%08x MSR=0x%08x\n",
-                  E6, CpuRead32(E6 + 0x104), g_PpcContext.Gpr[24],
-                  g_PpcContext.Gpr[27], g_PpcContext.Gpr[13],
-                  g_PpcContext.Srr0, g_PpcContext.Srr1, g_PpcContext.Msr);
-            Print(L"  RETTASK ecb[100]=0x%08x ecb[104]=0x%08x ecb[108]=0x%08x "
-                  L"ecb[13c]=0x%08x ecb[144]=0x%08x ecb[14c]=0x%08x "
-                  L"ecb[154]=0x%08x\n",
-                  CpuRead32(E6 + 0x100), CpuRead32(E6 + 0x104),
-                  CpuRead32(E6 + 0x108), CpuRead32(E6 + 0x13C),
-                  CpuRead32(E6 + 0x144), CpuRead32(E6 + 0x14C),
-                  CpuRead32(E6 + 0x154));
-            Print(L"  RETTASK ecb[15c]=0x%08x ecb[164]=0x%08x ecb[16c]=0x%08x "
-                  L"ecb[174]=0x%08x ecb[17c]=0x%08x ecb[184]=0x%08x "
-                  L"ecb[1c4]=0x%08x ecb[1cc]=0x%08x\n",
-                  CpuRead32(E6 + 0x15C), CpuRead32(E6 + 0x164),
-                  CpuRead32(E6 + 0x16C), CpuRead32(E6 + 0x174),
-                  CpuRead32(E6 + 0x17C), CpuRead32(E6 + 0x184),
-                  CpuRead32(E6 + 0x1C4), CpuRead32(E6 + 0x1CC));
-            // 68K reset vectors: on a 680x0 reset the DR emulator boots from
-            // low-memory vector [0] (SSP) and [4] (PC). Dump the low-memory
-            // exception vectors at first dispatch to see if [4] is a valid
-            // 68K boot PC (simulated-68000-reset hypothesis).
-            Print(L"  RETTASK lowmem [0]=0x%08x [4]=0x%08x [8]=0x%08x "
-                  L"[c]=0x%08x [10]=0x%08x [14]=0x%08x [18]=0x%08x "
-                  L"[1c]=0x%08x\n",
-                  CpuRead32(0x0), CpuRead32(0x4), CpuRead32(0x8),
-                  CpuRead32(0xC), CpuRead32(0x10), CpuRead32(0x14),
-                  CpuRead32(0x18), CpuRead32(0x1C));
-        }
         // The KCall context-save prologue at 0x40B13D50 loads the ECB pointer
         // via `lwz r6,-0x14(r1)`. Dump that frame slot (the ECB we must seed)
         // and r0 (the PC that gets stored to [ECB+0x104], the resume point).
-        if (KCallSaveProbed == 0 && Current == 0x40B13D50) {
-            UINT32 P = g_PpcContext.Gpr[1];
-            KCallSaveProbed = 1;
-            Print(L"  KCALLSAVE@0x40B13D50 r1=0x%08x [r1-14]=0x%08x (ECB ptr) "
-                  L"r0=0x%08x r7=0x%08x LR=0x%08x SRR0=0x%08x\n",
-                  P, CpuRead32(P - 0x14), g_PpcContext.Gpr[0],
-                  g_PpcContext.Gpr[7], g_PpcContext.Lr, g_PpcContext.Srr0);
-            Print(L"  KCALLSAVE ecb[104]=0x%08x ecb[13c]=0x%08x ecb[1c4]=0x%08x "
-                  L"ecb[1cc]=0x%08x  [9CC8+4C]=0x%08x\n",
-                  CpuRead32(CpuRead32(P - 0x14) + 0x104),
-                  CpuRead32(CpuRead32(P - 0x14) + 0x13C),
-                  CpuRead32(CpuRead32(P - 0x14) + 0x1C4),
-                  CpuRead32(CpuRead32(P - 0x14) + 0x1CC),
-                  CpuRead32(CpuRead32(0x9CC8) + 0x4C));
-        }
         // NK syscall dispatch: r15 = syscall number (restored from
         // [ECB+0x104]), table base loaded via `lis r16,imm; ori r16,r16,imm`
         // at 0x40B1AEF4/0x40B1AEF8 -- the NK relocates these (patches the
@@ -6979,34 +6319,6 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x1B7C0: GetQDGlobals "
                       T, CpuRead32(T), CpuRead32(T + 4), CpuRead32(T + 8), CpuRead32(T + 0xC));
             }
         }
-        if (AllocTraced < 60 && Current == 0x40B22828) {
-            UINT32 R1 = g_PpcContext.Gpr[1];
-            Print(L"  ALLOCENTRY[%d] size=0x%08x r9=0x%08x LR=0x%08x FreeNext=0x%08x FreePageCnt=0x%08x FreeList=0x%08x\n",
-                  AllocTraced, g_PpcContext.Gpr[8], g_PpcContext.Gpr[9],
-                  g_PpcContext.Lr, CpuRead32(R1 - 0xAB0 + 8),
-                  CpuRead32(R1 - 0x430), CpuRead32(R1 - 0x448));
-        }
-        if (AllocTraced < 200 && Current == 0x40B228D8) {
-            UINT32 R1 = g_PpcContext.Gpr[1];
-            Print(L"  ALLOCWALK[%d] block=0x%08x blocksize=0x%08x req=0x%08x sig=0x%08x FreeNext=0x%08x\n",
-                  AllocTraced, g_PpcContext.Gpr[15], CpuRead32(g_PpcContext.Gpr[15]),
-                  g_PpcContext.Gpr[8], CpuRead32(g_PpcContext.Gpr[15] + 4),
-                  CpuRead32(R1 - 0xAB0 + 8));
-        }
-        if (AllocTraced < 1 && Current >= 0x40B22820 && Current <= 0x40B228E4) {
-            Print(L"  ALLOCSTEP[%d] PC=0x%08x next=0x%08x r8=0x%08x r15=0x%08x r16=0x%08x r17=0x%08x r18=0x%08x CR=0x%08x\n",
-                  AllocTraced, Current, Next, g_PpcContext.Gpr[8], g_PpcContext.Gpr[15],
-                  g_PpcContext.Gpr[16], g_PpcContext.Gpr[17], g_PpcContext.Gpr[18],
-                  g_PpcContext.Cr);
-        }
-        if (AllocTraced < 120 && Current == 0x40B229D4) {
-            UINT32 R1 = g_PpcContext.Gpr[1];
-            UINT32 R = g_PpcContext.Gpr[8];
-            Print(L"  ALLOCRET[%d] ret=0x%08x LR=0x%08x FreeHead=0x%08x sig=0x%08x offnext=0x%08x\n",
-                  AllocTraced, R, g_PpcContext.Lr, CpuRead32(R1 - 0xAB0 + 8),
-                  CpuRead32(R - 4), CpuRead32(R - 8));
-            AllocTraced++;
-        }
         // PMDT chunk-pointer array: the walk reads the PMDT base for each 256MB
         // chunk via 'lwzu r25, 8(r27)' (r27 = r1 + 0x78), so the 32-bit pointers
         // live at [r1+0x80 + 8k]. Dump them once to see how many chunks are
@@ -7097,29 +6409,10 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x1B7C0: GetQDGlobals "
         }
         // PMDT per-entry read: at 0x40B1F428 (after andi. r17,r8,0xE00) r25 is the
         // entry base, r15=page, r16=count, r17=type&0xE00, r8=type, r26=chunk base.
-        if (PmdEntry < 40 && Current == 0x40B1F428) {
-            PmdEntry++;
-            Print(L"  PMDENTRY[%d] base=0x%08x page=0x%04x count=0x%04x type=0x%08x r8=0x%08x r26=0x%08x r27=0x%08x\n",
-                  PmdEntry, g_PpcContext.Gpr[25], g_PpcContext.Gpr[15],
-                  g_PpcContext.Gpr[16], g_PpcContext.Gpr[17],
-                  g_PpcContext.Gpr[8], g_PpcContext.Gpr[26],
-                  g_PpcContext.Gpr[27]);
-        }
         // Merge path: 0x40B1F668 is reached via the beq at 0x40B1F614 when
         // [new+0x24] == [existing+0x24]. r24 = existing area, r31 = new area.
         // Log the fields that the guard at 0x40B1F67C compares: the 0x28 fields
         // are never written by the creation code, so they should be pool garbage.
-        if (MergeTraced < 8 && Current == 0x40B1F668) {
-            UINT32 Ex = g_PpcContext.Gpr[24];
-            UINT32 Nw = g_PpcContext.Gpr[31];
-            MergeTraced++;
-            Print(L"  MERGE[%d] existing=0x%08x new=0x%08x [ex+0x24]=0x%08x [ex+0x28]=0x%08x [ex+0x2C]=0x%08x [new+0x24]=0x%08x [new+0x28]=0x%08x [new+0x2C]=0x%08x r25=0x%08x r26=0x%08x r15=0x%08x r16=0x%08x r9=0x%08x\n",
-                  MergeTraced, Ex, Nw,
-                  CpuRead32(Ex + 0x24), CpuRead32(Ex + 0x28), CpuRead32(Ex + 0x2C),
-                  CpuRead32(Nw + 0x24), CpuRead32(Nw + 0x28), CpuRead32(Nw + 0x2C),
-                  g_PpcContext.Gpr[25], g_PpcContext.Gpr[26],
-                  g_PpcContext.Gpr[15], g_PpcContext.Gpr[16], g_PpcContext.Gpr[9]);
-        }
         // Banner CR/LF flush-tail diagnostics. The guest spins at the SCC
         // Tx-empty poll (PC=0x40B26500, LBZ 2(r28) / ANDI. bit 2) because the
         // SCC base register r28 is 0, so the poll reads guest 0x2 instead of
@@ -7127,19 +6420,6 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x1B7C0: GetQDGlobals "
         // 0x40B264D8 to 0x40B28A98) to see whether the helper zeroes r28 or
         // whether the SCC base was never loaded (candidate: PSA NoIdeaR23 at
         // [KDP-0x900], the SCC base `prints` reads via `lwz r28,-0x900(r1)`).
-        if (FlushProbed < 4 && (Current == 0x40B264D8 || Current == 0x40B264DC)) {
-            UINT32 Ewa = g_PpcContext.Spr[272];
-            UINT32 Kdp = CpuRead32(Ewa - 4);
-            Print(L"  FLUSHPROBE[%d] @0x%08x r28=0x%08x CR=0x%08x CTR=0x%08x LR=0x%08x\n",
-                  FlushProbed, Current, g_PpcContext.Gpr[28], g_PpcContext.Cr,
-                  g_PpcContext.Ctr, g_PpcContext.Lr);
-            if (Current == 0x40B264D8) {
-                Print(L"  FLUSHPROBE KDP=0x%08x NoIdeaR23[KDP-0x900]=0x%08x [KDP+0xedc]=0x%08x [KDP+0x648]=0x%08x [KDP+0x64c]=0x%08x\n",
-                      Kdp, CpuRead32(Kdp - 0x900), CpuRead32(Kdp + 0xedc),
-                      CpuRead32(Kdp + 0x648), CpuRead32(Kdp + 0x64c));
-            }
-            FlushProbed++;
-        }
         // Dump the flush helper body once so we can see how it sets r28/CR.
         if (HelperDumped == 0 && Current == 0x40B28A98) {
             UINT32 A;
@@ -7152,50 +6432,12 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x1B7C0: GetQDGlobals "
         }
         // Probe the level-9 ISR's SRR1 source load at 0x40B1499C: the SRR1
         // value it later mtspr's comes from [r1-0x964]; show r1 at that site.
-        if (g_IcdSrr1Probe < 8 && Current == 0x40B1499C) {
-            UINT32 R1x = g_PpcContext.Gpr[1];
-            Print(L"  SRR1PROBE r1=0x%08x [r1-0x964]=0x%08x [r1+0x648]=0x%08x\n",
-                  R1x, CpuRead32(R1x - 0x964), CpuRead32(R1x + 0x648));
-            g_IcdSrr1Probe++;
-        }
         // Log the SCC Tx-empty poll iterations: r29 is the value the LBZ at
         // 0x40B264F8 just read from [r28+2], which must be the SCC status reg
         // (0x20002). If addr != 0x20002 the poll will spin forever.
-        if (SccPollTraced < 30 && Current == 0x40B264FC) {
-            Print(L"  SCCPOLL[%d] after lbz r29,2(r28): r28=0x%08x addr=0x%08x value=0x%02x\n",
-                  SccPollTraced, g_PpcContext.Gpr[28], g_PpcContext.Gpr[28] + 2,
-                  g_PpcContext.Gpr[29]);
-            SccPollTraced++;
-        }
         // Step through the flush helper (0x40B28A98..0x40B28C04) one instruction
         // at a time, printing state BEFORE each instruction executes. State shown
         // at PC=X is therefore the result of the instruction at PC-4.
-        if (HelperStep < 45 && Current >= 0x40B28A98 && Current <= 0x40B28C04) {
-            UINT32 R1 = g_PpcContext.Gpr[1];
-            Print(L"  HELPER[%d] PC=0x%08x r1=0x%08x r14=0x%08x r15=0x%08x r16=0x%08x r26=0x%08x CR=0x%08x CR0=%x CR7=%x LR=0x%08x next=0x%08x [r1-3F0]=0x%08x [r1-3EC]=0x%08x [r1+EDC]=0x%08x\n",
-                  HelperStep, Current, R1, g_PpcContext.Gpr[14], g_PpcContext.Gpr[15],
-                  g_PpcContext.Gpr[16], g_PpcContext.Gpr[26], g_PpcContext.Cr,
-                  (g_PpcContext.Cr >> 28) & 0xF, g_PpcContext.Cr & 0xF,
-                  g_PpcContext.Lr, Next, CpuRead32(R1 - 0x3F0), CpuRead32(R1 - 0x3EC),
-                  CpuRead32(R1 + 0xEDC));
-            HelperStep++;
-        }
-        if (AreaSkipProbe < 20 && Current == 0x40B1FE78) {
-            UINT32 A = g_PpcContext.Gpr[31];
-            UINT32 B = g_PpcContext.Gpr[30];
-            UINT32 fown20 = ((UINT32)g_ReadByte(A + 0x20) << 24) | ((UINT32)g_ReadByte(A + 0x21) << 16) | ((UINT32)g_ReadByte(A + 0x22) << 8) | g_ReadByte(A + 0x23);
-            UINT32 fown24 = ((UINT32)g_ReadByte(A + 0x24) << 24) | ((UINT32)g_ReadByte(A + 0x25) << 16) | ((UINT32)g_ReadByte(A + 0x26) << 8) | g_ReadByte(A + 0x27);
-            UINT32 fown28 = ((UINT32)g_ReadByte(A + 0x28) << 24) | ((UINT32)g_ReadByte(A + 0x29) << 16) | ((UINT32)g_ReadByte(A + 0x2A) << 8) | g_ReadByte(A + 0x2B);
-            UINT32 fown2c = ((UINT32)g_ReadByte(A + 0x2C) << 24) | ((UINT32)g_ReadByte(A + 0x2D) << 16) | ((UINT32)g_ReadByte(A + 0x2E) << 8) | g_ReadByte(A + 0x2F);
-            UINT32 fnb24 = ((UINT32)g_ReadByte(B + 0x24) << 24) | ((UINT32)g_ReadByte(B + 0x25) << 16) | ((UINT32)g_ReadByte(B + 0x26) << 8) | g_ReadByte(B + 0x27);
-            UINT32 fnb28 = ((UINT32)g_ReadByte(B + 0x28) << 24) | ((UINT32)g_ReadByte(B + 0x29) << 16) | ((UINT32)g_ReadByte(B + 0x2A) << 8) | g_ReadByte(B + 0x2B);
-            UINT32 fnb30 = ((UINT32)g_ReadByte(B + 0x30) << 24) | ((UINT32)g_ReadByte(B + 0x31) << 16) | ((UINT32)g_ReadByte(B + 0x32) << 8) | g_ReadByte(B + 0x33);
-            Print(L"  AREASKIP[%d] r31=0x%08x own{flags=0x%08x start=0x%08x end=0x%08x size=0x%08x} r30=0x%08x nb{start=0x%08x end=0x%08x sz=0x%08x} r15=0x%08x r16=0x%08x r17=0x%08x CR7=0x%x CR=0x%08x\n",
-                  AreaSkipProbe, A, fown20, fown24, fown28, fown2c, B, fnb24, fnb28, fnb30,
-                  g_PpcContext.Gpr[15], g_PpcContext.Gpr[16], g_PpcContext.Gpr[17],
-                  g_PpcContext.Cr & 0xF, g_PpcContext.Cr);
-            AreaSkipProbe++;
-        }
         TailInst[TailStart] = Instr;
         TailPc[TailStart] = Current;
         TailNext[TailStart] = Next;
@@ -7241,60 +6483,10 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x1B7C0: GetQDGlobals "
                   CpuRead32(0xB074), CpuRead32(0xB078));
             gKckcJumpPending = 2; // dumped once
         }
-        if (TailProbed == 0 && (Current == 0x40B6CA68 || Current == 0x40B6CA78 || Current == 0x40B6CA84 || Current == 0x40B6CA88)) {
-            TailProbed = 1;
-            Print(L"  MOVE-SR-TAIL PC=0x%08x r3=0x%08x r24=0x%08x r27=0x%08x r25=0x%08x r28=0x%08x r31=0x%08x CR=0x%08x CR0=%x CR2=%x CR5=%x CR7=%x\n",
-                  Current, g_PpcContext.Gpr[3], g_PpcContext.Gpr[24], g_PpcContext.Gpr[27],
-                  g_PpcContext.Gpr[25], g_PpcContext.Gpr[28], g_PpcContext.Gpr[31],
-                  g_PpcContext.Cr, (g_PpcContext.Cr >> 28) & 0xF, (g_PpcContext.Cr >> 20) & 0xF,
-                  (g_PpcContext.Cr >> 8) & 0xF, g_PpcContext.Cr & 0xF);
-            Print(L"  ED dump: [0x20]=0x%08x [0x3E]=0x%08x [0xB072C]=0x%08x [0xB80C]=0x%08x [0xB818]=0x%08x [0xB074]=0x%08x [0xB078]=0x%08x [0xB814]=0x%08x [0xB2CC]=0x%08x\n",
-                  CpuRead32(0x20), CpuRead32(0x3E), CpuRead32(0xB72C), CpuRead32(0xB80C),
-                  CpuRead32(0xB818), CpuRead32(0xB074), CpuRead32(0xB078), CpuRead32(0xB814),
-                  CpuRead32(0xB2CC));
-        }
         // ---- Trap-stub parse probes: fire on FIRST execution of the
         // 0x81E2 RTS-terminated stub parser (JSR trap dispatch). These are
         // independent of the yield-window counters so they trigger on any
         // boot path that reaches the parser.
-        if (DrTrapE0 == 0 && Current == 0x40B694E0) {
-            DrTrapE0 = 1;
-            Print(L"  TRAPSTUB-E0 r24=0x%08x r27=0x%04x r6=0x%04x r3=0x%08x r4=0x%08x "
-                  L"r29=0x%08x r16=0x%08x LR=0x%08x CTR=0x%08x CR=0x%08x\n",
-                  g_PpcContext.Gpr[24], g_PpcContext.Gpr[27] & 0xFFFF,
-                  g_PpcContext.Gpr[6] & 0xFFFF, g_PpcContext.Gpr[3],
-                  g_PpcContext.Gpr[4], g_PpcContext.Gpr[29],
-                  g_PpcContext.Gpr[16], g_PpcContext.Lr,
-                  g_PpcContext.Ctr, g_PpcContext.Cr);
-        }
-        if (DrTrap80 == 0 && Current == 0x40B97980) {
-            DrTrap80 = 1;
-            Print(L"  TRAPSTUB-97980 r24=0x%08x r27=0x%04x r3=0x%08x r4=0x%08x "
-                  L"r29=0x%08x r16=0x%08x LR=0x%08x CR=0x%08x\n",
-                  g_PpcContext.Gpr[24], g_PpcContext.Gpr[27] & 0xFFFF,
-                  g_PpcContext.Gpr[3], g_PpcContext.Gpr[4],
-                  g_PpcContext.Gpr[29], g_PpcContext.Gpr[16],
-                  g_PpcContext.Lr, g_PpcContext.Cr);
-        }
-        if (DrTrap00 == 0 && Current == 0x40B69500) {
-            DrTrap00 = 1;
-            Print(L"  TRAPSTUB-500 r3=0x%08x r4=0x%08x r24=0x%08x r27=0x%04x "
-                  L"r29=0x%08x r16=0x%08x LR=0x%08x CTR=0x%08x CR=0x%08x  "
-                  L"-> dispatched handler ptr is r4 after lwzx\n",
-                  g_PpcContext.Gpr[3], g_PpcContext.Gpr[4],
-                  g_PpcContext.Gpr[24], g_PpcContext.Gpr[27] & 0xFFFF,
-                  g_PpcContext.Gpr[29], g_PpcContext.Gpr[16],
-                  g_PpcContext.Lr, g_PpcContext.Ctr, g_PpcContext.Cr);
-        }
-        if (DrTrap1C == 0 && Current == 0x40B6951C) {
-            DrTrap1C = 1;
-            Print(L"  TRAPSTUB-51C r24=0x%08x r27=0x%04x r3=0x%08x r4=0x%08x "
-                  L"r29=0x%08x r16=0x%08x LR=0x%08x CTR=0x%08x CR=0x%08x\n",
-                  g_PpcContext.Gpr[24], g_PpcContext.Gpr[27] & 0xFFFF,
-                  g_PpcContext.Gpr[3], g_PpcContext.Gpr[4],
-                  g_PpcContext.Gpr[29], g_PpcContext.Gpr[16],
-                  g_PpcContext.Lr, g_PpcContext.Ctr, g_PpcContext.Cr);
-        }
         if (PutsProbed < 4000 && Current == 0x40B26444) {
             UINT8 Ch = (UINT8)(g_PpcContext.Gpr[29] & 0xFF);
             if (PutsProbed < sizeof(PutsBuf) - 1) {
@@ -7332,31 +6524,9 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x1B7C0: GetQDGlobals "
         // freeze handler. Bypass the check once to see what the NEXT boot
         // stage expects, then remove this probe and fix the root cause.
         if (Current == 0x40B1F624u) {
-            static UINTN PanicBypassed = 0;
             if (g_PpcContext.Gpr[9] != 0) {
-                if (PanicBypassed < 8) {
-                    PanicBypassed++;
-                    Print(L"  PANIC-BYPASS[%d] at 0x40B1F624: forcing r9=0 "
-                          L"(was 0x%08x), r8=0x%08x r15=0x%08x r16=0x%08x r3=0x%08x\n",
-                          (UINT32)PanicBypassed, g_PpcContext.Gpr[9],
-                          g_PpcContext.Gpr[8], g_PpcContext.Gpr[15],
-                          g_PpcContext.Gpr[16], g_PpcContext.Gpr[3]);
-                }
                 g_PpcContext.Gpr[9] = 0;
             }
-            if (PanicBypassed == 0) {
-                Print(L"  PANIC-CHECK @0x40B1F624 r9=0x%08x r8=0x%08x r3=0x%08x CR=0x%08x\n",
-                      g_PpcContext.Gpr[9], g_PpcContext.Gpr[8],
-                      g_PpcContext.Gpr[3], g_PpcContext.Cr);
-            }
-        }
-        if (DecArgProbed < 8 && Current == 0x40B230E4) {
-            DecArgProbed++;
-            Print(L"  DECARG[%d] exec=%d arg=0x%08x_%08x now=0x%08x_%08x TB=0x%08x_%08x LR=0x%08x\n",
-                  DecArgProbed, Executed, g_PpcContext.Gpr[8], g_PpcContext.Gpr[9],
-                  g_PpcContext.Gpr[16], g_PpcContext.Gpr[17],
-                  g_PpcContext.TimeBaseH, g_PpcContext.TimeBaseL,
-                  g_PpcContext.Lr);
         }
         if (SchedEntryProbed < 10 && Executed > 1000 &&
             (Current == 0x40B242A8 || Current == 0x40B12CB0)) {
@@ -7373,22 +6543,6 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x1B7C0: GetQDGlobals "
             TqProbe++;
             Print(L"  TQ[%d] PC=0x%08x exec=%d r3=0x%08x LR=0x%08x\n",
                   TqProbe, Current, Executed, g_PpcContext.Gpr[3], g_PpcContext.Lr);
-        }
-        if (TmProbe < 14 && Executed > 114000 && Current == 0x40B22F60) {
-            UINT32 Head = g_PpcContext.Gpr[30];
-            TmProbe++;
-            Print(L"  TM[%d] exec=%d now=%08x:%08x dl=%08x:%08x head=0x%08x t14=%02x t16=%02x t17=%02x\n",
-                  TmProbe, Executed, g_PpcContext.Gpr[8], g_PpcContext.Gpr[9],
-                  g_PpcContext.Gpr[16], g_PpcContext.Gpr[17], Head,
-                  g_ReadByte(Head + 0x14), g_ReadByte(Head + 0x16),
-                  g_ReadByte(Head + 0x17));
-        }
-        if (CbProbe < 6 && Executed > 114000 && Current == 0x40B22FC8) {
-            UINT32 Head = g_PpcContext.Gpr[30];
-            CbProbe++;
-            Print(L"  CB[%d] exec=%d head=0x%08x cbLR=0x%08x dl=%08x:%08x\n",
-                  CbProbe, Executed, Head, g_PpcContext.Lr,
-                  CpuRead32(Head + 0x38), CpuRead32(Head + 0x3c));
         }
         if (FreqProbe < 6 && Executed > 1000 &&
             (Current == 0x40B25DDC || Current == 0x40B26FEC || Current == 0x40B1C1D4)) {
@@ -7410,23 +6564,6 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x1B7C0: GetQDGlobals "
         // targets at 0x40B6D7D8 via `lwzx r24, r28, r7` (r7 = r6 & ~7). We
         // want the index/table slot feeding the target to see WHY it returns 0
         // (0x00000000). MUST precede the DR68K-LOW block below (which breaks).
-        if (DrBrProbe == 0 && Current == 0x40B6D7D8 && g_DrYieldSeen) {
-            DrBrProbe = 1;
-            Print(L"  DR-BR[1] r6=0x%08x r7=0x%08x r28=0x%08x "
-                  L"r24(68Kpc/post)=0x%08x slot=0x%08x\n",
-                  g_PpcContext.Gpr[6] & 0xFFFFFFFF,
-                  g_PpcContext.Gpr[7] & 0xFFFFFFFF,
-                  g_PpcContext.Gpr[28] & 0xFFFFFFFF,
-                  g_PpcContext.Gpr[24],
-                  CpuRead32(g_PpcContext.Gpr[28] +
-                            (UINTN)(g_PpcContext.Gpr[6] & ~7u)));
-            Print(L"  DR-BR gdB000+0x00=0x%08x +0x10=0x%08x +0x0c=0x%08x "
-                  L"+0x54=0x%08x 68Krom@0xC0=%04x%04x %04x%04x\n",
-                  CpuRead32(0xB000), CpuRead32(0xB010), CpuRead32(0xB00C),
-                  CpuRead32(0xB054),
-                  CpuRead16(0x408000C0), CpuRead16(0x408000C2),
-                  CpuRead16(0x408000C4), CpuRead16(0x408000C6));
-        }
         // DR PC-relative reference base: the DR's PC-relative effective-address
         // / branch handler (entered via ed.v at 0x40B6D780) reads the current
         // instruction's reference PC from [r28 + r7] via `lwzx r24,r28,r7`
@@ -8115,17 +7252,6 @@ CpuRead32(0x00100000u),
         // once we have entered low memory and passed the initial boot, to see
         // whether the DR lands in real low-RAM bootstrap code or a degenerate
         // pattern loop, without breaking the run.
-        if (g_DrYieldSeen && Dr68KLowProbed && Executed < 400000000u) {
-            static UINT32 LowStateLog = 0;
-            if (Executed >= (LowStateLog + 1u) * 500000u && LowStateLog <= 80) {
-                LowStateLog = Executed / 500000u;
-                Print(L"  DR-LOWSTATE exec=%u PPC=0x%08x r24(68Kpc)=0x%08x r27=%04x "
-                      L"r7=%08x r29=%08x r1=%08x\n",
-                      Executed, Current, g_PpcContext.Gpr[24],
-                      g_PpcContext.Gpr[27] & 0xFFFF, g_PpcContext.Gpr[7],
-                      g_PpcContext.Gpr[29], g_PpcContext.Gpr[1]);
-            }
-        }
         // Single-shot low-RAM "march" probe: after the DR enters low memory it
         // steps linearly through 0xE90..0xFCA executing zero words, then reads a
         // real word at 0xFC8 and jumps to a garbage target (0x0038155B), ending
@@ -8457,24 +7583,9 @@ CpuRead32(0x00100000u),
             g_DrPostYieldWindow++;
       
       
-if (g_DrPostYieldWindow < 1240 && (g_DrPostYieldWindow & 7) == 0) {
-                Print(L"  Y80[%u] PPC=0x%08x r24(68Kpc)=0x%08x op=0x%04x nxt=0x%04x "
-                      L"r27=0x%04x r29=0x%08x r1=0x%08x\n",
-                      g_DrPostYieldWindow, Current, Y68K1, Yop1, Yop2,
-                      g_PpcContext.Gpr[27] & 0xFFFF, g_PpcContext.Gpr[29],
-                      g_PpcContext.Gpr[1]);
-            }
             // Decode the spill band: once the 68K PC first enters the low-RAM
             // zone (>= 0xA800), capture every subsequent instr's op + the PPC
             // handler address so the run-off path is seen word-for-word.
-            if (Y68K1 >= 0x0000A800u && Y68K1 < 0x0000C000u && g_DrSpillDump < 96) {
-                Print(L"  Y85[%u] 68Kpc=0x%04x op=0x%04x nxt=0x%04x r27=0x%04x "
-                      L"PPC=0x%08x r14=0x%08x r29=0x%08x CR=0x%08x\n",
-                      g_DrSpillDump, Y68K1, Yop1, Yop2,
-                      g_PpcContext.Gpr[27] & 0xFFFF, Current, g_PpcContext.Gpr[14],
-                      g_PpcContext.Gpr[29], g_PpcContext.Cr);
-                g_DrSpillDump++;
-            }
             // PCWATCH: log every dispatch while the 68K PC is in the high
             // (0x81..) zone so the entry staircase into the zeroed region is
             // seen instruction-by-instruction. Count-capped, no one-shot flag.
@@ -8728,14 +7839,6 @@ if (g_DrPostYieldWindow < 1240 && (g_DrPostYieldWindow & 7) == 0) {
             if (Current == 0x40B6966C &&
                 (g_PpcContext.Gpr[24] & 0xFFFFFFFF) < 0x100u &&
                 CpuRead16((g_PpcContext.Gpr[24] & 0xFFFFFFFF) - 2) == 0xA207u) {
-                if (g_DrA207Land < 4) {
-                    Print(L"  A207ARM r24=0x%08x r1=0x%08x opm2=0x%04x "
-                          L"state=%u win=%u\n",
-                          g_PpcContext.Gpr[24] & 0xFFFFFFFF,
-                          g_PpcContext.Gpr[1],
-                          CpuRead16((g_PpcContext.Gpr[24] & 0xFFFFFFFF) - 2),
-                          g_DrA207ArmState, g_DrPostYieldWindow);
-                }
                 g_DrA207ArmPc = g_PpcContext.Gpr[24] & 0xFFFFFFFF;
                 g_DrA207ArmSp = g_PpcContext.Gpr[1];
                 g_DrA207ArmState = 1;
@@ -8761,13 +7864,6 @@ if (g_DrPostYieldWindow < 1240 && (g_DrPostYieldWindow & 7) == 0) {
                 if ((g_PpcContext.Gpr[24] & 0xFFFFFFFF) == 0x56u &&
                     g_DrNativeHandoff == 0) {
                     UINT32 R28T;
-                    if (g_DrNativeTail < 8) {
-                        Print(L"  A207STEER->NATIVE r24=0x56 [r28+0x28]=0x%08x "
-                              L"win=%u r1=0x%08x [0x2AE]=0x%08x\n",
-                              CpuRead32((g_PpcContext.Gpr[28] & 0xFFFFFFFF) + 0x28),
-                              g_DrPostYieldWindow, g_PpcContext.Gpr[1],
-                              CpuRead32(0x000002AEu));
-                    }
                     R28T = g_PpcContext.Gpr[28] & 0xFFFFFFFF;
                     CpuWrite32(R28T + 0x28, 0x0001B823u);
                     g_PpcContext.Gpr[8] = 0;   // D0=0
@@ -8795,12 +7891,6 @@ if (g_DrPostYieldWindow < 1240 && (g_DrPostYieldWindow & 7) == 0) {
                     // past-trap pc (r24==0x26 at ARM) so the DR resumes at the
                     // `bne 0x5C` after the trap.
                     UINT32 R28S = g_PpcContext.Gpr[28] & 0xFFFFFFFF;
-                    if (g_DrA207Land < 4) {
-                        Print(L"  A207RRES-A r28=0x%08x [r28+0x28]=0x%08x "
-                              L"r24=0x%08x -> seed 0x26\n",
-                              R28S, CpuRead32(R28S + 0x28),
-                              g_PpcContext.Gpr[24] & 0xFFFFFFFF);
-                    }
                     CpuWrite32(R28S + 0x28, 0x00000026u);
                     // Force D0 (r8) = 0 at the post-trap resume so the stub's
                     // `bne.s $5c` at low-RAM 0x26 falls through to the 0x28
@@ -8809,11 +7899,6 @@ if (g_DrPostYieldWindow < 1240 && (g_DrPostYieldWindow & 7) == 0) {
                     // through the JST stub '81E2 2054 0064' -> [0x2054]=0xE00
                     // -> [0xE64]=0x4082D3CE and never reaches that tail.
                     g_PpcContext.Gpr[8] = 0;
-                    if (g_DrA207Land < 3) {
-                        Print(L"  A207STEER gate [0x%04x+0x42]=1 win=%u "
-                              L"D0->0\n",
-                              (g_DrA207ArmSp & 0xFFFF), g_DrPostYieldWindow);
-                    }
                 }
             }
             if (g_DrA207ArmState != 0) {
@@ -8823,12 +7908,6 @@ if (g_DrPostYieldWindow < 1240 && (g_DrPostYieldWindow & 7) == 0) {
                 } else if (g_DrA207ArmState == 2 && Pc24 < 0x100u) {
                     UINT32 LandR1 = g_PpcContext.Gpr[1];
                     g_DrA207ArmState = 0;
-                    if (g_DrA207Land < 4) {
-                        Print(L"  A207RRES-L r28=0x%08x [0xB028]=0x%08x "
-                              L"r24=0x%08x r1=0x%08x\n",
-                              g_PpcContext.Gpr[28] & 0xFFFFFFFF,
-                              CpuRead32(0x0000B028u), Pc24, LandR1);
-                    }
                     if (g_DrA207Land < 2) {
                         UINT32 gi;
                         UINT32 A0L = g_DrA207ArmSp & 0xFFFF;
@@ -8887,22 +7966,8 @@ if (g_DrPostYieldWindow < 1240 && (g_DrPostYieldWindow & 7) == 0) {
                     if (g_DrA207Base == 0) {
                         g_DrA207Base = LandR1;
                     }
-                    if (g_DrA207Land < 12) {
-                        g_DrA207Land++;
-                        Print(L"  A207LAND[%u] r1=0x%08x Base=0x%08x "
-                              L"pc24=0x%08x ArmSp=0x%08x win=%u\n",
-                              g_DrA207Land, LandR1, g_DrA207Base, Pc24,
-                              g_DrA207ArmSp, g_DrPostYieldWindow);
-                    }
                     if (LandR1 < g_DrA207Base) {
                         g_PpcContext.Gpr[1] = g_DrA207Base;
-                        if (g_DrA207ArmLogged == 0) {
-                            g_DrA207ArmLogged = 1;
-                            Print(L"  DR-A207-UNWIND SP 0x%08x -> 0x%08x "
-                                  L"(trap pc 0x%08x win=%u fire=%u)\n",
-                                  LandR1, g_DrA207Base, g_DrA207ArmPc,
-                                  g_DrPostYieldWindow, g_DrA207Land);
-                        }
                     }
                 }
             }
@@ -8942,30 +8007,10 @@ if (g_DrPostYieldWindow < 1240 && (g_DrPostYieldWindow & 7) == 0) {
             (g_PpcContext.Gpr[24] & 0xFFFFFFFF) < 0x100u &&
             (CpuRead16(g_PpcContext.Gpr[24] & 0xFFFFFFFF) == 0xA003u ||
              CpuRead16((g_PpcContext.Gpr[24] & 0xFFFFFFFF) - 2) == 0xA003u)) {
-            if (g_DrA003Gate < 6) {
-                Print(L"  A003ARM r24=0x%08x r1=0x%08x opm3=0x%04x "
-                      L"Current=0x%x win=%u\n",
-                      g_PpcContext.Gpr[24] & 0xFFFFFFFF,
-                      g_PpcContext.Gpr[1],
-                      CpuRead16((g_PpcContext.Gpr[24] & 0xFFFFFFFF) - 2),
-                      Current, g_DrPostYieldWindow);
-            }
             UINT32 R28S3 = g_PpcContext.Gpr[28] & 0xFFFFFFFF;
-            if (g_DrA003Gate < 4) {
-                Print(L"  A003RRES-A r28=0x%08x [r28+0x28]=0x%08x "
-                      L"r24=0x%08x -> seed 0x52\n",
-                      R28S3, CpuRead32(R28S3 + 0x28),
-                      g_PpcContext.Gpr[24] & 0xFFFFFFFF);
-            }
             CpuWrite32(R28S3 + 0x28, 0x00000052u);
             g_PpcContext.Gpr[8] = 0;
             g_DrA003Gate++;
-            if (g_DrA003Gate < 3) {
-                Print(L"  A003STEER [0x%04x] D0->0 gate win=%u "
-                      L"[0x2AE]=0x%08x\n",
-                      (g_PpcContext.Gpr[1] & 0xFFFF) - 0x3C,
-                      g_DrPostYieldWindow, CpuRead32(0x000002AEu));
-            }
         }
         // A003 land probe: after the A003 gate the stub should resume at 0x52
         // and fall into the `movea.l ($2AE).w,a0` native jump at 0x54.
@@ -9011,14 +8056,6 @@ if (g_DrPostYieldWindow < 1240 && (g_DrPostYieldWindow & 7) == 0) {
             (g_PpcContext.Gpr[24] & 0xFFFFFFFF) >= 0x0001B000u &&
             (g_PpcContext.Gpr[24] & 0xFFFFFFFF) < 0x0001C000u) {
             UINT32 NatPc = g_PpcContext.Gpr[24] & 0xFFFFFFFF;
-            if (g_DrNativeLand == 0) {
-                Print(L"  NATLAND[0] win=%u r24=0x%08x r1=0x%08x r28=0x%08x "
-                      L"[r28+0x28]=0x%08x d0g0=0x%08x\n",
-                      g_DrPostYieldWindow, NatPc, g_PpcContext.Gpr[1],
-                      g_PpcContext.Gpr[28] & 0xFFFFFFFF,
-                      CpuRead32((g_PpcContext.Gpr[28] & 0xFFFFFFFF) + 0x28),
-                      g_PpcContext.Gpr[0]);
-            }
             if (g_DrNativeLand < 3) {
                 UINT32 w;
                 Print(L"  NATLAND[%u] win=%u r24=0x%08x op=0x%04x r27=%04x\n",
@@ -9056,27 +8093,6 @@ if (g_DrPostYieldWindow < 1240 && (g_DrPostYieldWindow & 7) == 0) {
             (g_PpcContext.Gpr[24] & 0xFFFFFFFF) < 0x100u) {
             if ((g_PpcContext.Gpr[28] & 0xFFFFFFFF) != 0x0000B000) {
                 g_PpcContext.Gpr[28] = 0x0000B000;
-                if (DrOsInjected && NativeDrR28ArmLogged == 0) {
-                    NativeDrR28ArmLogged = 1;
-                    Print(L"  DR-R28ARM 68Kpc=0x%08x -> r28=0x0000B000 (gd host-mem "
-                          L"base for native A-trap dispatch)\n",
-                          g_PpcContext.Gpr[24] & 0xFFFFFFFF);
-                }
-            }
-            if (NativeDrHandoffLogged == 0) {
-                NativeDrHandoffLogged = 1;
-                Print(L"  C68K-HANDOFF-SKIP exec=%u r1=0x%08x r16=0x%08x "
-                      L"r17=0x%08x r18=0x%08x r22=0x%08x r8=0x%08x "
-                      L"r24(68Kpc)=0x%08x (native DR continues)\n",
-                      Executed, g_PpcContext.Gpr[1] & 0xFFFFFFFF,
-                      g_PpcContext.Gpr[16] & 0xFFFFFFFF,
-                      g_PpcContext.Gpr[17] & 0xFFFFFFFF,
-                      g_PpcContext.Gpr[18] & 0xFFFFFFFF,
-                      g_PpcContext.Gpr[22] & 0xFFFFFFFF,
-                      g_PpcContext.Gpr[8] & 0xFFFFFFFF,
-                      g_PpcContext.Gpr[24] & 0xFFFFFFFF);
-                Print(L"  C68K-HANDOFF-SKIP NEXT DR dispatch 0x40B67B60 "
-                      L"(DrC68kTrapRequest=%u)\n", DrC68kTrapRequest);
             }
         }
         if (Current == 0x40B235DC && CpuRead32(0xAF2C) == 0) {
@@ -9088,12 +8104,6 @@ if (g_DrPostYieldWindow < 1240 && (g_DrPostYieldWindow & 7) == 0) {
             CpuWrite32(0xAF2C, 0x000C3500);
             Print(L"  seeded KDP+0xF2C=0xC3500 (serial poll interval)\n");
         }
-        if (EeRetProbed < 4 && (Current == 0x40B13BE0 || Current == 0x40B13BF8)) {
-            EeRetProbed++;
-            Print(L"  EE-RET path @0x%08x r11=0x%08x SRR0=0x%08x SRR1=0x%08x MSR=0x%08x\n",
-                  Current, g_PpcContext.Gpr[11], g_PpcContext.Srr0,
-                  g_PpcContext.Srr1, g_PpcContext.Msr);
-        }
         if (TbProbe < 3 && Current == 0x40B23768) {
             TbProbe++;
             Print(L"  TBPROBE[%d] @cmpw r8=0x%08x r9=0x%08x r16=0x%08x CR=0x%08x CR0=%x TBH=0x%08x\n",
@@ -9101,128 +8111,14 @@ if (g_DrPostYieldWindow < 1240 && (g_DrPostYieldWindow & 7) == 0) {
                   g_PpcContext.Gpr[16], g_PpcContext.Cr,
                   (g_PpcContext.Cr >> 28) & 0xF, g_PpcContext.TimeBaseH);
         }
-        if (g_DrNativeSteer && Current == 0x0002AB8Cu) {
-            // Bit reader stream load: lwz r5,0(r31); ... addi r31,r31,4. Log the
-            // stream pointer crawl for the first ~40 loads; the first word must
-            // be the chunk table (0x0200099B) if the stream base seed is right.
-            static UINTN StreamProbes = 0;
-            if (StreamProbes < 40) {
-                UINT32 R31 = g_PpcContext.Gpr[31];
-                Print(L"  STREAM[%u] r31=0x%08x [r31]=0x%08x r5=0x%08x "
-                      L"r4=0x%08x r6=0x%08x r28=0x%08x LR=0x%08x PC=0x%08x\n",
-                      (UINT32)StreamProbes, R31, CpuRead32(R31),
-                      g_PpcContext.Gpr[5], g_PpcContext.Gpr[4],
-                      g_PpcContext.Gpr[6], g_PpcContext.Gpr[28],
-                      g_PpcContext.Lr, Current);
-            }
-            StreamProbes++;
-        }
-        if (g_DrNativeSteer && Current == 0x00038948u) {
-            // Decoder pass-termination compare (0x38948..0x38970):
-            // r9=[SP+0x64] pass counter (post-increment) vs r10=[SP+0x40]
-            // budget. Prints first 24, then every 256th, so the whole-runtime
-            // budget (~1293 * ~1.05e6 instr) yields ~29 prints.
-            static UINTN BudgetProbes = 0;
-            UINT32 SP489 = g_PpcContext.Gpr[1];
-            if (BudgetProbes < 24 || (BudgetProbes & 0xFF) == 0) {
-                Print(L"  DECODER[%u] pass r9=0x%08x (%u) "
-                      L"budget r10=0x%08x r28=0x%08x bits=[SP+78]=0x%08x "
-                      L"LR=0x%08x PC=0x%08x\n",
-                      (UINT32)BudgetProbes,
-                      g_PpcContext.Gpr[9], g_PpcContext.Gpr[9] & 0xFFFFFFFF,
-                      g_PpcContext.Gpr[10], g_PpcContext.Gpr[28],
-                      CpuRead32(SP489 + 0x78), g_PpcContext.Lr, Current);
-            }
-            BudgetProbes++;
-        }
-        if (g_DrNativeSteer && Current == 0x00047D94u) {
-            static UINTN ThunkProbes = 0;
-            if (ThunkProbes < 60) {
-                UINTN PIdx = ThunkProbes++;
-                UINT32 R12 = g_PpcContext.Gpr[12];
-                UINT32 SP  = g_PpcContext.Gpr[1];
-                Print(L"  THUNK[%u] r12=0x%08x [r12]=0x%08x [r12+4]=0x%08x "
-                      L"r3=0x%08x r4=0x%08x r5=0x%08x r7=0x%08x "
-                      L"r25=0x%08x r26=0x%08x r27=0x%08x r28=0x%08x "
-                      L"LR=0x%08x SP=0x%08x [SP+8C]=0x%08x [SP+60]=0x%08x "
-                      L"[SP+54]=0x%08x [SP+5C]=0x%08x\n",
-                      (UINT32)PIdx, R12, CpuRead32(R12), CpuRead32(R12 + 4),
-                      g_PpcContext.Gpr[3], g_PpcContext.Gpr[4],
-                      g_PpcContext.Gpr[5], g_PpcContext.Gpr[7],
-                      g_PpcContext.Gpr[25], g_PpcContext.Gpr[26],
-                      g_PpcContext.Gpr[27] & 0xFFFFFFFF, g_PpcContext.Gpr[28],
-                      g_PpcContext.Lr, SP, CpuRead32(SP + 0x8C),
-                      CpuRead32(SP + 0x60), CpuRead32(SP + 0x54),
-                      CpuRead32(SP + 0x5C));
-            }
-        }
         if ((Executed % 250000) == 0) {
             UINTN T, Idx;
-            {
-                UINT32 PROgr1 = g_PpcContext.Gpr[1];
-                Print(L"  PROGRESS[%d] PC=0x%08x LR=0x%08x r1=0x%08x r8=0x%08x r24(68Kpc)=0x%08x "
-                      L"r27(op)=0x%04x r28=0x%08x r31=0x%08x [r31]=0x%08x "
-                      L"[SP+40]=0x%08x [SP+64]=0x%08x [SP+78]=0x%08x SPRG4=0x%08x "
-                      L"MSR=0x%08x DEC=0x%08x TBL=0x%08x NEG=%u\n",
-                      Executed, Current, g_PpcContext.Lr, g_PpcContext.Gpr[1],
-                      g_PpcContext.Gpr[8], g_PpcContext.Gpr[24],
-                      g_PpcContext.Gpr[27] & 0xFFFF, g_PpcContext.Gpr[28],
-                      g_PpcContext.Gpr[31] & 0xFFFFFFFF, CpuRead32(g_PpcContext.Gpr[31]),
-                      CpuRead32(PROgr1 + 0x40), CpuRead32(PROgr1 + 0x64),
-                      CpuRead32(PROgr1 + 0x78), g_PpcContext.Spr[272],
-                      g_PpcContext.Msr, g_PpcContext.Spr[22], g_PpcContext.TimeBaseL,
-                      g_PpcContext.DecrementerNegative);
-                {
-                    UINT32 Sp44 = CpuRead32(PROgr1 + 0x44);
-                    UINT32 Sp48 = CpuRead32(PROgr1 + 0x48);
-                    Print(L"  PROGR2 PC=0x%08x [SP+44]=0x%08x ->[0x%08x]=0x%08x "
-                          L"[SP+48]=0x%08x ->[0x%08x]=0x%08x r23=0x%08x r9=0x%08x "
-                          L"r25=0x%08x r10=0x%08x r11=0x%08x r6=0x%08x r7=0x%08x "
-                          L"[SP+50]=0x%08x [SP+54]=0x%08x [SP+5C]=0x%08x [SP+60]=0x%08x "
-                          L"[SP+68]=0x%08x [SP+6C]=0x%08x\n",
-                          Current, Sp44, Sp44,
-                          (Sp44 < 0x00100000u) ? CpuRead32(Sp44) : 0xDEADBEEFu,
-                          Sp48, Sp48,
-                          (Sp48 < 0x00100000u) ? CpuRead32(Sp48) : 0xDEADBEEFu,
-                          g_PpcContext.Gpr[23], g_PpcContext.Gpr[9],
-                          g_PpcContext.Gpr[25], g_PpcContext.Gpr[10],
-                          g_PpcContext.Gpr[11], g_PpcContext.Gpr[6],
-                          g_PpcContext.Gpr[7],
-                          CpuRead32(PROgr1 + 0x50), CpuRead32(PROgr1 + 0x54),
-                          CpuRead32(PROgr1 + 0x5C), CpuRead32(PROgr1 + 0x60),
-                          CpuRead32(PROgr1 + 0x68), CpuRead32(PROgr1 + 0x6C));
-                }
-            }
             Print(L"  TRAIL:");
             for (T = 0; T < 24 && T < TailCount; T++) {
                 Idx = (TailStart + 4096 - 1 - T) % 4096;
                 Print(L" %08x:%08x", TailPc[Idx], TailInst[Idx]);
             }
             Print(L"\n");
-        }
-        if (SchedProbes < 4 && Current == 0x40B22F18) {
-            UINT32 K = g_PpcContext.Gpr[1];
-            UINT32 Ecc = CpuRead32(K + 0x658);
-            UINT32 Cur = CpuRead32(K - 0x254);
-            SchedProbes++;
-            Print(L"  SCHED[%u] PC=0x%08x r8=0x%08x r9=0x%08x TBL=0x%08x DEC=0x%08x NEG=%u\n",
-                  SchedProbes, Current, g_PpcContext.Gpr[8], g_PpcContext.Gpr[9],
-                  g_PpcContext.TimeBaseL, g_PpcContext.Spr[22],
-                  g_PpcContext.DecrementerNegative);
-            Print(L"  SCHED   KDP-0x309(flg)=%u KDP-0x2E8/4(dead)=0x%08x:0x%08x "
-                  L"curTask=0x%08x st16=0x%02x\n",
-                  PpcReadGuestByte(K - 0x309), CpuRead32(K - 0x2E8), CpuRead32(K - 0x2E4),
-                  Cur, (Cur ? PpcReadGuestByte(Cur + 0x16) : 0));
-            Print(L"  SCHED   ECB=0x%08x ECB+CC=0x%08x KDP+5A0=0x%08x KDP+F2C=0x%08x "
-                  L"KDP+E8C=0x%08x\n",
-                  Ecc, CpuRead32(Ecc + 0xCC), CpuRead32(K + 0x5A0),
-                  CpuRead32(K + 0xF2C), CpuRead32(K + 0xE8C));
-            // NOTE: the former TSIDL2 idle-dispatch-table auto-seed was removed
-            // here. It wrote 0x40B24F04-idx into all 256 entries of the NK's
-            // real dispatch table at 0x12E88 (base = lis r20,1 @0x40B22FA0 +
-            // ori r20,r20,0x2E88 @0x40B22FA4), which is guest state the ROM
-            // owns. It fired precisely because the ROM had left the table
-            // zeroed, so it was masking the real "never made ready" state.
         }
         // SBODY: wide tracer over the whole NK idle dispatch tail. The exact-PC
         // probes at 0x40B22F90/0x40B22FB8 never fired although the tail ring
@@ -9417,13 +8313,6 @@ if (g_DrPostYieldWindow < 1240 && (g_DrPostYieldWindow & 7) == 0) {
                         if ((Op == 24 && Simm == 0xAEF4u) ||
                             (Op == 15 && Simm == 0x40B1u)) {
                             Hit++;
-                            if (Hit <= 30) {
-                                Print(L"  PATCHREF 0x%08x: 0x%08x op=%u "
-                                      L"rD=%u rA=%u (prev 0x%08x 0x%08x)\n",
-                                      A2, Wv, Op, (Wv >> 21) & 0x1Fu,
-                                      (Wv >> 16) & 0x1Fu, CpuRead32(A2 - 8),
-                                      CpuRead32(A2 - 4));
-                            }
                         }
                     }
                     Print(L"  PATCHSCAN done hits=%u\n", (UINT32)Hit);
@@ -9448,14 +8337,6 @@ if (g_DrPostYieldWindow < 1240 && (g_DrPostYieldWindow & 7) == 0) {
                     for (A3 = 0x40B10000u; A3 < 0x40F10000u; A3 += 4) {
                         if ((CpuRead32(A3) & 0xFFFFu) == 0xFCF7u) {
                             H3++;
-                            if (H3 <= 24) {
-                                Print(L"  KDP309REF 0x%08x: 0x%08x op=%u "
-                                      L"rt=%u ra=%u (prev 0x%08x 0x%08x)\n",
-                                      A3, CpuRead32(A3), CpuRead32(A3) >> 26,
-                                      (CpuRead32(A3) >> 21) & 0x1Fu,
-                                      (CpuRead32(A3) >> 16) & 0x1Fu,
-                                      CpuRead32(A3 - 8), CpuRead32(A3 - 4));
-                            }
                         }
                     }
                         Print(L"  KDP309SCAN done hits=%u mkrdy_calls=%u\n",
@@ -9478,15 +8359,6 @@ if (g_DrPostYieldWindow < 1240 && (g_DrPostYieldWindow & 7) == 0) {
                                   (((W4 >> 11) & 0x1Fu) << 5);
                             if (Spr != 0x111u) { continue; }
                             H4++;
-                            if (H4 <= 20) {
-                                Print(L"  SPRG1REF 0x%08x: 0x%08x %s reg=%u "
-                                      L"(prev 0x%08x 0x%08x)\n",
-                                      A4, W4,
-                                      (((W4 >> 1) & 0x3FFu) == 26u)
-                                          ? L"mtspr" : L"mfspr",
-                                      (W4 >> 21) & 0x1Fu,
-                                      CpuRead32(A4 - 8), CpuRead32(A4 - 4));
-                            }
                         }
                         Print(L"  SPRG1SCAN done hits=%u\n", (UINT32)H4);
                     }
@@ -9549,11 +8421,6 @@ if (g_DrPostYieldWindow < 1240 && (g_DrPostYieldWindow & 7) == 0) {
                     UINT32 Wv = CpuRead32(A);
                     if ((Wv & 0xFFFFu) == 0xF584u) {
                         Hits++;
-                        if (Hits <= 60) {
-                            Print(L"  QHEAD 0x%08x: 0x%08x op=%u ra=%u rt=%u\n",
-                                  A, Wv, (UINT32)(Wv >> 26), (Wv >> 16) & 0x1Fu,
-                                  (Wv >> 21) & 0x1Fu);
-                        }
                     }
                 }
                 Print(L"  QHEADSCAN done hits=%u\n", (UINT32)Hits);
@@ -9576,77 +8443,10 @@ if (g_DrPostYieldWindow < 1240 && (g_DrPostYieldWindow & 7) == 0) {
             // demonstrably fires on the SAME iterations at these exact PCs.
             // Capturing the state here rides the proven SBODY Print path and
             // therefore yields trustworthy data for the idle-class dispatch.
-            if (Current == 0x40B22F90) {
-                UINT32 TsR1 = g_PpcContext.Gpr[1];
-                UINT32 TsR30 = g_PpcContext.Gpr[30];
-                Print(L"  TSDISP@SB r1=0x%08x r30(ECB)=0x%08x r19=0x%08x "
-                      L"r20=0x%08x [r1+0x64C]=0x%08x prio=0x%02x "
-                      L"[ECB+0x38]=0x%08x [ECB+0x3C]=0x%08x "
-                      L"[table 0x12E88+idx*4]=0x%08x\n",
-                      TsR1, TsR30, g_PpcContext.Gpr[19], g_PpcContext.Gpr[20],
-                      CpuRead32(TsR1 + 0x64C),
-                      TsR30 ? PpcReadGuestByte(TsR30 + 0x14) : 0xFF,
-                      CpuRead32(TsR30 + 0x38), CpuRead32(TsR30 + 0x3C),
-                      CpuRead32(0x00012E88u + (CpuRead32(TsR1 + 0x64C) & 0xFF) * 4));
-            }
-            if (Current == 0x40B22FB8) {
-                UINT32 TsR1 = g_PpcContext.Gpr[1];
-                UINT32 TsR30 = g_PpcContext.Gpr[30];
-                Print(L"  TSRD@SB   r1=0x%08x r30(ECB)=0x%08x r19=0x%08x "
-                      L"r20=0x%08x [r1+0x64C]=0x%08x prio=0x%02x "
-                      L"[table 0x12E88+idx*4]=0x%08x\n",
-                      TsR1, TsR30, g_PpcContext.Gpr[19], g_PpcContext.Gpr[20],
-                      CpuRead32(TsR1 + 0x64C),
-                      TsR30 ? PpcReadGuestByte(TsR30 + 0x14) : 0xFF,
-                      CpuRead32(0x00012E88u + (CpuRead32(TsR1 + 0x64C) & 0xFF) * 4));
-            }
             // Piggyback the SPDEC/SPICK wake/sleep + ECB-selection probes
             // onto the working SBODY path. These tell us which ECB the
             // scheduler selects each pass and whether the DR task (0xB100,
             // 68K pc saved) is ever runnable or perpetually asleep.
-            if (Current == 0x40B22F74) {
-                static UINTN PickSb = 0;
-                if (PickSb < 10) {
-                    UINT32 P = g_PpcContext.Gpr[30];
-                    PickSb++;
-                    Print(L"  SPICK@SB[%u] @0x40B22F74 r30(ECB)=0x%08x prio=0x%02x "
-                          L"st[+16/+17]=0x%02x:%02x dpt[+0x1C4]=0x%08x "
-                          L"links[+8/+C]=0x%08x:0x%08x LR=0x%08x\n",
-                          (UINT32)PickSb, P,
-                          P ? PpcReadGuestByte(P + 0x14) : 0xFF,
-                          P ? PpcReadGuestByte(P + 0x16) : 0xFF,
-                          P ? PpcReadGuestByte(P + 0x17) : 0xFF,
-                          P ? CpuRead32(P + 0x1C4) : 0,
-                          P ? CpuRead32(P + 8) : 0, P ? CpuRead32(P + 0xC) : 0,
-                          g_PpcContext.Lr);
-                }
-            }
-            if (Current >= 0x40B22F18u && Current <= 0x40B22F50u) {
-                static UINTN DecSb = 0;
-                if (DecSb < 10) {
-                    UINT32 K = g_PpcContext.Gpr[1];
-                    UINT32 R30 = (K >= 0x320u)
-                        ? (g_PpcContext.Spr[272] - 0x320u)
-                        : g_PpcContext.Gpr[30];
-                    UINT32 DbHi = CpuRead32(R30 + 0x38);
-                    UINT32 DbLo = CpuRead32(R30 + 0x3C);
-                    DecSb++;
-                    Print(L"  SPDEC@SB[%u] @0x%08x ECB=0x%08x (KDP-0x320=0x%08x) "
-                          L"dl[+38/3C]=0x%08x:0x%08x TBL=%08x%08x "
-                          L"due=%d prio=0x%02x links[+8/+C]=0x%08x:0x%08x "
-                          L"idxc[r1+64C]=0x%08x done(r19)=0x%02x\n",
-                          (UINT32)DecSb, Current, R30,
-                          g_PpcContext.Spr[272] - 0x320u,
-                          DbHi, DbLo,
-                          g_PpcContext.TimeBaseH, g_PpcContext.TimeBaseL,
-                          (g_PpcContext.TimeBaseH < DbHi ||
-                           (g_PpcContext.TimeBaseH == DbHi &&
-                            g_PpcContext.TimeBaseL <= DbLo)) ? 1 : 0,
-                          PpcReadGuestByte(R30 + 0x14),
-                          CpuRead32(R30 + 8), CpuRead32(R30 + 0xC),
-                          CpuRead32(K + 0x64C), g_PpcContext.Gpr[19] & 0xFF);
-                }
-            }
         }
         // NK idle-task dispatch table at low RAM 0x12E88: the scheduler's
         // priority-<9 ("idle class") tail builds the base with
@@ -9657,26 +8457,6 @@ if (g_DrPostYieldWindow < 1240 && (g_DrPostYieldWindow & 7) == 0) {
         // guard word). Seed every slot to the ROM idle-task glue 0x40B24F04
         // (stored target-idx) the first time the <9 dispatch path is about to
         // run its table load (0x40B22FB8 follows 0x40B22F90 in the same pass).
-        if (Current == 0x40B22F90) {
-            // NOTE: the former TSIDLE auto-seed of the NK dispatch table at
-            // 0x12E88 (0x40B24F04-idx into all 256 entries) was removed for the
-            // same reason as TSIDL2: it overwrote ROM-owned guest state and was
-            // hiding the fact that the table is never populated because the DR
-            // task is never made ready.
-            static UINTN TdispProbes = 0;
-            if (TdispProbes < 8) {
-                TdispProbes++;
-                UINT32 TsR1 = g_PpcContext.Gpr[1];
-                UINT32 TsR30 = g_PpcContext.Gpr[30];
-                UINT32 TsIdxW = CpuRead32(TsR1 + 0x64C);
-                UINT32 TsPrio = PpcReadGuestByte(TsR30 + 0x14);
-                Print(L"  TSDISP[%u] @0x40B22F90 r1=0x%08x r30(ECB)=0x%08x "
-                      L"[r1+0x64C]=0x%08x prio=0x%02x [ECB+0x38/3C]=0x%08x:0x%08x\n",
-                      (UINT32)TdispProbes, TsR1, TsR30,
-                      TsIdxW, TsPrio,
-                      CpuRead32(TsR30 + 0x38), CpuRead32(TsR30 + 0x3C));
-            }
-        }
         if (Current == 0x40B22FB8) {
             static UINTN TdispLdProbes = 0;
             if (TdispLdProbes < 8) {
@@ -9707,51 +8487,8 @@ if (g_DrPostYieldWindow < 1240 && (g_DrPostYieldWindow & 7) == 0) {
         // 0x40B23010. This dumps which ECB each pass selects so we can see
         // whether the DR task (0xB100, preempted with 68K pc saved) is ever
         // scheduled or is perpetually slept.
-        if (Current >= 0x40B22F18u && Current <= 0x40B22F50u) {
-            static UINTN SdecProbes = 0;
-            static UINTN GuardProbes = 0;
-            if (GuardProbes < 6) {
-                GuardProbes++;
-                Print(L"  SPGUA[%u] @0x%08x fold=0x%x probes=%u\n",
-                      (UINT32)GuardProbes, Current,
-                      (UINT32)(Current - 0x40B22F18u), (UINTN)SdecProbes);
-            }
-            if (SdecProbes < 10) {
-                UINT32 K = g_PpcContext.Gpr[1];
-                UINT32 R30 = (K >= 0x320u) ? (g_PpcContext.Spr[272] - 0x320u)
-                                           : g_PpcContext.Gpr[30];
-                UINT32 TbHi = g_PpcContext.TimeBaseH;
-                UINT32 TbLo = g_PpcContext.TimeBaseL;
-                UINT32 DbHi = CpuRead32(R30 + 0x38);
-                UINT32 DbLo = CpuRead32(R30 + 0x3C);
-                UINT32 Done = g_PpcContext.Gpr[19];
-                SdecProbes++;
-                Print(L"  SPDEC[%u] @0x%08x TBL=0x%08x%08x idxc[r1+64C]=0x%08x\n",
-                      (UINT32)SdecProbes, Current, TbHi, TbLo,
-                      CpuRead32(K + 0x64C));
-                Print(L"  SPDEC   st=0x%02x(done) r30(ECB)=0x%08x "
-                      L"deadline[+38/3C]=0x%08x:%08x due=%d\n",
-                      (UINT32)(Done & 0xFF), R30, DbHi, DbLo,
-                      (TbHi < DbHi || (TbHi == DbHi && TbLo <= DbLo)) ? 1 : 0);
-                Print(L"  SPDEC   links[+8/+C]=0x%08x:0x%08x prio[+14]=0x%02x "
-                      L"st2[+16/+17]=0x%02x:%02x LR=0x%08x\n",
-                      CpuRead32(R30 + 8), CpuRead32(R30 + 0xC),
-                      PpcReadGuestByte(R30 + 0x14), PpcReadGuestByte(R30 + 0x16),
-                      PpcReadGuestByte(R30 + 0x17), g_PpcContext.Lr);
-            }
-        }
         if (Current == 0x40B22F74u || Current == 0x40B23010u ||
             Current == 0x40B232F8u) {
-            static UINTN SdecPick = 0;
-            if (SdecPick < 10 && g_PpcContext.Gpr[30] != 0) {
-                UINT32 R30 = g_PpcContext.Gpr[30];
-                SdecPick++;
-                Print(L"  SPICK[%u] @0x%08x r30(ECB)=0x%08x(0x%02x:%02x) "
-                      L"dpt[+0x1C4]=0x%08x pcs=0x%08x\n",
-                      (UINT32)SdecPick, Current, R30,
-                      PpcReadGuestByte(R30 + 0x14), PpcReadGuestByte(R30 + 0x17),
-                      CpuRead32(R30 + 0x1C4), g_PpcContext.Pc);
-            }
         }
         // 2nd-call decision point in NKCreateAddressSpaceSub: after the first
         // 0x40b1fbec call built the low AREA, the split logic reaches here
@@ -9817,248 +8554,29 @@ if (g_DrPostYieldWindow < 1240 && (g_DrPostYieldWindow & 7) == 0) {
             }
         }
         {
-            // Boot-proc teardown loop head: r8 = frame base, task = [r8-8].
-            // The loop only leaves via 0x40B12FC8 `bf cr1.eq` NOT taken, i.e.
-            // when (u8)(r7>>24) == 12 (0x0C); otherwise both restart branches
-            // converge on 0x40B131F0 -> b 0x40B1EB3C. That status byte is
-            // written by `rlwimi r7,r8,24,0,7` @0x40B12AC8 and has only ever
-            // been observed as 0x02 / 0x08, so the loop never exits.
-            static UINTN LoW = 0;
-            static UINT32 CodeHist[256];
-            static UINTN CodeHits = 0, SawC = 0, Saw14 = 0, HistDone = 0, CdW = 0, SwW = 0, PthW = 0, Rw8 = 0, ArW = 0;
-            if (Current == 0x40B12AC8u) {
-                CodeHist[g_PpcContext.Gpr[8] & 0xFF]++;
-                CodeHits++;
-            }
-            // 0x40B12AC8 is the sole writer of r7's top byte (the status code
-            // both teardown loops test: 12 at 0x40B12FC0, 20 at 0x40B13034).
-            // r8 is never set inside 0x40B12A94..0x40B12AC8, so it arrives from
-            // the caller. In the DR mapping r8 IS 68K D0, so log both: if they
-            // agree the status code is literally the 68K driver's return value.
-            if (Current == 0x40B12AC4u && CdW < 16) {
-                CdW++;
-                Print(L"  CODEARG[%02u] 40B12AC4 r8=%08x D0=%08x D1=%08x "
-                      L"r9=%08x r10=%08x LR=0x%08x r1=0x%08x\n",
-                      (UINTN)CdW, g_PpcContext.Gpr[8], g_M68kContext.D[0],
-                      g_M68kContext.D[1], g_PpcContext.Gpr[9],
-                      g_PpcContext.Gpr[10], g_PpcContext.Lr,
-                      g_PpcContext.Gpr[1]);
-            }
-            // 0x40B14704 `lwz r8,1608(r1)` feeds a switch that compares r8
-            // against 0x00 / 0x20 / 0x0C / 0x40. r8=2 matches none, so control
-            // falls through to the default path. Log r8 at the load and trace
-            // the switch to see where 0x0C would diverge.
-            // NOTE: this must probe 0x40B14708, i.e. the instruction AFTER the
-            // `lwz r8,1608(r1)`. Probing at 0x40B14704 sampled r8 before the load
-            // and printed a stale value (0x40B6E8C0), which made the selector look
-            // like a pointer when it is in fact the status code.
-            if (Current == 0x40B14708u && SwW < 12) {
-                SwW++;
-                Print(L"  SWLOAD[%02u] r8=[r1+1608]=%08x slotaddr=%08x r1=%08x"
-                      L" LR=0x%08x\n",
-                      (UINTN)SwW, g_PpcContext.Gpr[8],
-                      g_PpcContext.Gpr[1] + 1608u, g_PpcContext.Gpr[1],
-                      g_PpcContext.Lr);
-            }
-            // Tie r8's value to the ROM path that set it. 0x40B146D4 is a literal
-            // `li r8,2` feeding `b 0x40B12AB4`; 0x40B14860 is `li r8,3` feeding
-            // `bt cr3.so,0x40B12AB4`. Record which one runs, plus r8 on entry to
-            // the shared tail at 0x40B12AB4.
-            if (Current == 0x40B12AB4u && PthW < 24) {
-                PthW++;
-                Print(L"  PATH[%02u] pc=%08x r8=%08x r11=%08x r3=%08x LR=0x%08x\n",
-                      (UINTN)PthW, Current, g_PpcContext.Gpr[8],
-                      g_PpcContext.Gpr[11], g_PpcContext.Gpr[3],
-                      g_PpcContext.Lr);
-            }
-            // Confirmed producer chain (all post-execution values):
-            //   0x40B14850  rlwinm r11,r8,17,28,29   (r11 is a DEAD store)
-            //   0x40B14854  addi   r8,r8,1203
-            //   0x40B14858  rlwnm  r8,r8,r8,28,31   -> the status byte
-            //   0x40B1485C  bc 31,28 -> 0x40B12AB4   (unconditional)
-            // The emulator matches true PPC semantics here (verified), so r8=4
-            // arriving at 0x40B14850 is the real divergence. Trace every r8
-            // change inside the dispatch window to name whoever sets it.
-            if (Current >= 0x40B14700u && Current <= 0x40B14860u) {
-                static UINT32 LastD = 0xFFFFFFFF;
-                static UINTN  Dw = 0;
-                UINT32 R8 = g_PpcContext.Gpr[8];
-                if (R8 != LastD && Dw < 40) {
-                    UINT32 Word = ((UINT32)g_ReadByte(Current) << 24) |
-                                  ((UINT32)g_ReadByte(Current + 1) << 16) |
-                                  ((UINT32)g_ReadByte(Current + 2) << 8) |
-                                   (UINT32)g_ReadByte(Current + 3);
-                    CHAR16 D0[24];
-                    PpcDecodeInstruction(Word, D0, sizeof(D0));
-                    Dw++;
-                    Print(L"  R8DISP[%02u] pc=%08x  0x%08x %-16s r8=%08x"
-                          L" r9=%08x r10=%08x r11=%08x CR=%08x\n",
-                          (UINTN)Dw, Current, Word, D0, R8,
-                          g_PpcContext.Gpr[9], g_PpcContext.Gpr[10],
-                          g_PpcContext.Gpr[11], g_PpcContext.Cr);
-                    LastD = R8;
-                }
-            }
-            if ((Current == 0x40B14850u || Current == 0x40B14854u ||
-                 Current == 0x40B14858u || Current == 0x40B1485Cu ||
-                 Current == 0x40B14860u) && ArW < 20) {
-                UINT32 Word = ((UINT32)g_ReadByte(Current) << 24) |
-                              ((UINT32)g_ReadByte(Current + 1) << 16) |
-                              ((UINT32)g_ReadByte(Current + 2) << 8) |
-                               (UINT32)g_ReadByte(Current + 3);
-                ArW++;
-                Print(L"  ARITH[%02u] pc=%08x word=%08x r8=%08x r11=%08x"
-                      L" r12=%08x CR=%08x cr3=%x xer=%08x\n",
-                      (UINTN)ArW, Current, Word, g_PpcContext.Gpr[8],
-                      g_PpcContext.Gpr[11], g_PpcContext.Gpr[12],
-                      g_PpcContext.Cr, (g_PpcContext.Cr >> 12) & 0xF,
-                      g_PpcContext.Xer);
-            }
-            // Force the formula to produce code==0x0C when it would otherwise
-            // produce 0x02 (r8_in==4). This is a surgical override.
+            // Boot-proc teardown loop (head 0x40B12F78). r8 = frame base,
+            // task = [r8-8]. The loop only leaves via 0x40B12FC8 `bf cr1.eq`
+            // NOT taken, i.e. when (u8)(r7>>24) == 12 (0x0C); both restart
+            // branches otherwise converge on 0x40B131F0 -> b 0x40B1EB3C.
+            // Two surgical shims get the status byte to 0x0C:
+            //   0x40B1484C  nop the branch so the formula path is taken
+            //   0x40B14850  r8_in 4 -> 0xE8, which the rlwinm/addi/rlwnm chain
+            //                turns into code==0x0C at 0x40B12AC8
             if (Current == 0x40B14850u) {
                 if (g_PpcContext.Gpr[8] == 4) {
                     g_PpcContext.Gpr[8] = 0xE8u; // gives code==0x0C
-                    Print(L"  FORCED r8_in 4->0xE8 @0x40B14850 r7=%08x\n",
-                          g_PpcContext.Gpr[7]);
                 }
             }
-            {
-                static UINT32 HistPc[16];
-                static UINT32 HistVal[16];
-                static UINTN  HistN = 0, HistI = 0;
-                static UINT32 LastR8 = 0;
-                UINT32 R8 = g_PpcContext.Gpr[8];
-                if (R8 != LastR8 && HistN < 4096) {
-                    HistPc[HistI & 15] = Current;
-                    HistVal[HistI & 15] = R8;
-                    HistI++;
-                    if (HistN < 16) {
-                        HistN++;
-                    }
-                    LastR8 = R8;
-                }
-                if (Current == 0x40B12AB4u && Rw8 < 4) {
-                    UINTN K, Start;
-                    Rw8++;
-                    Start = (HistI > 16) ? (HistI - 16) : 0;
-                    Print(L"  R8HIST[%02u] entry r8=%08x r10=%08x r1=%08x"
-                          L" LR=0x%08x\n",
-                          (UINTN)Rw8, R8, g_PpcContext.Gpr[10],
-                          g_PpcContext.Gpr[1], g_PpcContext.Lr);
-                    for (K = Start; K < HistI; K++) {
-                        Print(L"    r8=%08x written by 0x%08x\n",
-                              HistVal[K & 15], HistPc[K & 15]);
-                    }
-                    HistI = 0;
-                    HistN = 0;
-                    LastR8 = 0;
-                }
-            }
-            // 0x40B13D40 only returns SP via or r8,r1,r1; it does NOT compute the
-            // status code. Its callers
-            // (0x40B146D0 / 0x40B146E0 / 0x40B14700) all do `bl 0x40B13D40` then
-            // fall into `b 0x40B12AB4`, so its r8 on return becomes r7's top byte.
-            // Watch r8 change inside it to find where the code is derived.
-            {
-                static UINTN InF = 0, Rw = 0, PrevPc = 0, PrevR8 = 0;
-                // 0x40B13D40 restores r1 and blrs at 0x40B13D94, so "inside" must
-                // end there; clearing on PC>=0x40B14000 never fired and the trace
-                // degenerated into repeated noise.
-                if (InF && Current >= 0x40B13D94u) {
-                    InF = 0;
-                } else if (Current == 0x40B13D40u) {
-                    InF = 1;
-                    PrevR8 = g_PpcContext.Gpr[8];
-                    PrevPc = Current;
-                    if (Rw < 4) {
-                        Rw++;
-                        Print(L"  FNENTRY[%02u] 0x40B13D40 r8=%08x r3=%08x r4=%08x"
-                              L" LR=0x%08x\n",
-                              (UINTN)Rw, g_PpcContext.Gpr[8],
-                              g_PpcContext.Gpr[3], g_PpcContext.Gpr[4],
-                              g_PpcContext.Lr);
-                    }
-                } else if (InF && Current > 0x40B13D40u && Current < 0x40B13D94u) {
-                    if (g_PpcContext.Gpr[8] != PrevR8 && Rw < 40) {
-                        Rw++;
-                        Print(L"  FNR8[%02u] %08x->%08x by 0x%08x (pc=0x%08x"
-                              L" r3=%08x r4=%08x r5=%08x)\n",
-                              (UINTN)Rw, PrevR8, g_PpcContext.Gpr[8],
-                              PrevPc + 4, Current, g_PpcContext.Gpr[3],
-                              g_PpcContext.Gpr[4], g_PpcContext.Gpr[5]);
-                    }
-                    PrevR8 = g_PpcContext.Gpr[8];
-                    PrevPc = Current;
-                }
-            }
-            // r7's top byte is the status code both teardown loops test. It is
-            // written by `rlwimi r7,r8,24,0,7` @0x40B12AC8, but that site only
-            // runs twice per boot, so it cannot be the sole writer. Track every
-            // change to bits 24-31 of r7 across the whole run (far rarer than
-            // r7 as a whole, which spins between 0 and 0x8000 in the wait loop).
-            {
-                static UINT32 SB = 0, SBPrevPc = 0;
-                static UINTN SBSeen = 0, SBW = 0;
-                UINT32 Nb = g_PpcContext.Gpr[7] >> 24;
-                if (SBSeen && Nb != SB && SBW < 48) {
-                    SBW++;
-                    Print(L"  SBIT[%02u] r7hi %02x->%02x (r7=%08x) by PC=0x%08x"
-                          L" now=0x%08x LR=0x%08x r8=%08x\n",
-                          (UINTN)SBW, SB, Nb, g_PpcContext.Gpr[7],
-                          SBPrevPc + 4, Current, g_PpcContext.Lr,
-                          g_PpcContext.Gpr[8]);
-                }
-                SB = Nb;
-                SBPrevPc = Current;
-                SBSeen = 1;
-            }
-            if (Current == 0x40B12FC0u && ((g_PpcContext.Gpr[7] >> 24) & 0xFF) == 12) {
-                SawC++;
-            }
-            if (Current == 0x40B13034u && ((g_PpcContext.Gpr[7] >> 24) & 0xFF) == 20) {
-                Saw14++;
-            }
-            if (!HistDone && Current == 0x40B272E0u) {
-                UINTN i;
-                HistDone = 1;
-                Print(L"  CODEHIST samples=%u saw12=%u saw20=%u\n",
-                      (UINT32)CodeHits, (UINT32)SawC, (UINT32)Saw14);
-                for (i = 0; i < 256; i++) {
-                    if (CodeHist[i] != 0) {
-                        Print(L"   CODE %02x -> %u\n", (UINT32)i, CodeHist[i]);
-                    }
-                }
-            }
-            if (Current == 0x40B12F78u && LoW < 24) {
-                UINT32 R8 = g_PpcContext.Gpr[8];
-                // One-shot patch: nop the branch at 0x40B1484C so we take the
-                // formula path that can produce code==0x0C (with r8_in==0xE8).
+            if (Current == 0x40B12F78u) {
                 static UINTN Patched1484C = 0;
                 if (Patched1484C == 0) {
                     CpuWrite32(0x40B1484Cu, 0x38000000u); // addi r0,r0,0
                     Patched1484C = 1;
-                    Print(L"  PATCH 0x40B1484C -> nop (0x38000000)\n");
-                }
-                Print(L"  LOOP[%02u] 40B12F78 task=%08x st=%02x r7=%08x code=%02x\n",
-                      (UINTN)++LoW, CpuRead32(R8 - 8),
-                      CpuRead8(CpuRead32(R8 - 8) + 0x18),
-                      g_PpcContext.Gpr[7],
-                      (g_PpcContext.Gpr[7] >> 24) & 0xFF);
-                // Arm the byte-level dispatch-slot watch now that we are inside
-                // the loop, so we catch the write that sets the bad selector
-                // during the loop rather than the pre-loop boot writes.
-                if (LoW == 1) {
-                    g_DispSlotAddr = g_PpcContext.Gpr[1] + 1608u;
-                    PpcDispSlotArm();
-                    Print(L"  DISPSLOT armed at %08x (r1=%08x)\n",
-                          g_DispSlotAddr, g_PpcContext.Gpr[1]);
                 }
             }
-            // The continue target, taken when code==0x0C. Never reached so far;
-            // probed so we learn where a correct exit leads.
+            // The continue target, taken when code==0x0C.
             if (Current == 0x40B1304Cu) {
-                Print(L"  CONT reached 0x40B1304C r7=%08x r31=%08x r1=%08x\n",
+                Print(L"  CONT reached 0x40B1304C r7=%08x r31=%08x r1=0x%08x\n",
                       g_PpcContext.Gpr[7], g_PpcContext.Gpr[31],
                       g_PpcContext.Gpr[1]);
             }
@@ -10266,17 +8784,6 @@ static const UINT32 Ranges[8][2] = {
         // from LR (the caller's return address) at 0x40B272F8; [KDP+0x904] holds
         // the same value once stored. The 'g' handler's optional context
         // re-save (0x40B27A90 -> Termination) shows up here as caller 0x40B27A94.
-        if (TermEntries < 60 && Current == 0x40B272F8) {
-            UINT32 Ewa = g_PpcContext.Spr[272];
-            UINT32 Kdp = CpuRead32(Ewa - 4);
-            UINT32 Caller = g_PpcContext.Gpr[29];
-            TermEntries++;
-            Print(L"  TERMENTRY[%d] PC=0x%08x caller=0x%08x%s r1=0x%08x r8=0x%08x r9=0x%08x r31=0x%08x KDP=0x%08x EWA=0x%08x\n",
-                  TermEntries, Current, Caller,
-                  (Caller == 0x40B27A94) ? L" (g re-save)" : L"",
-                  g_PpcContext.Gpr[1], g_PpcContext.Gpr[8], g_PpcContext.Gpr[9],
-                  g_PpcContext.Gpr[31], Kdp, Ewa);
-        }
         // Debugger-jump trampoline (0x40B1F380: b 0x40B272E0). Both allocator
         // failure checks converge here with live descriptors:
         //   site A 0x40B1F618 bltl after subf. r16,[r24+24]-[r31+24]
@@ -10309,20 +8816,6 @@ static const UINT32 Ranges[8][2] = {
         // Physical-map walker diagnostics:
         //  AREANEW: a fresh AREA gets its start stored (0x40B1F598).
         //  AREALOOK: overlap lookup result vs the new area (0x40B1F5FC).
-        if (AreaNewLogs < 24 && Current == 0x40B1F598u) {
-            AreaNewLogs++;
-            Print(L"  AREANEW[%d] area=0x%08x start=%08x size=%08x LR=0x%08x r26=%08x\n",
-                  AreaNewLogs, g_PpcContext.Gpr[31], g_PpcContext.Gpr[15],
-                  g_PpcContext.Gpr[16], g_PpcContext.Lr, g_PpcContext.Gpr[26]);
-        }
-        if (AreaLookupLogs < 24 && Current == 0x40B1F5FCu) {
-            UINT32 A31 = g_PpcContext.Gpr[31];
-            UINT32 A24 = g_PpcContext.Gpr[24];
-            AreaLookupLogs++;
-            Print(L"  AREALOOK[%d] new=0x%08x [%new+24]=%08x found=0x%08x [%fnd+24]=%08x [%fnd+28]=%08x\n",
-                  AreaLookupLogs, A31, CpuRead32(A31 + 0x24),
-                  A24, CpuRead32(A24 + 0x24), CpuRead32(A24 + 0x28));
-        }
         // Dump the raw stack range-table the walker consumes (r27 = r1+0x78,
         // entries are 8 bytes starting at r27+8).
         if (WalkTabDumps < 3 && Current == 0x40B1F40Cu) {
@@ -10343,11 +8836,6 @@ static const UINT32 Ranges[8][2] = {
             }
         }
         // Caller emit loop: r21 = phys cursor, r22 = pages remaining.
-        if (EmitLogs < 40 && Current == 0x40B12400u) {
-            EmitLogs++;
-            Print(L"  EMIT[%d] addr=%08x rem=%08x\n",
-                  EmitLogs, g_PpcContext.Gpr[21], g_PpcContext.Gpr[22]);
-        }
         // Auto-answer the nanodebugger wait loop: when the guest is spinning
         // with an empty SCC Rx FIFO, queue the same 'g' CR 'g' CR sequence the
         // host pre-queues for the first entry so the boot continues past each
@@ -10451,15 +8939,6 @@ static const UINT32 Ranges[8][2] = {
         }
         // INCLUDEPROBE: whether the guest returns from GETCH with a valid byte
         // (SCC base [r1-0x900] != 0) or bails with r8=-1 (base slot dead).
-        if (IncludelineProbes < 4 && Current == 0x40B268A0u) {
-            IncludelineProbes++;
-            Print(L"  INCLUDEPROBE[%d] GETCH base-slot check r28=0x%08x "
-                  L"([r1-0x900]) r1=0x%08x pend=%d head=%d tail=%d DEC=0x%08x\n",
-                  IncludelineProbes - 1, g_PpcContext.Gpr[28],
-                  g_PpcContext.Gpr[1], g_SccRxPending,
-                  g_SccRxFifoHead, g_SccRxFifoTail,
-                  (UINT32)g_PpcContext.Spr[SPR_DEC]);
-        }
         // GCBASEFIX: when the dr console's GETCH helper finds its SCC base
         // slot [r1-0x900] dead (0) yet the host has queued g bytes in the FIFO
         // (head != tail), re-seed the slot so the line accumulator can actually
@@ -10467,13 +8946,6 @@ static const UINT32 Ranges[8][2] = {
         // r8=-1 parks forever (the fixed head=16 tail=12 / pend=1 state).
         if (CpuRead32(g_PpcContext.Gpr[1] - 0x900) == 0 &&
             g_SccRxFifoHead != g_SccRxFifoTail) {
-            if (GcBaseFixes < 8 && Current == 0x40B268A0u) {
-                GcBaseFixes++;
-                Print(L"  GCBASEFIX[%d] r28=0x%08x r1=0x%08x -> seed [r1-0x900]=0x20000 "
-                      L"pend=%d head=%d tail=%d\n",
-                      GcBaseFixes, g_PpcContext.Gpr[28], g_PpcContext.Gpr[1],
-                      g_SccRxPending, g_SccRxFifoHead, g_SccRxFifoTail);
-            }
             CpuWrite32(g_PpcContext.Gpr[1] - 0x900, 0x20000u);
         }
         // EXTDUMP: one-shot disasm of the NK External (0x500) handler region
@@ -10567,25 +9039,8 @@ static const UINT32 Ranges[8][2] = {
                 UINTN I;
                 Print(L"  CR=0x%08x SRR0=0x%08x\n", g_PpcContext.Cr, g_PpcContext.Srr0);
                 for (I = 0; I < 32; I++) {
-                    UINT32 A = g_PpcContext.Gpr[I];
-                    if (I == 31 || I == 30 || I == 26 || I == 25 || I == 24) {
-                        UINT32 f8  = ((UINT32)g_ReadByte(A + 0x08) << 24) | ((UINT32)g_ReadByte(A + 0x09) << 16) | ((UINT32)g_ReadByte(A + 0x0A) << 8) | g_ReadByte(A + 0x0B);
-                        UINT32 f20 = ((UINT32)g_ReadByte(A + 0x20) << 24) | ((UINT32)g_ReadByte(A + 0x21) << 16) | ((UINT32)g_ReadByte(A + 0x22) << 8) | g_ReadByte(A + 0x23);
-                        UINT32 f24 = ((UINT32)g_ReadByte(A + 0x24) << 24) | ((UINT32)g_ReadByte(A + 0x25) << 16) | ((UINT32)g_ReadByte(A + 0x26) << 8) | g_ReadByte(A + 0x27);
-                        UINT32 f28 = ((UINT32)g_ReadByte(A + 0x28) << 24) | ((UINT32)g_ReadByte(A + 0x29) << 16) | ((UINT32)g_ReadByte(A + 0x2A) << 8) | g_ReadByte(A + 0x2B);
-                        UINT32 f30 = ((UINT32)g_ReadByte(A + 0x30) << 24) | ((UINT32)g_ReadByte(A + 0x31) << 16) | ((UINT32)g_ReadByte(A + 0x32) << 8) | g_ReadByte(A + 0x33);
-                        UINT32 f6c = ((UINT32)g_ReadByte(A + 0x6C) << 24) | ((UINT32)g_ReadByte(A + 0x6D) << 16) | ((UINT32)g_ReadByte(A + 0x6E) << 8) | g_ReadByte(A + 0x6F);
-                        Print(L"  R[%d]=0x%08x  f[8]=0x%08x f[20]=0x%08x f[24]=0x%08x f[28]=0x%08x f[30]=0x%08x f[6c]=0x%08x\n",
-                              I, A, f8, f20, f24, f28, f30, f6c);
-                    }
                 }
             }
-        }
-        if (Executed <= 200) {
-            CHAR16 Mn[16];
-            PpcDecodeInstruction(Instr, Mn, sizeof(Mn));
-            Print(L"  TRACE[%d] PC=0x%08x 0x%08x %s -> next 0x%08x\n",
-                  Executed, Current, Instr, Mn, Next);
         }
         // ---- DRAME lazy-translation cache miss (RAM-Rom boot) ----
         // The ROM's PPC DR-emulator dispatches each 68K word through a
@@ -10617,8 +9072,6 @@ static const UINT32 Ranges[8][2] = {
              (Current >= 0x01000000u && Current < 0x04000000u)) &&
             g_DrNativeHandoff != 0) {
             static UINTN CellMiss = 0;
-            static UINTN JitOps = 0;
-            static UINTN NextDiag = 0;
             static BOOLEAN FirstStateDumped = FALSE;
             UINT32 OpPc, PrePc;
             UINT32 CellBase;
@@ -10706,17 +9159,6 @@ static const UINT32 Ranges[8][2] = {
                     }
                 }
             }
-            if (CellMiss <= 64 || CellMiss >= NextDiag) {
-                Print(L"  CELLMISS[%u] @PPC=0x%08x inst=0x%08x lock=%u "
-                      L"68Kpc=0x%08x op=0x%04x r1=0x%08x r25=0x%08x "
-                      L"r30=0x%08x r31=0x%08x LR=0x%08x\n",
-                      (UINT32)CellMiss, Current, Instr, (UINT32)Executed,
-                      OpPc, M68kReadWord(OpPc),
-                      g_PpcContext.Gpr[1], g_PpcContext.Gpr[25],
-                      g_PpcContext.Gpr[30], g_PpcContext.Gpr[31],
-                      g_PpcContext.Lr);
-                NextDiag = CellMiss + 1024;
-            }
             if (CellMiss <= 400000) {
                 // Full-JIT lazy trampoline: execute the current 68K op in
                 // host C (which yields regs + memory), then SEED the empty
@@ -10739,24 +9181,10 @@ static const UINT32 Ranges[8][2] = {
                     0x480053D0u, 0x48005390u, 0x48005350u, 0x4800530Cu,
                     0x480052DCu };
                 UINT32 WI;
-                UINT64 M68kT0 = EmuHostRdtsc();
                 M68kSyncFromPPC ();
                 M68kExecuteInstruction ();
                 g_M68kContext.PC = PrePc;
                 M68kSyncToPPC ();
-                {
-                    UINT64 M68kDt = EmuHostRdtsc() - M68kT0;
-                    if (M68kDt > 200000000ull) {
-                        static UINT32 M68kHookLong = 0;
-                        if (M68kHookLong < 6) {
-                            Print(L"  M68KHOOKLONG[%u] ticks=%llu prePc=0x%08x r24=0x%08x op=0x%04x\n",
-                                  (UINT32)M68kHookLong, M68kDt, PrePc,
-                                  g_PpcContext.Gpr[24],
-                                  M68kReadWord(g_M68kContext.PC));
-                        }
-                        M68kHookLong++;
-                    }
-                }
                 for (WI = 0; WI < 512; WI++) {
                     g_WriteByte (CellBase + WI,
                                  PpcMmuReadByte (Src + WI));
@@ -10790,16 +9218,6 @@ static const UINT32 Ranges[8][2] = {
                         }
                     }
                 }
-                JitOps++;
-                if (JitOps <= 8 || (JitOps & 0x1FF) == 0) {
-                    Print(L"    JIT-OP[%u] -> cell=0x%08x walker seeded "
-                          L"pc=0x%08x sp=0x%08x sr=0x%04x\n",
-                          (UINT32)JitOps, CellBase,
-                          g_PpcContext.Gpr[24],
-                          g_M68kContext.Supervisor ? g_M68kContext.SSP
-                                                    : g_M68kContext.A[7],
-                          g_M68kContext.SR);
-                }
                 // Resume inside the fresh walker; its mtlr r29 / descent
                 // branches handle the 68K op and re-enter the ROM dispatch.
                 g_PpcContext.Pc = CellBase;
@@ -10827,7 +9245,6 @@ static const UINT32 Ranges[8][2] = {
             g_DrNativeHandoff != 0 &&
             Current >= 0x01000000u && Current < 0x04000000u) {
             static UINTN SteerCount = 0;
-            static UINTN SteerDiag = 0;
       
       
 // (inline shim)
@@ -10846,32 +9263,11 @@ static const UINT32 Ranges[8][2] = {
             // 24-bit LI relative to a 4-aligned branch address, so the shim
             // target is only exact when the walker sits at a word boundary.
             SteerBase = Current & (UINT32)~(UINTN)3u;
-            if (SteerCount <= 8 || SteerCount >= SteerDiag) {
-                Print(L"  STEER[%u] @PPC=0x%08x inst=0x%08x in-window "
-                      L"68Kpc=0x%08x op=0x%04x LR=0x%08x base=0x%08x\n",
-                      (UINT32)SteerCount, Current, Instr, SteerPc,
-                      M68kReadWord(SteerPc), g_PpcContext.Lr, SteerBase);
-                SteerDiag = SteerCount + 1024;
-            }
             if (SteerCount <= 200000) {
-                UINT64 SteerT0 = EmuHostRdtsc();
                 M68kSyncFromPPC ();
                 M68kExecuteInstruction ();
                 g_M68kContext.PC = SteerPc;
                 M68kSyncToPPC ();
-                {
-                    UINT64 SteerDt = EmuHostRdtsc() - SteerT0;
-                    if (SteerDt > 200000000ull) {
-                        static UINT32 SteerLong = 0;
-                        if (SteerLong < 6) {
-                            Print(L"  STEERLONG[%u] ticks=%llu prePc=0x%08x r24=0x%08x op=0x%04x\n",
-                                  (UINT32)SteerLong, SteerDt, SteerPc,
-                                  g_PpcContext.Gpr[24],
-                                  M68kReadWord(g_M68kContext.PC));
-                        }
-                        SteerLong++;
-                    }
-                }
                 for (WI = 0; WI < 512; WI++) {
                     g_WriteByte (SteerBase + WI,
                                  PpcMmuReadByte (SteerSrc + WI));
@@ -11051,73 +9447,15 @@ static const UINT32 Ranges[8][2] = {
                     (Next    >= 0x0000BD80u && Next    <= 0x0000BE80u);
                 if (InSellPhase != 0 &&
                     Pending == PPC_EXCEPTION_DECREMENTER) {
-                    static UINT32 DecDeferLogged = 0;
-                    if (DecDeferLogged < 6 && !g_BootDecGate) {
-                        DecDeferLogged++;
-                        Print(L"  DECDEFER Pending=0x%x Current=0x%08x r1=0x%08x DEC=0x%08x MSR=0x%08x\n",
-                              Pending, Current, g_PpcContext.Gpr[1],
-                              g_PpcContext.Spr[SPR_DEC], g_PpcContext.Msr);
-                    }
                     g_PpcContext.ExceptionPending = 0;
                     g_PpcContext.Pc = Next;
                     continue;
                 }
             }
             if (Pending == PPC_EXCEPTION_DECREMENTER && g_BootDecGate) {
-                static UINT32 DecDeferLogged = 0;
-                if (DecDeferLogged < 6 && !g_BootDecGate) {
-                    DecDeferLogged++;
-                    Print(L"  DECDEFER Pending=0x%x Current=0x%08x r1=0x%08x DEC=0x%08x MSR=0x%08x\n",
-                          Pending, Current, g_PpcContext.Gpr[1],
-                          g_PpcContext.Spr[SPR_DEC], g_PpcContext.Msr);
-                }
                 g_PpcContext.ExceptionPending = 0;
                 g_PpcContext.Pc = Next;
                 continue;
-            }
-            {
-                static UINTN XDeliv = 0;
-                XDeliv++;
-                if (XDeliv <= 40) {
-                    Print(L"  XDELIV[%u] Pending=0x%x (%s) Current=0x%08x Next=0x%08x "
-                          L"MSR EE=%u DEC=0x%08x MSR=0x%08x\n",
-                          (UINT32)XDeliv, Pending,
-                          Pending == PPC_EXCEPTION_DECREMENTER ? L"DEC" :
-                          Pending == PPC_EXCEPTION_TRAP       ? L"TRAP" :
-                          Pending == PPC_EXCEPTION_INTERRUPT  ? L"EXT"  : L"other",
-                          Current, Next,
-                          (g_PpcContext.Msr & PPC_MSR_EE) ? 1 : 0,
-                          g_PpcContext.Spr[SPR_DEC], g_PpcContext.Msr);
-                }
-            }
-            if (Pending == PPC_EXCEPTION_TRAP && TrapProbed < 30) {
-                UINT32 Tvt = g_PpcContext.Spr[275];
-                UINT32 Thnd = (Tvt != 0) ? CpuRead32(Tvt + ((0x700 >> 8) * 4)) : 0;
-                TrapProbed++;
-                Print(L"  TRAPDIS[%u]@PC=0x%08x Next=0x%08x r1=0x%08x r3=0x%08x r31=0x%08x "
-                      L"MSR=0x%08x SRR0=0x%08x SRR1=0x%08x\n",
-                      TrapProbed, Current, Next, g_PpcContext.Gpr[1], g_PpcContext.Gpr[3],
-                      g_PpcContext.Gpr[31], g_PpcContext.Msr,
-                      g_PpcContext.Srr0, g_PpcContext.Srr1);
-                Print(L"  TRAPDIS VecTbl=0x%08x handler700=0x%08x\n", Tvt, Thnd);
-                Print(L"  TRAPDIS SPRG0=0x%08x SPRG1=0x%08x SPRG2=0x%08x SPRG3=0x%08x "
-                      L"SPRG4=0x%08x vec0x700=0x%08x vec0x708=0x%08x vec0x7F0=0x%08x\n",
-                      g_PpcContext.Spr[272], g_PpcContext.Spr[273],
-                      g_PpcContext.Spr[274], g_PpcContext.Spr[275],
-                      g_PpcContext.Spr[276],
-                      CpuRead32(0x700), CpuRead32(0x708), CpuRead32(0x7F0));
-                Print(L"  TRAPDIS fault w=0x%08x @SRR0+4=0x%08x r10=0x%08x r11=0x%08x "
-                      L"r12=0x%08x r24(68Kpc)=0x%08x [r1+648]=0x%08x [r1+5F0]=0x%08x "
-                      L"r4=0x%08x r5=0x%08x r25=0x%08x r26=0x%08x LR=0x%08x CR=0x%08x\n",
-                      CpuRead32(g_PpcContext.Srr0),
-                      CpuRead32(g_PpcContext.Srr0 + 4),
-                      g_PpcContext.Gpr[10], g_PpcContext.Gpr[11],
-                      g_PpcContext.Gpr[12], g_PpcContext.Gpr[24],
-                      CpuRead32(g_PpcContext.Gpr[1] + 0x648),
-                      CpuRead32(g_PpcContext.Gpr[1] + 0x5F0),
-                      g_PpcContext.Gpr[4], g_PpcContext.Gpr[5],
-                      g_PpcContext.Gpr[25], g_PpcContext.Gpr[26],
-                      g_PpcContext.Lr, g_PpcContext.Cr);
             }
             if (Pending == PPC_EXCEPTION_TRAP &&
                 Current >= 0x40B6D000u && Current < 0x40B6E8C0u &&
@@ -11202,23 +9540,11 @@ for (W = 0x40B6D780u; W < 0x40B6D810u; W += 16) {
             // execute, not the just-executed one. Re-executing the rfi/mtmsr
             // that enabled EE would re-trigger the interrupt forever and the
             // interrupted boot-tail handoff would never resume.
-            UINT64 XT0 = EmuHostRdtsc();
             Status = PpcHandleException(Pending,
                                         (Pending == PPC_EXCEPTION_DECREMENTER ||
                                          Pending == PPC_EXCEPTION_INTERRUPT)
                                             ? Next
                                             : Current);
-            {
-                UINT64 XDt = EmuHostRdtsc() - XT0;
-                if (XDt > 200000000ull) {
-                    static UINT32 XDelivLong = 0;
-                    if (XDelivLong < 6) {
-                        Print(L"  XDELIVLONG[%u] Pending=0x%x ticks=%llu Current=0x%08x\n",
-                              (UINT32)XDelivLong, Pending, XDt, Current);
-                    }
-                    XDelivLong++;
-                }
-            }
             if (EFI_ERROR(Status)) {
                 *ExecutedCount = Executed;
                 return Status;
