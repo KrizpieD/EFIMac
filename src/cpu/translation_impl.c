@@ -3,6 +3,11 @@
 #include <efi.h>
 #include <efilib.h>
 
+// Separate from g_MsrTraceCount so the MSR-write trace keeps its full budget:
+// the idle `sc` raises thousands of identical 0xC00 entries per second and
+// would otherwise consume the whole cap before the interesting rfi happens.
+UINT32 g_ExcTraceCount = 0;
+
 // ---------------------------------------------------------------------------
 // Context initialization
 // ---------------------------------------------------------------------------
@@ -498,6 +503,11 @@ PpcExecuteTranslatedBlock (
     return PpcExecuteBlock(InstructionBlock, BlockSize / sizeof(UINT32), &Executed);
 }
 
+// Exception deliveries per vector bucket (see interpreter.h). Only the totals
+// matter for the stall hunt: they answer "did the guest ever receive the vector
+// it is waiting for" without a print per delivery.
+UINT32 g_VecCount[4];
+
 // Read a 32-bit big-endian word from guest memory through the interpreter's
 // active memory path (unmapped addresses read as zero).
 static UINT32
@@ -567,11 +577,33 @@ PpcHandleException (
     // cause bit. Without it SRR1 = MSR = 0x0000D032 has cr3.EQ clear and the
     // ROM routes a valid emulator KCall (index 0) to the fault/exception path
     // instead of KCallTbl[0] = 0x40B13BF8 (the DR-emulator entry).
-    g_PpcContext.Srr1 = g_PpcContext.Msr;
-    if (ExceptionType == PPC_EXCEPTION_TRAP) {
-        g_PpcContext.Srr1 |= 0x00020000u;  // SRR1[14]: program-exception "trap" cause
+    //
+    // `sc` is the one exception whose SRR1 the interpreter has already decided
+    // (case 17 in interpreter.c), and re-deriving it here as `MSR` would undo
+    // the nested-`sc` EE carry that keeps the NK idle sell alive: inside the
+    // decrementer handler MSR is 0x00001000 (EE clear) while the enclosing
+    // handler's SRR1 is 0x00009002 (EE set), and the soft-fn stub's `rfi` at
+    // 0xBE10 restores whatever SRR1 holds. So for SYSTEM_CALL leave SRR1 alone.
+    if (ExceptionType != PPC_EXCEPTION_SYSTEM_CALL) {
+        g_PpcContext.Srr1 = g_PpcContext.Msr;
+        if (ExceptionType == PPC_EXCEPTION_TRAP) {
+            g_PpcContext.Srr1 |= 0x00020000u;  // SRR1[14]: program-exception "trap" cause
+        }
     }
     g_PpcContext.Msr &= ~(PPC_MSR_EE | PPC_MSR_RI);
+
+    // Exception-entry tracer for the NK idle-sell deadlock. Prints the vector,
+    // the resulting SRR0/SRR1 pair, and the MSR that just got masked. SRR0/SRR1
+    // are plain context fields, not Spr[] slots (see the mfspr/mtspr cases),
+    // so they must be sampled directly. Counted separately from the MSR-write
+    // trace so its budget survives: the idle `sc` raises thousands of identical
+    // 0xC00 entries per second.
+    if (g_MsrTraceArmed && g_ExcTraceCount < 6) {
+        g_ExcTraceCount++;
+        Print(L"  EXC[%u] vect=0x%x SRR0=0x%08x SRR1=0x%08x Msr=0x%08x\n",
+              (UINT32)g_ExcTraceCount, Vector, g_PpcContext.Srr0,
+              g_PpcContext.Srr1, g_PpcContext.Msr);
+    }
 
     // On real hardware the low-memory vector area (0x100..0xFFF) holds small
     // stubs installed by the firmware before the Mac OS ROM boots. Each stub
@@ -625,11 +657,25 @@ PpcHandleException (
             g_PpcContext.Spr[274] = g_PpcContext.Lr;       // SPRG2 = user LR
             g_PpcContext.Gpr[1]   = g_PpcContext.Spr[272]; // r1 = KDP (SPRG0)
             g_PpcContext.Pc       = Handler;
-            Print(L"VECDISP vector=0x%x VecTbl=0x%x offset=0x%x handler=0x%x "
-                  L"SPRG1=0x%x SPRG2=0x%x SRR0=0x%x DEC=0x%x\n",
-                  Vector, VecTblBase, ((Vector >> 8) * 4), Handler,
-                  g_PpcContext.Spr[273], g_PpcContext.Spr[274],
-                  g_PpcContext.Srr0, g_PpcContext.Spr[22]);
+            // Per-vector delivery counters plus a rate-limited trace. The 16550
+            // path here is an emulated UART with a polling THRE wait, so a
+            // ~130-char line per interrupt costs far more wall-clock than the
+            // guest instructions it reports: printing every delivery throttled
+            // the guest to a few thousand instructions per second and hid
+            // everything the counters would have shown. Show the first few of
+            // each vector (so a new vector is never invisible), then every
+            // 4096th, and let the counters carry the totals.
+            g_VecCount[Vector >> 12]++;
+            if (g_VecCount[Vector >> 12] <= 4 ||
+                (g_VecCount[Vector >> 12] & 0xFFF) == 0) {
+                Print(L"VECDISP[%u] vector=0x%x VecTbl=0x%x offset=0x%x "
+                      L"handler=0x%x SPRG1=0x%x SPRG2=0x%x SRR0=0x%x "
+                      L"DEC=0x%x\n",
+                      (UINT32)g_VecCount[Vector >> 12], Vector, VecTblBase,
+                      ((Vector >> 8) * 4), Handler,
+                      g_PpcContext.Spr[273], g_PpcContext.Spr[274],
+                      g_PpcContext.Srr0, g_PpcContext.Spr[22]);
+            }
         } else {
             // No usable vector table / handler: keep the hardware PC behaviour
             // and execute whatever sits at the vector slot.

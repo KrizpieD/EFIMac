@@ -52,6 +52,20 @@ typedef struct {
 // Global CPU context
 extern PPC_CPU_CONTEXT g_PpcContext;
 
+// Exception deliveries per vector, indexed by (Vector >> 12): index 0 covers
+// 0x000-0xFFF (every PowerPC exception vector), index 1 the 0x1000+ range.
+// Diagnostic only -- the totals are what say whether the guest ever receives a
+// vector it needs, without printing one line per delivery.
+extern UINT32 g_VecCount[4];
+
+// Diagnostic arm for the MSR/SRR1 tracer (interpreter.c). Once the guest
+// reaches the NK idle spin loop, every MSR write and every exception entry is
+// logged so the instruction or nested exception that drops the external-enable
+// bit is identified instead of guessed.
+extern BOOLEAN g_MsrTraceArmed;
+extern UINT32  g_MsrTraceCount;
+extern UINT32  g_DecTraceCount;
+
 // Update a single 4-bit Condition Register field
 VOID
 PpcSetCrField (
