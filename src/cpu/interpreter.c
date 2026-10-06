@@ -1192,6 +1192,10 @@ static VOID   TaskStoreWatch(UINT32 A, UINT32 V, UINTN Bytes)
     // at 0x40B6D7D0 (`stw r24,2(r1)` with r1 == 0x9FF8 covers 0x9FFA..0x9FFD),
     // writing 68K data over the slot. Catch every overlapping access regardless
     // of width so the straddling store is attributed.
+    // The 68K supervisor stack must start below the NK's fixed structures so its
+    // downward growth cannot reach [KDP-4]=0x9FFC. Count writes per 256-byte
+    // page of 0x8000..0x9FC0 across the boot so a free span for the 68K SSP can
+    // be measured rather than assumed.
     if (A >= 0x00009FFAu && A <= 0x00009FFFu) {
         static UINT32 OverlapN = 0;
         if (OverlapN < 24) {
@@ -6647,7 +6651,23 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x1B7C0: GetQDGlobals "
             // reset vectors from low-memory [0]/[4] exactly like a 680x0 reset
             // (SSP, then the 68K initial PC from the boot-structure reset-field
             // we patched). Nothing in the NK flow installs them on this machine.
-            CpuWrite32(0x00000000, 0x0000A000);  // lowmem[0] 68K supervisor stack pointer
+            // The DR builds the 68K SSP and pushes it DOWNWARD (0x40B6D7CC
+            // `sthu r4,-8(r1)`, then 0x40B6D7D0 `stw r24,2(r1)` covering
+            // r1-6..r1-3). Seeding the SSP at 0xA000 put it exactly on top of the
+            // NK's own KDP frame, whose bottom word [KDP-4]=0x9FFC holds the
+            // current task r1. The first push therefore wrote 68K data across
+            // that slot (see TASKR1OVL), every task restore then loaded
+            // r1 = 0xAA0E0010, and the console flush helper's `blr` returned to
+            // PC 0. Give the 68K stack its own reserved region instead.
+            //
+            // 0xBE00 is chosen from measurement, not guesswork: a per-page write
+            // census of the first 256 KB across a full boot (LOWPAGES, printed on
+            // the first null branch) shows the NK/DR claim contiguous RAM from
+            // 0x0000 through 0xBE00, and that 0xBE00..0x10000 is never written.
+            // 0x10000 is left as headroom below the first OS-owned page, and the
+            // stack has 16 KB of room to grow down without reaching any NK
+            // structure.
+            CpuWrite32(0x00000000, 0x00010000);  // lowmem[0] 68K supervisor stack pointer
             CpuWrite32(0x00000004, 0x4080002A);  // lowmem[4] 68K reset PC (ROM entry)
             CpuWrite32(0x0000B2CC, 0x00000007);  // ECB+0x1CC interrupt pending
             CpuWrite32(0x0000B1FC, 0x40B6E964);  // ECB+0xFC DR start (secondary resume PC)
@@ -7834,7 +7854,7 @@ CpuRead32(0x00100000u),
                       (CpuRead16(Rpc) & 0xFFFF));
             }
         }
-        if (BootStepDumpDone == 0 &&
+        if (g_DrYieldSeen && BootStepDumpDone == 0 &&
             (BootStepIdx >= 1024u || (DrLowMarchProbed && BootStepIdx > 0))) {
             UINTN S;
             BootStepDumpDone = 1;
