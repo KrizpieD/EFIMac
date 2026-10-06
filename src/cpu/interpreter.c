@@ -9364,15 +9364,12 @@ static const UINT32 Ranges[8][2] = {
             if (Current == 0x40B27A70u) {
                 UINT32 R1 = g_PpcContext.Gpr[1];
                 if (R1 < 0x1000u || R1 >= 0x00040000u || (R1 >= 0x076E0u && R1 < 0x08000u)) {
-                    UINT32 S0 = CpuRead32(0x9FFC);
-                    UINT32 NewR1 = (S0 >= 0x8000u && S0 < 0x00A000u) ? S0 : 0x9000u;
                     static UINT32 R1FixGo = 0;
                     if (R1FixGo < 16) {
                         R1FixGo++;
-                        Print(L"  R1FIXGO[%d] @0x%08x r1=0x%08x->0x%08x S0=0x%08x\n",
-                              R1FixGo - 1, Current, R1, NewR1, S0);
+                        Print(L"  R1FIXGO[%d] @0x%08x r1=0x%08x (no longer patched)\n",
+                              R1FixGo - 1, Current, R1);
                     }
-                    g_PpcContext.Gpr[1] = NewR1;
                 }
             }
             CHAR16 Mn[16];

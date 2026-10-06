@@ -521,20 +521,6 @@ PpcReadGuestWord (
            ((UINT32)PpcReadGuestByte(Address + 3));
 }
 
-// Write a 32-bit big-endian word to guest memory through the interpreter's
-// active memory path (writes to unmapped pages are dropped).
-static VOID
-PpcWriteGuestWord (
-    IN UINT32 Address,
-    IN UINT32 Value
-    )
-{
-    PpcWriteGuestByte(Address,     (UINT8)(Value >> 24));
-    PpcWriteGuestByte(Address + 1, (UINT8)(Value >> 16));
-    PpcWriteGuestByte(Address + 2, (UINT8)(Value >> 8));
-    PpcWriteGuestByte(Address + 3, (UINT8)(Value));
-}
-
 EFI_STATUS
 EFIAPI
 PpcHandleException (
@@ -641,18 +627,38 @@ PpcHandleException (
             // r0,-3` at 0x40B14AC0) and stores it to [ECB+0x104] for the
             // dispatch table index.
             //
-            // The NanoKernel's InterruptSave called from the vector handlers
-            // (0x40B14700 -> bl 0x40B13D40) restores r7 from [KDP-0x10] and
-            // r1 from [KDP-0x4] at the END of the register save (lwz r7,-0x10
-            // (r1); lwz r1,-0x4(r1); bclr), so the firmware vector stub must
-            // have deposited the interrupted r7 and r1 into those KDP slots
-            // before the handler is entered. Without that deposit the handler
-            // resumes with whatever stale value occupied [SPRG0-4] (the DR
-            // swap's task_r1 slot, seeded to 0xA000 only at DR-boot), and e.g.
-            // a twi fault mid-boot resumes with r1 = a task pointer instead of
-            // the interrupted stack pointer. Mirror the stub deposits here.
-            PpcWriteGuestWord(g_PpcContext.Spr[272] - 0x04, g_PpcContext.Gpr[1]);  // [KDP-4]  = interrupted r1
-            PpcWriteGuestWord(g_PpcContext.Spr[272] - 0x10, g_PpcContext.Gpr[7]);  // [KDP-0x10] = interrupted r7
+            // The NanoKernel's InterruptSave (reached from the vector handlers
+            // 0x40B14700 -> bl 0x40B13D40) finishes with
+            //   lwz r7,-0x10(r1); lwz r1,-0x4(r1); bclr
+            // using r1 == KDP, i.e. [KDP-0x10] and [KDP-0x4] = [0x9FF0] and
+            // [0x9FFC].
+            //
+            // Those two words are NOT scratch space the emulator may own.
+            // Disassembly shows 0x40B1FBF0 builds an ordinary NK stack frame off
+            // KDP:
+            //   0x40B1FBF0  mfspr r9,0x110        ; r9 = KDP
+            //   0x40B1FBF4  stw   r16,-0x40(r9)    ; [0x9FC0] = saved LR
+            //   0x40B1FBF8  stmw  r25,-0x3c(r9)    ; [0x9FE4..0x9FFC] = r25..r31
+            // so [0x9FFC] is the top word of that live frame (saved r31) and
+            // [0x9FF0] sits inside it.
+            //
+            // Overwriting [KDP-0x4] on every vector delivery therefore destroys a
+            // saved register of whatever NK function was interrupted. That single
+            // clobber is the root cause of the whole "debugger frame" saga:
+            //   - the exception-return epilogue at 0x40B28828 begins
+            //     `lwz r1,-4(r1)` and reloads f0..f31 from 0x800(r1) and the GPRs
+            //     from `lmw`, so a clobbered [r1-4] pops a bogus back-chain;
+            //   - the bad back-chain made the frame pointer land at 0x77E0,
+            //     inside the console output ring at 0x77D8/0x77DC, so
+            //     [r1-4] then read the ring's own live counters;
+            //   - restoring from that frame loaded ring values into r28..r31 and
+            //     CTR, which is the `BDRIFT` signature (all four == 0x40B14A20),
+            //     and sent `blr` to PC=0.
+            //
+            // Keep the interrupted context in emulator-side storage instead of
+            // guest RAM. SPRG1/SPRG2 still carry interrupted r1/LR per the real
+            // LoadInterruptRegisters contract, and r1 = KDP is what the NK
+            // expects on entry.
             g_PpcContext.Spr[273] = g_PpcContext.Gpr[1];   // SPRG1 = user r1
             g_PpcContext.Spr[274] = g_PpcContext.Lr;       // SPRG2 = user LR
             g_PpcContext.Gpr[1]   = g_PpcContext.Spr[272]; // r1 = KDP (SPRG0)
