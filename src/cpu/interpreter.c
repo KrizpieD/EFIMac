@@ -786,6 +786,9 @@ static PPC_CPU_WRITE_MEMORY g_WriteByte = PpcMmuWriteByte;
 // is simply not covering this region -- record a write count and first writer
 // for every 4 KB page of the first 128 KB.
 UINT32 g_LowPageWrites[LOW_CENSUS_PAGES];
+// Set once DRBOOT-RESUME has seeded the 0x700 swap chain, so the low-RAM
+// census only reports writers that race our seed.
+static UINT32 g_SeedSwapChainDone = 0;
 UINT32 g_LowPageFirstPc[LOW_CENSUS_PAGES];
 UINT32 g_LowPageFirstAddr[LOW_CENSUS_PAGES];
 UINT8  g_LowPageSeen[LOW_CENSUS_PAGES];
@@ -808,6 +811,28 @@ LowRamCensus (
     Pg = A >> 12;
     if (g_LowPageWrites[Pg] != 0xFFFFFFFFu) {
         g_LowPageWrites[Pg]++;
+    }
+    if (A >= 0x9600u && A < 0x9720u) {
+        static UINTN PqW = 0;
+        if (V != 0) {
+            if (PqW < 40) {
+                PqW++;
+                Print(L"  PQW[%u] [0x%08x]<-0x%08x by PC=0x%08x\n",
+                      PqW, A, V, Pc);
+            }
+        }
+    }
+    // [0xA658] is [task_r1+0x658], the "next context" link the 0x700 task swap
+    // follows. It lives inside the NK stack frame at KDP=0xA000, so the NK may
+    // recycle it at any time. Name the writer that clears it after our
+    // DRBOOT-RESUME seed, since a null there makes the NK's own rfi tail at
+    // 0x40B244D8 load SRR0=0 and jump to PC 0.
+    if (A == 0x0000A658u && g_SeedSwapChainDone) {
+        static UINTN Sw = 0;
+        if (Sw < 16) {
+            Sw++;
+            Print(L"  SWAPW[%u] [0xA658]<-0x%08x by PC=0x%08x\n", Sw, V, Pc);
+        }
     }
     if (g_LowPageSeen[Pg] == 0) {
         g_LowPageSeen[Pg] = 1;
@@ -987,6 +1012,7 @@ static VOID   CpuWrite16(UINT32 A, UINT32 V) { g_WriteByte(A, (UINT8)(V >> 8)); 
 static UINT32 g_DrBootPcSeeded  = 0;
 static UINT32 Srr0Bad = 0;
 static UINT32 TaskR1Writes = 0;
+static UINT32 FlushR1Writes = 0;
 static UINT32 BcWrites = 0;
 // DR-HANDOFF GATE: verified load-bearing. With this 0 the guest stops at ~18s,
 // before the NK reaches its console at all, so the 68K ROM handoff really is
@@ -1139,12 +1165,42 @@ static VOID   TaskStoreWatch(UINT32 A, UINT32 V, UINTN Bytes)
               BcWrites - 1, A, V, g_PpcContext.Pc, g_PpcContext.Pc,
               g_PpcContext.Gpr[1], g_PpcContext.Gpr[3], g_PpcContext.Gpr[4]);
     }
+    // The flush helper at 0x40B28A98 opens with
+    //   stw   r14,-0x3f0(r1)   ; save LR for the epilogue's mtlr r14
+    //   mtspr 0x113, r26
+    // and closes with `mtlr r14 ; blr`. With r1 == KDP == 0xA000 the save slot
+    // is [0x9FC0] -- the first word of the KDP frame, i.e. the same saved-r1
+    // slot the NK uses at [0x9FFC] one frame down. Trace every word write to
+    // [0x9FC0] and who zeroes it, since a lost LR here makes the NK return to
+    // PC 0 and die on the first reserved opcode.
+    if (A == 0x00009FC0u && FlushR1Writes < 16) {
+        FlushR1Writes++;
+        Print(L"  FLUSHR1[%d] [0x9FC0]<-0x%08x by PC=0x%08x w=0x%08x "
+              L"r1=0x%08x r14=0x%08x\n",
+              FlushR1Writes - 1, V, g_PpcContext.Pc, g_PpcContext.Pc,
+              g_PpcContext.Gpr[1], g_PpcContext.Gpr[14] & 0xFFFFFFFFu);
+    }
     if (A == 0x00009FFC && TaskR1Writes < 16) {
         TaskR1Writes++;
         Print(L"  TASKR1W[%d] [0x9FFC]<-0x%08x by PC=0x%08x r1=0x%08x "
               L"r31=0x%08x r2=0x%08x r3=0x%08x\n",
               TaskR1Writes - 1, V, g_PpcContext.Pc, g_PpcContext.Gpr[1],
               g_PpcContext.Gpr[31], g_PpcContext.Gpr[2], g_PpcContext.Gpr[3]);
+    }
+    // [0x9FFC] is a WORD slot, so a store that only overlaps its low bytes can
+    // corrupt it while evading this word-aligned probe. The DR does exactly that
+    // at 0x40B6D7D0 (`stw r24,2(r1)` with r1 == 0x9FF8 covers 0x9FFA..0x9FFD),
+    // writing 68K data over the slot. Catch every overlapping access regardless
+    // of width so the straddling store is attributed.
+    if (A >= 0x00009FFAu && A <= 0x00009FFFu) {
+        static UINT32 OverlapN = 0;
+        if (OverlapN < 24) {
+            OverlapN++;
+            Print(L"  TASKR1OVL[%u] [0x%08x] w=%u <-0x%08x by PC=0x%08x "
+                  L"r1=0x%08x\n",
+                  OverlapN - 1, A, (A & 1u) ? 2u : 1u, V,
+                  g_PpcContext.Pc, g_PpcContext.Gpr[1] & 0xFFFFFFFFu);
+        }
     }
 }
 static VOID   CpuWrite32(UINT32 A, UINT32 V)
@@ -3553,6 +3609,7 @@ PpcExecuteInstruction (
     UINT32 Op = OP(w);
     UINT32 Next = CurrentAddress + 4;
     static UINT32 HandoffDumped = 0;
+    static UINT32 NullBranchN = 0;
     if (NextAddress == NULL) {
         return EFI_INVALID_PARAMETER;
     }
@@ -3791,7 +3848,8 @@ PpcExecuteInstruction (
                     // in the ECB's Handler-return slot to resume the emulator.
                     CpuWrite32(0x00009FFC, 0x0000A000);  // [SPRG0-4] task r1 (68K SSP)
                     CpuWrite32(0x0000A658, 0x0000B100);  // [task_r1+0x658] next ctx = ECB
-                    CpuWrite32(0x0000B204, 0x40B67B60);  // ECB+0x104 HandlerReturn = DR dispatch
+CpuWrite32(0x0000B204, 0x40B67B60);  // ECB+0x104 HandlerReturn = DR dispatch
+                    g_SeedSwapChainDone = 1;
                     // Seed the NK's saved-decrementer slot. 0x40B13234 does
                     //   lwz r8,-0x9d4(r1) ; mtspr DEC,r8
                     // with r1 == KDP == 0xA000, i.e. it reloads DEC from
@@ -5204,6 +5262,20 @@ g_DrA207Land = 0;
     default:
         return EFI_UNSUPPORTED;
     }
+    // A branch to physical 0 from non-zero code is always a bug in guest state:
+    // the NK's `blr` returns to whatever its saved LR slot held. Catch the exact
+    // instruction that produced it instead of only seeing the "reserved" fault
+    // at PC 0, and name the register that carried the null target.
+    if (Next == 0u && CurrentAddress != 0u && NullBranchN < 8) {
+        NullBranchN++;
+        Print(L"  NULLBRANCH[%u] 0x%08x -> 0 at PC=0x%08x LR=0x%08x CTR=0x%08x "
+              L"r1=0x%08x r3=0x%08x r4=0x%08x r5=0x%08x r6=0x%08x r7=0x%08x\n",
+              NullBranchN - 1, Instruction, CurrentAddress, g_PpcContext.Lr,
+              g_PpcContext.Ctr, g_PpcContext.Gpr[1] & 0xFFFFFFFFu,
+              g_PpcContext.Gpr[3] & 0xFFFFFFFFu, g_PpcContext.Gpr[4] & 0xFFFFFFFFu,
+              g_PpcContext.Gpr[5] & 0xFFFFFFFFu, g_PpcContext.Gpr[6] & 0xFFFFFFFFu,
+              g_PpcContext.Gpr[7] & 0xFFFFFFFFu);
+    }
     *NextAddress = Next;
     return EFI_SUCCESS;
 }
@@ -5304,6 +5376,9 @@ PpcRunGuest (
     static UINT32 StoreProbed = 0;
     static UINT32 RamProbed = 0;
     static UINT32 HelperDumped = 0;
+    static UINT32 BadR1N = 0;
+static UINT32 FlushFirstBad = 0;
+    static UINT32 FlushSlotN = 0;
     static UINT32 DbgJumpDumps = 0;
     static UINT32 WalkTabDumps = 0;
     static UINT32 PcBootProcLockWord = 0;
@@ -6763,9 +6838,83 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x1B7C0: GetQDGlobals "
         // whether the SCC base was never loaded (candidate: PSA NoIdeaR23 at
         // [KDP-0x900], the SCC base `prints` reads via `lwz r28,-0x900(r1)`).
         // Dump the flush helper body once so we can see how it sets r28/CR.
+// The flush helper saves LR at 0x40B28AA4 (`stw r14,-0x3f0(r1)`) and reloads
+        // it at 0x40B28BF0 (`lwz r14,-0x3f0(r1)`) before `mtlr r14; blr`. With
+        // r1 == KDP == 0xA000 that slot is [0x9FC0], which the exception-frame
+        // builder at 0x40B1FBF0 also writes (`stw r16,-0x40(r9)` with r9=SPRG1).
+        // If the builder runs between the save and the reload the NK's LR is
+        // silently replaced and its `blr` returns to the wrong address. Log both
+        // ends of the round trip so the overwrite is visible.
+        if ((Current == 0x40B28AA4 || Current == 0x40B28BF0) && FlushSlotN < 24) {
+            FlushSlotN++;
+            Print(L"  FLUSHSLOT[%u] %s r1=0x%08x r14=0x%08x [r1-0x3f0]=0x%08x\n",
+                  FlushSlotN - 1,
+                  (Current == 0x40B28AA4) ? L"save" : L"restore",
+                  g_PpcContext.Gpr[1] & 0xFFFFFFFFu,
+                  g_PpcContext.Gpr[14] & 0xFFFFFFFFu,
+                  CpuRead32(g_PpcContext.Gpr[1] - 0x3f0));
+        }
+        // The flush helper at 0x40B28A98 must be entered with r1 == KDP == 0xA000: its
+        // prologue `stw r14,-0x3f0(r1)` / `stmw r2,-0x3e8(r1)` write into the NK
+        // frame, and the epilogue reads LR back from [r1-0x3f0]. A first
+        // non-KDP entry means the NK stack pointer itself is already corrupt, so
+        // report the transition once with the value's provenance.
+        // The DR builds the 68K SSP from r1, then pushes it DOWNWARD at 0x40B6D7CC
+    // (`sthu r4,-8(r1)`) followed by 0x40B6D7D0 (`stw r24,2(r1)`) and
+    // 0x40B6D7DC (`sth r6,6(r1)`). If r1 is still the NK KDP (0xA000) at the
+    // sthu, that frame lands at 0x9FF0..0x9FFF and its `stw r24,2(r1)` covers
+    // 0x9FFA..0x9FFD -- which straddles the [KDP-4]=0x9FFC task-r1 slot and turns
+    // it into 68K data (0xAA0E0010). Every later task restore then loads
+    // r1 = 0xAA0E0010, the `blr` at 0x40B28C04 returns to PC 0, and the guest
+    // dies on a reserved opcode. r1 must already be the 68K SSP on entry, so
+    // show where it is loaded from.
+    if (Current == 0x40B6D7B0 || Current == 0x40B6D7B4 ||
+            Current == 0x40B6D7CC || Current == 0x40B6D7D0) {
+            static UINT32 SspSrcN = 0;
+            if (SspSrcN < 16) {
+                SspSrcN++;
+                Print(L"  SSPSRC[%u] PC=0x%08x r1=0x%08x r24=0x%08x r31=0x%08x "
+                      L"[+0x48]=0x%08x [+0x4c]=0x%08x [+0x50]=0x%08x r4=0x%08x\n",
+                      SspSrcN - 1, Current,
+                      g_PpcContext.Gpr[1] & 0xFFFFFFFFu,
+                      g_PpcContext.Gpr[24] & 0xFFFFFFFFu,
+                      g_PpcContext.Gpr[31] & 0xFFFFFFFFu,
+                      CpuRead32((g_PpcContext.Gpr[31] & 0xFFFFFFFFu) + 0x48),
+                      CpuRead32((g_PpcContext.Gpr[31] & 0xFFFFFFFFu) + 0x4c),
+                      CpuRead32((g_PpcContext.Gpr[31] & 0xFFFFFFFFu) + 0x50),
+                      g_PpcContext.Gpr[4] & 0xFFFFFFFFu);
+            }
+        }
+        if (Current == 0x40B28A98) {
+            UINT32 R1 = g_PpcContext.Gpr[1] & 0xFFFFFFFFu;
+            if (R1 != 0x0000A000u && FlushFirstBad == 0) {
+                FlushFirstBad = R1;
+                Print(L"  FLUSHFIRSTBAD entry 0x40B28A98 r1=0x%08x LR=0x%08x "
+                      L"CTR=0x%08x SPRG1=0x%08x SPRG2=0x%08x [0x9FFC]=0x%08x\n",
+                      R1, g_PpcContext.Lr, g_PpcContext.Ctr,
+                      g_PpcContext.Spr[273] & 0xFFFFFFFFu,
+                      g_PpcContext.Spr[274] & 0xFFFFFFFFu,
+                      CpuRead32(0x9FFC));
+            }
+            if ((R1 < 0x00009000u || R1 > 0x0000C000u) && BadR1N < 8) {
+                BadR1N++;
+                Print(L"  FLUSHBADR1[%u] entry 0x40B28A98 r1=0x%08x LR=0x%08x "
+                      L"CTR=0x%08x caller?\n",
+                      BadR1N - 1, R1, g_PpcContext.Lr, g_PpcContext.Ctr);
+            }
+        }
         if (HelperDumped == 0 && Current == 0x40B28A98) {
-            UINT32 A;
-            HelperDumped = 1;
+                UINT32 A;
+                HelperDumped = 1;
+                // The caller at 0x40B264D8 is a `bl`, so LR must be 0x40B264DC
+                // on entry. The epilogue reloads LR from [r1-0x3f0] and `blr`s;
+                // if that slot reads 0 the NK returns to PC 0 and dies on the
+                // first reserved opcode. Show LR, r1 and the saved slot.
+                Print(L"  FLUSHENTRY LR=0x%08x r1=0x%08x [r1-0x3f0]=0x%08x "
+                      L"[r1-0x3e8]=0x%08x\n",
+                      g_PpcContext.Lr, g_PpcContext.Gpr[1] & 0xFFFFFFFFu,
+                      CpuRead32(g_PpcContext.Gpr[1] - 0x3f0),
+                      CpuRead32(g_PpcContext.Gpr[1] - 0x3e8));
             Print(L"  FLUSHHELPER dump 0x40B28A74..0x40B28C00:\n");
             for (A = 0x40B28A74; A < 0x40B28C00; A += 16) {
                 Print(L"    0x%08x: %08x %08x %08x %08x\n",
