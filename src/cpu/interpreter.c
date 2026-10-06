@@ -3792,6 +3792,22 @@ PpcExecuteInstruction (
                     CpuWrite32(0x00009FFC, 0x0000A000);  // [SPRG0-4] task r1 (68K SSP)
                     CpuWrite32(0x0000A658, 0x0000B100);  // [task_r1+0x658] next ctx = ECB
                     CpuWrite32(0x0000B204, 0x40B67B60);  // ECB+0x104 HandlerReturn = DR dispatch
+                    // Seed the NK's saved-decrementer slot. 0x40B13234 does
+                    //   lwz r8,-0x9d4(r1) ; mtspr DEC,r8
+                    // with r1 == KDP == 0xA000, i.e. it reloads DEC from
+                    // [0x962C]. That word is only ever written by the timer path
+                    // at 0x40B230D4/0x40B230DC, which runs after
+                    // 0x40B24A98 has already returned early via its `bltlr` at
+                    // 0x40B24AA8 (that routine sets r8=0 and exits when
+                    // [r1+0x658] has no queue element). With the slot left at its
+                    // guard-fill value of 0 the NK therefore executes
+                    // `mtspr DEC,0`, which disables the decrementer outright:
+                    // no 0x900 ever arrives, the idle sell never expires, and
+                    // the NK livelocks re-rfi'ing the same DR dispatch
+                    // (SRR0=0x40B67B60) forever. Seed a normal tick interval so
+                    // the NK re-arms DEC as a positive count down to zero rather
+                    // than parking it at 0.
+                    CpuWrite32(0x0000962C, 0x01000000);  // [KDP-0x9d4] saved DEC interval
                     // Park DEC positive so the handoff rfi (EE already on,
                     // DEC left negative by the pre-DRB boot) doesn't fire an
                     // immediate 0x900 on the first DR-start instruction and let
@@ -4969,6 +4985,43 @@ g_DrA207Land = 0;
                                   L"@PC=0x%08x LR=0x%08x r1=0x%08x\n",
                                   Srr0Bad - 1, Value, RS(w), CurrentAddress,
                                   g_PpcContext.Lr, g_PpcContext.Gpr[1]);
+                            // The 0x700 task-swap return path (0x40B244D0) restores
+                            // r1 from SPRG1 and mtspr's SRR0 from r10, which must
+                            // be the chosen task's resume PC. If r10 is null the
+                            // following rfi jumps to 0 and the guest dies on the
+                            // first reserved opcode. Dump the queue head and the
+                            // candidate TCBs so the bad record is identifiable:
+                            // the class-3 head lives at KDP-0x988 == 0x9678 and
+                            // each TCB links +8 (next) / +0xC (prev).
+                            {
+                                UINT32 T;
+                                Print(L"  SRR0BAD q[0x9678]=0x%08x q[0x9690]=0x%08x "
+                                      L"r10=0x%08x r12=0x%08x\n",
+                                      CpuRead32(0x9678), CpuRead32(0x9690),
+                                      g_PpcContext.Gpr[10] & 0xFFFFFFFFu,
+                                      g_PpcContext.Gpr[12] & 0xFFFFFFFFu);
+                                // The 0x700 swap chain is
+                                //   task_r1 = [0x9FFC]; next = [task_r1+0x658];
+                                //   SRR0 = next[0x104]; LR = next[0x100].
+                                // If any link is clobbered the NK's own rfi tail
+                                // at 0x40B244D0 gets a null resume pair. Show
+                                // every link so the break is identifiable.
+                                Print(L"  SRR0BAD chain [0x9FFC]=0x%08x "
+                                      L"[0xA658]=0x%08x [next+0x100]=0x%08x "
+                                      L"[next+0x104]=0x%08x\n",
+                                      CpuRead32(0x9FFC), CpuRead32(0xA658),
+                                      CpuRead32(CpuRead32(0xA658) + 0x100),
+                                      CpuRead32(CpuRead32(0xA658) + 0x104));
+                                T = CpuRead32(0x9678);
+                                if (T > 0x1000u && T < 0x0000B000u) {
+                                    Print(L"  SRR0BAD tcb@0x%08x:\n", T);
+                                    for (UINTN D = 0; D < 0x60; D += 16) {
+                                        Print(L"    +0x%02x 0x%08x 0x%08x 0x%08x 0x%08x\n",
+                                              D, CpuRead32(T + D), CpuRead32(T + D + 4),
+                                              CpuRead32(T + D + 8), CpuRead32(T + D + 12));
+                                    }
+                                }
+                            }
                         }
                         g_PpcContext.Srr0 = Value;
                         break;
