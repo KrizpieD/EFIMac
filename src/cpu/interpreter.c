@@ -1027,7 +1027,7 @@ static UINT32 g_MkrdyAny = 0;     // branches landing anywhere in 0x40B22D40..48
 // (ROM handler region, low RAM, System fork, DR gd/tv tables). Those dumps add
 // ~2000 lines to the log; set to 0 for clean soak runs. The brief per-site
 // header lines and all state-changing probes remain active either way.
-#define PPC_DR_FULL_DUMPS 1
+#define PPC_DR_FULL_DUMPS 0
 // DEC preemption gate during the boot critical section: once the 68K emulator
 // genuinely starts its first DR dispatch, the NK may preempt it on the
 // decrementer tick like real hardware. File scope so both the rfi bootstrap
@@ -3617,6 +3617,29 @@ PpcExecuteInstruction (
     if (NextAddress == NULL) {
         return EFI_INVALID_PARAMETER;
     }
+    // ---- DIAGSTUB: break the System-fork epilogue self-loop @0x100000 ----
+    // The System data fork is mirrored into low RAM, so the ROM glue's diag
+    // target 0x100000 lands in fork bytes that decode as a leaf epilogue:
+    //   0x100000 lwz r0,8(r1) / 0x100004 mtlr r0
+    //   0x100008 lwz r31,-4(r1) / 0x10000C blr
+    // and [r1+8] holds 0x100000 itself, so the stub blr's to itself forever.
+    // Intercept at the instruction level (fires from any dispatch loop) and
+    // resume the ROM's common 68K DR dispatch instead. One-shot.
+    if (CurrentAddress >= 0x00100000u && CurrentAddress < 0x00100010u) {
+        static UINT32 DiagStubExec = 0;
+        if (DiagStubExec < 4) {
+            DiagStubExec++;
+            Print(L"  DIAGSTUB-EXEC[%u] @0x%08x Instr=0x%08x LR=0x%08x "
+                  L"r1=0x%08x [r1+8]=0x%08x -> 0x40B67C60\n",
+                  DiagStubExec, CurrentAddress, w,
+                  g_PpcContext.Lr, g_PpcContext.Gpr[1],
+                  CpuRead32((g_PpcContext.Gpr[1] & 0xFFFFFFFFu) + 8u));
+        }
+        g_PpcContext.Lr = 0x40B67C60u;
+        g_PpcContext.Pc = 0x40B67C60u;
+        *NextAddress = 0x40B67C60u;
+        return EFI_SUCCESS;
+    }
     // All floating-point instructions (opcodes 48-55, 59, 63) require MSR[FP].
     // With the bit clear the FP-unavailable exception is raised (vector 0x800);
     // the OS handler sets MSR[FP] and re-executes. The reserved FP opcodes
@@ -5466,6 +5489,51 @@ static UINT32 RegSyscallSeen = 0;
         UINT32 Current;
         UINT32 Instr = CpuRead32(g_PpcContext.Pc);
         Current = g_PpcContext.Pc;
+        {
+            static UINT32 P2PrevPc = 0;
+            static UINT32 P2First = 0;
+            if (g_DrNativeHandoff != 0 && P2First == 0 &&
+                Current >= 0x00100000u && Current < 0x00101000u) {
+                P2First = 1;
+                Print(L"  P2AT100000 first entry: PPC=0x%08x prev=0x%08x "
+                      L"LR=0x%08x r0=0x%08x r1=0x%08x r3=0x%08x "
+                      L"[r1+8]=0x%08x [r1+0]=0x%08x [r1-4]=0x%08x CTR=0x%08x "
+                      L"r24=0x%08x\n",
+                      Current, P2PrevPc, g_PpcContext.Lr, g_PpcContext.Gpr[0],
+                      g_PpcContext.Gpr[1], g_PpcContext.Gpr[3],
+                      CpuRead32(g_PpcContext.Gpr[1] + 8),
+                      CpuRead32(g_PpcContext.Gpr[1]),
+                      CpuRead32(g_PpcContext.Gpr[1] - 4u),
+                      g_PpcContext.Ctr, g_PpcContext.Gpr[24]);
+            }
+            P2PrevPc = Current;
+        }
+        // ---- DIAGSTUB: break the System-fork diag-stub self-loop @0x100000 ----
+        // The System data fork is mirrored into low RAM (0x96000..0x2A2B0A), so
+        // the ROM glue's diag target 0x100000 lands in the fork bytes there.
+        // Those bytes decode as a leaf epilogue:
+        //   0x100000 lwz r0,8(r1) / 0x100004 mtlr r0
+        //   0x100008 lwz r31,-4(r1) / 0x10000C blr
+        // The return slot [r1+8] still holds 0x100000 itself, so the stub blr's
+        // to itself forever (PC=0x100008, LR=0x100000). A real boot resumes the
+        // ROM's common 68K DR dispatch loop instead, so redirect the first
+        // arrival there. One-shot; must run before the stub executes.
+        {
+            static UINT32 DiagStubIntercepted = 0;
+            if (DiagStubIntercepted == 0 &&
+                Current >= 0x00100000u && Current < 0x00100010u) {
+                DiagStubIntercepted = 1;
+                Print(L"  DIAGSTUB-ENTER Current=0x%08x handoff=%u steer=%u "
+                      L"r1=0x%08x LR=0x%08x [r1+8]=0x%08x -> 0x40B67C60\n",
+                      Current, g_DrNativeHandoff, g_DrNativeSteer,
+                      g_PpcContext.Gpr[1], g_PpcContext.Lr,
+                      CpuRead32((g_PpcContext.Gpr[1] & 0xFFFFFFFFu) + 8u));
+                g_PpcContext.Lr = 0x40B67C60u;
+                g_PpcContext.Pc = 0x40B67C60u;
+                continue;
+            }
+        }
+        // (session scaffold removed)
         // ---- WEDGE watchdog: post-Fix-B the guest parks DEC at 0x7FFFFFFF,
         // clears EE and idles in the 0x40B264xx/0x40B265CC wait loop with no
         // interrupt to wake it. The interpreter then stops committing entirely
@@ -5764,6 +5832,27 @@ if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 48) {
         // permanently (the staged bootstrap runs as plain PPC from here on).
         {
             UINT32 Pc24 = g_PpcContext.Gpr[24] & 0xFFFFFFFF;
+            // PATH 2 terminal handoff (real boot-image handoff):
+            // Unlike PATH 1 (the OSINLOW stub loop, steered to 0x1B823 by the
+            // tail-A207 redirect below), the ROM's OWN PDEF bootstrap runs to
+            // completion and terminates by popping the fork's diag target
+            // 0x100000 and executing `jmp (a0)` into it (68K 0x408773C0:
+            // `movea.l (a7)+,a0` ... `jmp (a0)`). The fork image at 0x100000
+            // is the raw System data-fork (PPC) bytes, so the 68K DR would
+            // 68K-fetch it and GUEST STOP at PC 0x100002. That jump is the
+            // ROM asking for the real OS bootstrap, so route it into the same
+            // staged System native bootstrap (0x1B823) the PATH 1 steer uses;
+            // the handoff block below then loads the real PEF fragment and
+            // leaves the DR permanently for native PPC.
+            if (g_DrNativeHandoff == 0 && g_DrNativeSteer == 0 &&
+                Pc24 >= 0x00100000u && Pc24 < 0x00101000u) {
+                g_DrNativeSteer = 1;
+                Pc24 = 0x0001B823u;
+                g_PpcContext.Gpr[24] = Pc24;
+                Print(L"  PATH2-HANDOFF 68K diag jump 0x100000 -> staged native "
+                      L"bootstrap 0x1B823 (exec=%u PPC=0x%08x)\n",
+                      (UINT32)Executed, Current);
+            }
             if (g_DrNativeHandoff == 0 && g_DrNativeSteer != 0 &&
                 Pc24 >= 0x0001B000u && Pc24 < 0x0001C000u) {
                 // Resume at the fork's FUNCTION ENTRY (0x1B7C0), not the
@@ -6147,6 +6236,45 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x1B7C0: GetQDGlobals "
                     }
                 }
                 R1Prev = R1Now;
+            }
+        }
+        // A0TRACE: name the instruction that sets 68K A0 (PPC r16) to the
+        // bogus 0x100000 that the JMP (A0) dispatch at 0x40BA7680 then
+        // loads into r24. Ring-holds the last 8 r16 writes so the writer and
+        // its recent predecessors are visible.
+        {
+            static UINT32 A0Prev = 0;
+            static UINT32 A0RingN = 0;
+            static UINT32 A0RingPc[8];
+            static UINT32 A0RingOld[8];
+            static UINT32 A0RingNew[8];
+            UINT32 A0Now = (UINT32)(g_PpcContext.Gpr[16] & 0xFFFFFFFFu);
+            if (A0Now != A0Prev) {
+                A0RingPc[A0RingN & 7u] = Current;
+                A0RingOld[A0RingN & 7u] = A0Prev;
+                A0RingNew[A0RingN & 7u] = A0Now;
+                A0RingN++;
+                if (A0Now == 0x00100000u) {
+                    Print(L"  A0TRACE r16 <- 0x00100000 by PC=0x%08x w=0x%08x "
+                          L"LR=0x%08x r24=0x%08x r3=0x%08x r4=0x%08x r5=0x%08x "
+                          L"r6=0x%08x r27=0x%08x\n",
+                          Current, Instr, g_PpcContext.Lr,
+                          g_PpcContext.Gpr[24] & 0xFFFFFFFF,
+                          g_PpcContext.Gpr[3] & 0xFFFFFFFF,
+                          g_PpcContext.Gpr[4] & 0xFFFFFFFF,
+                          g_PpcContext.Gpr[5] & 0xFFFFFFFF,
+                          g_PpcContext.Gpr[6] & 0xFFFFFFFF,
+                          g_PpcContext.Gpr[27] & 0xFFFFFFFF);
+                    {
+                        UINT32 d;
+                        for (d = 0; d < 8; d++) {
+                            UINT32 p = (A0RingN - 1u - d) & 7u;
+                            Print(L"  A0RING[-%u] PC=0x%08x old=0x%08x new=0x%08x\n",
+                                  d, A0RingPc[p], A0RingOld[p], A0RingNew[p]);
+                        }
+                    }
+                }
+                A0Prev = A0Now;
             }
         }
         // Post-fork diag poll entry probe: first arrival at 0x1417E0 after the
@@ -7583,7 +7711,7 @@ CpuRead32(0x00100000u),
                         // answer is patching the trap table / EMUL_OP dispatch,
                         // NOT diverting to a hand-rolled 68K interpreter.
                         DrC68kTrapRequest = 1;
-#ifdef PPC_DR_FULL_DUMPS
+#if PPC_DR_FULL_DUMPS
                         {
                             // Decide conclusively whether the OSINJECT writes
                             // landed: compare (a) the MMU-path read (DR=1, may
