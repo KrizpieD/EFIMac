@@ -558,6 +558,18 @@ PpcDefaultWriteByte (
     )
 {
     UINTN I;
+    // STK100W: find who builds the low-RAM table around 0xFFFE that the DR's
+    // `lwz r16,0(r1)` reads as the bogus 68K A0=0x100000. Catches every write
+    // width (this is the final byte-level sink below CpuWrite16/32).
+    {
+        static UINT32 Stk100N = 0;
+        if (Address >= 0x0000FFC0u && Address < 0x00010040u && Stk100N < 48) {
+            Stk100N++;
+            Print(L"  STK100W[%u] [%08x]=%02x pc=%08x last=%08x r1=%08x\n",
+                  Stk100N - 1, Address, Value, g_PpcContext.Pc,
+                  g_PpcContext.Gpr[1] & 0xFFFFFFFFu);
+        }
+    }
     for (I = 0; I < PPC_MAX_GUEST_REGIONS; I++) {
         if (g_GuestRegions[I].Active &&
             Address >= g_GuestRegions[I].GuestBase &&
@@ -727,6 +739,19 @@ PpcMmuWriteByte (
     )
 {
     UINT32 Pa;
+    // EA100K: effective-address watch for the low 68K stack window. The
+    // physical-address watch (STK100W) can miss stores that translate via
+    // SDR1, so log the effective address too, including whether DR was on.
+    {
+        static UINT32 Ea100N = 0;
+        if (Ea >= 0x0000FFC0u && Ea < 0x00010040u && Ea100N < 48) {
+            Ea100N++;
+            Print(L"  EA100K[%u] [%08x]=%02x pc=%08x dr=%u sdr1=%08x r1=%08x\n",
+                  Ea100N - 1, Ea, Value, g_PpcContext.Pc,
+                  (g_PpcContext.Msr & PPC_MSR_DR) ? 1u : 0u,
+                  g_PpcContext.Sdr1, g_PpcContext.Gpr[1] & 0xFFFFFFFFu);
+        }
+    }
     if ((g_PpcContext.Msr & PPC_MSR_DR) != 0 &&
         PpcTranslateEffective(Ea, FALSE, &Pa)) {
         PpcDefaultWriteByte(Pa, Value);
@@ -966,6 +991,15 @@ PpcCopyGuestMemory (
         UINT8* SrcHost = NULL;
         UINT8* DstHost = NULL;
         UINT32 Chunk   = Size - Offset;
+        {
+            static UINT32 CpyN = 0;
+            if (DstGuest + Offset < 0x00010040u &&
+                DstGuest + Size > 0x0000F000u && CpyN < 40) {
+                CpyN++;
+                Print(L"  LOWCOPY[%u] dst=0x%08x src=0x%08x size=0x%x off=0x%x hit\n",
+                      CpyN - 1, DstGuest, SrcGuest, Size, Offset);
+            }
+        }
         for (I = 0; I < PPC_MAX_GUEST_REGIONS; I++) {
             if (!g_GuestRegions[I].Active) {
                 continue;
@@ -1119,9 +1153,23 @@ static UINT32 g_DrNativeTail = 0;     // tail-A207 -> 0x1B823 redirect fire coun
 static UINT32 g_DrNativeLand = 0;     // staged-native bootstrap landing probe budget
 static UINT64 g_NatDecSteps = 0;      // decoder(0x3873C) runaway canary count
 static UINT32 g_DrNativeHandoff = 0;  // one-shot: host switched to native PPC at 0x1B820
+static UINT32 g_NatTermPending = 0;   // NATIVE-TERMINAL one-shot arm (set at handoff; .bss is not zero-filled)
+static UINT32 g_NatImpProbes = 0;     // NATDIAG import-glue probe budget (fire-once)
 static UINT32 g_LastPc = 0;           // branch source (previous executed PC)
 static UINT32 PollRing[64];            // pre-first-poll PC ring
 static UINT32 PollRingIdx = 0;         // ring cursor
+static UINT64 g_ForkInstr = 0;         // instrs executed in fork range [0x1B7C0,0x1B940)
+static UINT32 g_ForkFirst = 0xFFFFFFFFu; // first fork PC seen
+static UINT32 g_ForkLast  = 0;         // last fork PC seen
+static UINT32 g_ForkRingPc[32];        // last 32 fork PCs
+static UINT32 g_ForkRingN = 0;
+static UINT64 g_DecInstr = 0;          // instrs in decoder range [0x38700,0x38900)
+static UINT64 g_Call4672c = 0;         // instrs at 0x4672c
+static UINT64 g_Call8fdc  = 0;         // instrs at 0x8fdc
+static UINT64 g_LowCode   = 0;         // instrs in low code [0x300,0x1000)
+static UINT64 g_Dec14F    = 0;         // instrs in [0x14F00,0x15200) (import decoder 0x14F0C)
+static UINT32 g_Snap100a  = 0;         // [0x100000] when fork starts
+static UINT32 g_Snap100b  = 0;         // [0x100004] when fork starts
 static UINT32 g_PollProbed = 0;       // one-shot: diag poll 0x1417E0 entry probe
 static UINT32 g_PollFixed  = 0;       // one-shot: diag poll completion applied
 static UINT32 g_LrWriterProbed = 0;   // one-shot: LR writer of a 0x3C.. handler
@@ -1209,6 +1257,32 @@ static VOID   TaskStoreWatch(UINT32 A, UINT32 V, UINTN Bytes)
 }
 static VOID   CpuWrite32(UINT32 A, UINT32 V)
 {
+    // PUSH100K: find who mints the bogus 68K diag target 0x100000. The DR's
+    // 68K `move.l (a7)+,a0` handler at 0x40B902F8 loads A0 from the stack, so
+    // 0x100000 was pushed earlier. Catch every 32-bit store of that value and
+    // attribute it to the writing PC.
+    {
+        static UINT32 Push100kN = 0;
+        if (V == 0x00100000u && Push100kN < 32) {
+            Push100kN++;
+            Print(L"  PUSH100K[%u] [%08x]<-%08x pc=%08x last=%08x "
+                  L"lr=%08x r1=%08x r24=%08x r3=%08x r4=%08x\n",
+                  Push100kN - 1, A, V, g_PpcContext.Pc, g_LastPc,
+                  g_PpcContext.Lr, g_PpcContext.Gpr[1],
+                  g_PpcContext.Gpr[24], g_PpcContext.Gpr[3],
+                  g_PpcContext.Gpr[4]);
+        }
+    }
+    // TRACE100: watch writes to the diag region 0x100000-0x101000
+    if (A >= 0x00100000u && A < 0x00101000u) {
+        static UINT32 T100N = 0;
+        if (T100N < 64) {
+            T100N++;
+            Print(L"  TRACE100[%u] W %08x <- %08x (pc=%08x lr=%08x r1=%08x)\n",
+                  T100N - 1, A, V, g_PpcContext.Pc, g_PpcContext.Lr,
+                  g_PpcContext.Gpr[1]);
+        }
+    }
     TaskStoreWatch(A, V, 4);
     // Watch the NK dispatch table at 0x12E88 (256 words). The scheduler reads
     // it at 0x40B22FA4/0x40B22FB8 via `lis r20,1` + `ori r20,r20,0x2E88`, but a
@@ -3617,6 +3691,21 @@ PpcExecuteInstruction (
     if (NextAddress == NULL) {
         return EFI_INVALID_PARAMETER;
     }
+    // Fork/decoder reachability probes: prove whether the resumed fork prologue
+    // (0x1B7C0) actually calls its bookkeeping (0x4672c), the decompressor
+    // (0x8fdc / decoder 0x3873C), or runs low staged code at all.
+    if (CurrentAddress >= 0x0001B7C0u && CurrentAddress < 0x0001B940u) {
+        if (g_ForkFirst == 0xFFFFFFFFu) g_ForkFirst = CurrentAddress;
+        g_ForkLast = CurrentAddress;
+        g_ForkRingPc[g_ForkRingN & 31u] = CurrentAddress;
+        g_ForkRingN++;
+        g_ForkInstr++;
+    }
+    if (CurrentAddress >= 0x00038700u && CurrentAddress < 0x00038900u) g_DecInstr++;
+    if (CurrentAddress == 0x0004672Cu) g_Call4672c++;
+    if (CurrentAddress == 0x00008FDCu) g_Call8fdc++;
+    if (CurrentAddress >= 0x00000300u && CurrentAddress < 0x00001000u) g_LowCode++;
+    if (CurrentAddress >= 0x00014F00u && CurrentAddress < 0x00015200u) g_Dec14F++;
     // ---- DIAGSTUB: break the System-fork epilogue self-loop @0x100000 ----
     // The System data fork is mirrored into low RAM, so the ROM glue's diag
     // target 0x100000 lands in fork bytes that decode as a leaf epilogue:
@@ -3625,7 +3714,8 @@ PpcExecuteInstruction (
     // and [r1+8] holds 0x100000 itself, so the stub blr's to itself forever.
     // Intercept at the instruction level (fires from any dispatch loop) and
     // resume the ROM's common 68K DR dispatch instead. One-shot.
-    if (CurrentAddress >= 0x00100000u && CurrentAddress < 0x00100010u) {
+    if (g_DrNativeHandoff == 0 &&
+        CurrentAddress >= 0x00100000u && CurrentAddress < 0x00100010u) {
         static UINT32 DiagStubExec = 0;
         if (DiagStubExec < 4) {
             DiagStubExec++;
@@ -3634,11 +3724,94 @@ PpcExecuteInstruction (
                   DiagStubExec, CurrentAddress, w,
                   g_PpcContext.Lr, g_PpcContext.Gpr[1],
                   CpuRead32((g_PpcContext.Gpr[1] & 0xFFFFFFFFu) + 8u));
+            // Native-fix investigation: replay the last 64 executed PCs so the
+            // call/return path that lands the fork on this epilogue is visible.
+            {
+                UINT32 R1 = g_PpcContext.Gpr[1] & 0xFFFFFFFFu;
+                Print(L"  DIAGSTUB-CTX r3=0x%08x r12=0x%08x r29=0x%08x "
+                      L"r30=0x%08x r31=0x%08x LR=0x%08x CTR=0x%08x "
+                      L"[r1]=0x%08x [r1+4]=0x%08x [r1+8]=0x%08x "
+                      L"[r1+12]=0x%08x\n",
+                      g_PpcContext.Gpr[3] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[12] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[29] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[30] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[31] & 0xFFFFFFFF,
+                      g_PpcContext.Lr & 0xFFFFFFFF,
+                      g_PpcContext.Ctr & 0xFFFFFFFF,
+                      CpuRead32(R1), CpuRead32(R1 + 4),
+                      CpuRead32(R1 + 8), CpuRead32(R1 + 12));
+                Print(L"  DIAGSTUB-ROM 40B67C60:");
+                {
+                    UINT32 a;
+                    for (a = 0x40B67C60u; a <= 0x40B67D08u; a += 4)
+                        Print(L" %08x", CpuRead32(a));
+                    Print(L"\n  DIAGSTUB-ROM 40BA7680:");
+                    for (a = 0x40BA7680u; a <= 0x40BA76A0u; a += 4)
+                        Print(L" %08x", CpuRead32(a));
+                    Print(L"\n  DIAGSTUB-ROM 40B902E0:");
+                    for (a = 0x40B902E0u; a <= 0x40B90310u; a += 4)
+                        Print(L" %08x", CpuRead32(a));
+                    Print(L"\n  DIAGSTUB-SLOT [0x2AE]=0x%08x [0x698]=0x%08x "
+                          L"[0x2B0]=0x%08x [0x2B4]=0x%08x [0x96000]=0x%08x "
+                          L"[0x1B7C0]=0x%08x\n",
+                          CpuRead32(0x2AE), CpuRead32(0x698),
+                          CpuRead32(0x2B0), CpuRead32(0x2B4),
+                          CpuRead32(0x96000), CpuRead32(0x1B7C0));
+                }
+                Print(L"  DIAGSTUB-PATH");
+                {
+                    UINT32 k = PollRingIdx & 63u;
+                    for (UINT32 d = 0; d < 64; d++) {
+                        UINT32 p = PollRing[(k - 1 - d) & 63u];
+                        Print(L" %08x", p);
+                        if ((d & 7) == 7) Print(L"\n  DIAGSTUB-PATH :");
+                    }
+                }
+                Print(L"\n");
+            }
         }
         g_PpcContext.Lr = 0x40B67C60u;
         g_PpcContext.Pc = 0x40B67C60u;
         *NextAddress = 0x40B67C60u;
         return EFI_SUCCESS;
+    }
+    // ---- D127388: capture the first entry into the fork QD reader loop ----
+    {
+        static UINT32 D127PrevPc = 0;
+        static UINT32 D127PrevIn = 0;
+        static UINT32 D127Done   = 0;
+        if (D127Done == 0 && CurrentAddress >= 0x00127388u &&
+            CurrentAddress < 0x001273C0u) {
+            UINT32 R1  = g_PpcContext.Gpr[1] & 0xFFFFFFFFu;
+            UINT32 R12 = g_PpcContext.Gpr[12] & 0xFFFFFFFFu;
+            D127Done = 1;
+            Print(L"  D127388 first PC=0x%08x prevPc=0x%08x prevIn=0x%08x "
+                  L"LR=0x%08x CTR=0x%08x r1=0x%08x r3=0x%08x r12=0x%08x "
+                  L"[r12+4]=0x%08x [r12+8]=0x%08x r24=0x%08x "
+                  L"[r1-18]=0x%08x [r1-14]=0x%08x\n",
+                  CurrentAddress, D127PrevPc, D127PrevIn, g_PpcContext.Lr,
+                  g_PpcContext.Ctr, R1, g_PpcContext.Gpr[3], R12,
+                  CpuRead32(R12 + 4u), CpuRead32(R12 + 8u), g_PpcContext.Gpr[24],
+                  CpuRead32(R1 - 0x18u), CpuRead32(R1 - 0x14u));
+        }
+        D127PrevIn = w;
+        D127PrevPc = CurrentAddress;
+    }
+    // ---- DWIN: trace LR/CTR/r24 transitions inside the DR dispatch window ----
+    {
+        static UINT32 DwinLastLr = 0xFFFFFFFFu;
+        static UINT32 DwinN      = 0;
+        if (CurrentAddress >= 0x40B67C60u && CurrentAddress < 0x40B67C80u &&
+            g_PpcContext.Lr != DwinLastLr && DwinN < 48u) {
+            DwinN++;
+            Print(L"  DWIN[%u] PC=0x%08x LR=0x%08x CTR=0x%08x r24=0x%08x "
+                  L"r27=0x%08x CR=0x%08x\n",
+                  DwinN, CurrentAddress, g_PpcContext.Lr, g_PpcContext.Ctr,
+                  g_PpcContext.Gpr[24] & 0xFFFFFFFFu,
+                  g_PpcContext.Gpr[27] & 0xFFFFFFFFu, g_PpcContext.Cr);
+            DwinLastLr = g_PpcContext.Lr;
+        }
     }
     // All floating-point instructions (opcodes 48-55, 59, 63) require MSR[FP].
     // With the bit clear the FP-unavailable exception is raised (vector 0x800);
@@ -3941,6 +4114,7 @@ g_DrA207Land = 0;
                 g_DrNativeTail = 0;
                 g_DrNativeLand = 0;
                 g_DrNativeHandoff = 0;  // .bss not zero-filled past 0x1800b12a0
+                g_NatTermPending = 0;
                 g_DrNativeSteer = 0;    // (loader skips it): force known state
                 g_DrForkSlotFixed = 0;  // gate the FORKDIAG/CRASHFIX repairs on 0
                 Print(L"  DRYIELD-RESUME @rfi trap=0x40B6E8C8 68Kpc(r24)=0x%08x "
@@ -4266,6 +4440,35 @@ g_DrA207Land = 0;
             UINT32 Ea = EaD(w, RA(w));
             PpcKdProfileLoad(Ea, CurrentAddress);
             g_PpcContext.Gpr[RT(w)] = CpuRead32(Ea);
+            // A0LD: the exact load that mints the bogus 68K A0 (r16) = 0x100000.
+            if (RT(w) == 16 && g_PpcContext.Gpr[16] == 0x00100000u) {
+                static UINT32 A0LdN = 0;
+                if (A0LdN < 8) {
+                    A0LdN++;
+                    Print(L"  A0LD[%u] PC=0x%08x w=0x%08x Ea=0x%08x RA=%u r1=0x%08x "
+                          L"r24=0x%08x LR=0x%08x MSR=0x%08x\n",
+                          A0LdN - 1, CurrentAddress, w, Ea, RA(w),
+                          g_PpcContext.Gpr[1] & 0xFFFFFFFF, g_PpcContext.Gpr[24],
+                          g_PpcContext.Lr, g_PpcContext.Msr);
+                    {
+                        UINT32 A0Pa = 0;
+                        BOOLEAN A0Hit = PpcTranslateEffective(Ea, FALSE, &A0Pa);
+                        UINTN Rg;
+                        Print(L"  A0MAP sdr1=0x%08x xlatehit=%u pa=0x%08x sr0=0x%08x\n",
+                              g_PpcContext.Sdr1, A0Hit, A0Pa,
+                              g_PpcContext.Sr[0]);
+                        for (Rg = 0; Rg < PPC_MAX_GUEST_REGIONS; Rg++) {
+                            if (g_GuestRegions[Rg].Active) {
+                                Print(L"  A0REG[%u] base=0x%08x size=0x%08x ro=%u host=0x%08x\n",
+                                      Rg, g_GuestRegions[Rg].GuestBase,
+                                      g_GuestRegions[Rg].Size,
+                                      g_GuestRegions[Rg].ReadOnly,
+                                      (UINT32)(UINTN)g_GuestRegions[Rg].HostBase);
+                            }
+                        }
+                    }
+                }
+            }
         }
         break;
     case 33: // lwzu
@@ -5104,8 +5307,8 @@ g_DrA207Land = 0;
                                         Print(L"    +0x%02x 0x%08x 0x%08x 0x%08x 0x%08x\n",
                                               D, CpuRead32(T + D), CpuRead32(T + D + 4),
                                               CpuRead32(T + D + 8), CpuRead32(T + D + 12));
-                                    }
-                                }
+        }
+    }
                             }
                         }
                         g_PpcContext.Srr0 = Value;
@@ -5366,6 +5569,574 @@ static UINT32 PeiBe32(const UINT8 *p)
            ((UINT32)p[2] << 8) | (UINT32)p[3];
 }
 // ---------------------------------------------------------------------------
+// Real multi-fragment CFM/PEF loader.  The classic Mac OS "System" data fork is
+// a stream of ~96 PEF containers laid out back-to-back; each carries its own
+// loader section (imports/exports/relocations) and pattern-initialised data.
+// The old handoff only instantiated fragment 0 (QuickDraw) and then raw-mirrored
+// the rest of the fork byte-for-byte, so packed data was never expanded and no
+// cross-fragment import was bound (the fork's native calls fell through a stale
+// descriptor to unmapped 0x41500000).  This loader walks every container,
+// expands its sections, places code in place (file offset == runtime address)
+// and writable data in a dedicated bump region, builds a global name->address
+// export map, resolves each fragment's imports against it (unresolved -> the
+// catch-all glue at 0xBA20), applies the relocation bytecode, and writes the
+// instantiated images into guest RAM.
+#define NAT_CFM_MAXFRAGS    200
+#define NAT_CFM_MAXEXPORTS  24000
+#define NAT_CFM_DATA_BUMP  0x00700000u   /* expanded data region (above code) */
+#define NAT_CFM_FORK_LEN   0x00700000u
+/* Program fragment whose 'main' transition vector is the real native OS entry
+   the ROM's 68K bootstrap hands control to.  Matched by container base offset
+   in the System data fork (file offset == runtime address).  Fragment 83 is the
+   large program fragment (16 imported libs incl. MPLibrary/NameRegistryLib). */
+#define NAT_CFM_ENTRY_BASE 0x0055CB40u
+
+static VOID *NatCfmAlloc(void *ctx, size_t n)
+{
+    VOID *p = NULL;
+    (void)ctx;
+    if (BS->AllocatePool(EfiBootServicesData, (UINTN)(n ? n : 1), &p) != EFI_SUCCESS)
+        return NULL;
+    return p;
+}
+static VOID NatCfmFree(void *ctx, void *p) { (void)ctx; if (p) BS->FreePool(p); }
+
+static UINT32 g_NatCfmEntryToc = 0;   /* TOC of the fragment owning code 0x100000 */
+static UINT32 g_NatCfmMainEntry = 0;  /* real 'main' TVector entry (code address) */
+static UINT32 g_NatCfmMainToc   = 0;  /* real 'main' TVector TOC (r2) */
+static PefFragment *g_NatCfmEntryFrag = 0; /* entry fragment (for import-name lookup) */
+
+/* ===================== Host-side Mac OS Memory Manager =====================
+ *
+ * The native-CFM shortcut skips the System's own 68K Memory Manager init, so
+ * low-memory SysZone (0x02A6) / ApplZone (0x02AA) / TheZone (0x0118) are all
+ * zero. The CFM entry fragment (~0x55EAB0) bootstraps MemMgr by setting
+ * TheZone := ApplZone and then calling MoreMasters until the zone's free
+ * master-pointer chain (zone+8) has >= 32 entries -- with no zone it spins at
+ * 0x55EB18 forever. This module builds a real zone in guest RAM, wires the
+ * low-memory globals, and binds the MemMgr Toolbox imports to host handlers so
+ * allocation genuinely works (blocks are handed out of a guest-resident heap).
+ */
+
+#define NAT_MEM_ZONE_ADDR   0x00A00000u   /* zone record */
+#define NAT_MEM_STUB_BASE   0x00A00200u   /* per-import descriptors {entry,toc} */
+#define NAT_MEM_STUB_CODE   0x00A01000u   /* per-import stub code PCs */
+#define NAT_MEM_BLOCK_ADDR  0x00A10000u   /* master-pointer slot pool */
+#define NAT_MEM_BLOCK_END   0x00A14000u
+#define NAT_MEM_HEAP_ADDR   0x00B00000u   /* allocatable heap */
+#define NAT_MEM_HEAP_END    0x00F00000u
+#define NAT_MEM_MAXSTUB     256
+
+/* Zone record field offsets (Inside Macintosh: Memory). */
+#define Z_BKLIM   0
+#define Z_PURGE   4
+#define Z_HFREE   8
+#define Z_CBFREE  12
+#define Z_GZPROC  16
+#define Z_MOREMST 20
+
+/* Low-memory globals. */
+#define LM_SYSZONE  0x000002A6u
+#define LM_APPLZONE 0x000002AAu
+#define LM_THEZONE  0x00000118u
+
+static UINT32  NatMemZone     = NAT_MEM_ZONE_ADDR;
+static UINT32  NatMemHeapBump = NAT_MEM_HEAP_ADDR;
+static UINT32  NatMemMpBump   = NAT_MEM_BLOCK_ADDR;
+static UINT32  NatMemFreeMps  = 0;
+static BOOLEAN NatMemInited   = FALSE;
+static UINT32  NatMemStubCount = 0;
+static UINT32  NatMemStubHandler[NAT_MEM_MAXSTUB];
+static const char *NatMemStubName[NAT_MEM_MAXSTUB];
+static UINT8   NatMemStubSeen[NAT_MEM_MAXSTUB];
+
+enum {
+    NAT_MEM_H_NONE = 0,
+    NAT_MEM_H_MORE,
+    NAT_MEM_H_NEWHANDLE,
+    NAT_MEM_H_NEWHANDLECLEAR,
+    NAT_MEM_H_NEWPTR,
+    NAT_MEM_H_NEWPTRCLEAR,
+    NAT_MEM_H_DISPOSEHANDLE,
+    NAT_MEM_H_DISPOSEPTR,
+    NAT_MEM_H_HLOCK,
+    NAT_MEM_H_HUNLOCK,
+    NAT_MEM_H_HNOPURGE,
+    NAT_MEM_H_HPURGE,
+    NAT_MEM_H_GETHSIZE,
+    NAT_MEM_H_GETPSIZE,
+    NAT_MEM_H_GETZONE,
+    NAT_MEM_H_SYSZONE,
+    NAT_MEM_H_SETZONE,
+    NAT_MEM_H_MAXAPPLZONE,
+    NAT_MEM_H_BLOCKMOVE,
+    NAT_MEM_H_MEMERROR,
+    NAT_MEM_H_COMPACTMEM,
+    NAT_MEM_H_PURGEMEM,
+    NAT_MEM_H_TOOLTRAPGET,
+    NAT_MEM_H_TOOLTRAPSET
+};
+
+typedef struct { const char *name; UINT32 handler; } NatMemEntry;
+
+static const NatMemEntry NatMemTable[] = {
+    { "MoreMasters",         NAT_MEM_H_MORE },
+    { "NewHandle",           NAT_MEM_H_NEWHANDLE },
+    { "NewHandleClear",      NAT_MEM_H_NEWHANDLECLEAR },
+    { "NewPtr",              NAT_MEM_H_NEWPTR },
+    { "NewPtrClear",         NAT_MEM_H_NEWPTRCLEAR },
+    { "NewPtrSys",           NAT_MEM_H_NEWPTR },
+    { "NewPtrSysClear",      NAT_MEM_H_NEWPTRCLEAR },
+    { "DisposeHandle",       NAT_MEM_H_DISPOSEHANDLE },
+    { "DisposePtr",          NAT_MEM_H_DISPOSEPTR },
+    { "HLock",               NAT_MEM_H_HLOCK },
+    { "HUnlock",             NAT_MEM_H_HUNLOCK },
+    { "HNoPurge",            NAT_MEM_H_HNOPURGE },
+    { "HPurge",              NAT_MEM_H_HPURGE },
+    { "GetHandleSize",       NAT_MEM_H_GETHSIZE },
+    { "GetPtrSize",          NAT_MEM_H_GETPSIZE },
+    { "GetZone",             NAT_MEM_H_GETZONE },
+    { "SystemZone",          NAT_MEM_H_SYSZONE },
+    { "SetZone",             NAT_MEM_H_SETZONE },
+    { "MaxApplZone",         NAT_MEM_H_MAXAPPLZONE },
+    { "BlockMove",           NAT_MEM_H_BLOCKMOVE },
+    { "BlockMoveData",       NAT_MEM_H_BLOCKMOVE },
+    { "MemError",            NAT_MEM_H_MEMERROR },
+    { "CompactMem",          NAT_MEM_H_COMPACTMEM },
+    { "PurgeMem",            NAT_MEM_H_PURGEMEM },
+    { "GetToolTrapAddress",  NAT_MEM_H_TOOLTRAPGET },
+    { "SetToolTrapAddress",  NAT_MEM_H_TOOLTRAPSET },
+    { NULL, NAT_MEM_H_NONE }
+};
+
+static BOOLEAN
+NatMemNameEq (
+    IN const char *A,
+    IN const char *B
+    )
+{
+    if (A == NULL || B == NULL) { return FALSE; }
+    while (*A != '\0' && *B != '\0') {
+        if (*A != *B) { return FALSE; }
+        A++; B++;
+    }
+    return (*A == '\0' && *B == '\0');
+}
+
+static UINT32
+NatMemFindHandler (
+    IN const char *Name
+    )
+{
+    UINT32 I;
+    if (Name == NULL) { return NAT_MEM_H_NONE; }
+    for (I = 0; NatMemTable[I].name != NULL; I++) {
+        if (NatMemNameEq (NatMemTable[I].name, Name)) {
+            return NatMemTable[I].handler;
+        }
+    }
+    return NAT_MEM_H_NONE;
+}
+
+/* Register a unique descriptor+stub for a host-bound import; returns the
+   descriptor address written into the import slot (glue reads {entry,toc}). */
+static UINT32
+NatMemBindImport (
+    IN UINT32 Handler,
+    IN const char *Name
+    )
+{
+    UINT32 Desc, Code, I;
+    if (Handler != NAT_MEM_H_NONE) {
+        for (I = 0; I < NatMemStubCount; I++) {
+            if (NatMemStubHandler[I] == Handler) {
+                return NAT_MEM_STUB_BASE + I * 8u;   /* reuse existing stub */
+            }
+        }
+    }
+    if (NatMemStubCount >= NAT_MEM_MAXSTUB) { return 0x0000BA20u; }
+    Desc = NAT_MEM_STUB_BASE + NatMemStubCount * 8u;
+    Code = NAT_MEM_STUB_CODE + NatMemStubCount * 4u;
+    CpuWrite32 (Desc + 0, Code);
+    CpuWrite32 (Desc + 4, 0x00000000u);
+    CpuWrite32 (Code, 0x4E800020u);          /* blr */
+    NatMemStubHandler[NatMemStubCount] = Handler;
+    NatMemStubName[NatMemStubCount] = Name;
+    NatMemStubSeen[NatMemStubCount] = 0;
+    NatMemStubCount++;
+    return Desc;
+}
+
+static UINT32
+NatMemAddFree (
+    IN UINT32 Count
+    )
+{
+    UINT32 I, Added = 0;
+    for (I = 0; I < Count; I++) {
+        UINT32 Slot, Head;
+        if (NatMemMpBump + 8u > NAT_MEM_BLOCK_END) { break; }
+        Slot = NatMemMpBump;
+        NatMemMpBump += 8u;
+        Head = CpuRead32 (NatMemZone + Z_HFREE);
+        CpuWrite32 (Slot, Head | 1u);            /* free list link */
+        CpuWrite32 (NatMemZone + Z_HFREE, Slot);
+        NatMemFreeMps++;
+        CpuWrite32 (NatMemZone + Z_CBFREE,
+                    CpuRead32 (NatMemZone + Z_CBFREE) + 32u);
+        Added++;
+    }
+    return Added;
+}
+
+static UINT32
+NatMemPopFree (
+    VOID
+    )
+{
+    UINT32 Head = CpuRead32 (NatMemZone + Z_HFREE);
+    UINT32 Next;
+    if (Head == 0) {
+        NatMemAddFree (32);
+        Head = CpuRead32 (NatMemZone + Z_HFREE);
+        if (Head == 0) { return 0; }
+    }
+    Next = CpuRead32 (Head) & ~1u;
+    CpuWrite32 (NatMemZone + Z_HFREE, Next);
+    NatMemFreeMps--;
+    return Head;
+}
+
+static UINT32
+NatMemNewBlock (
+    IN UINT32 Size,
+    IN BOOLEAN Clear
+    )
+{
+    UINT32 Data = NatMemHeapBump + 4u;
+    UINT32 Need = (Size + 3u) & ~3u;
+    if (Data + Need + 4u > NAT_MEM_HEAP_END) { return 0; }
+    NatMemHeapBump = Data + Need + 4u;
+    CpuWrite32 (Data - 4u, Size);                /* size header */
+    if (Clear) {
+        UINT32 I;
+        for (I = 0; I < Need; I += 4) { CpuWrite32 (Data + I, 0u); }
+    }
+    return Data;
+}
+
+static UINT32
+NatMemNewHandle (
+    IN UINT32 Size,
+    IN BOOLEAN Clear
+    )
+{
+    UINT32 Mp = NatMemPopFree ();
+    UINT32 Data;
+    if (Mp == 0) { return 0; }
+    Data = NatMemNewBlock (Size, Clear);
+    if (Data == 0) { return 0; }
+    CpuWrite32 (Mp, Data);
+    return Mp;
+}
+
+static VOID
+NatMemInit (
+    VOID
+    )
+{
+    if (NatMemInited) { return; }
+    NatMemInited = TRUE;
+    NatMemHeapBump = NAT_MEM_HEAP_ADDR;
+    NatMemMpBump   = NAT_MEM_BLOCK_ADDR;
+    NatMemFreeMps  = 0;
+    {
+        UINT32 I;
+        for (I = 0; I < 40; I++) { CpuWrite32 (NatMemZone + I, 0u); }
+    }
+    CpuWrite32 (NatMemZone + Z_BKLIM,   NAT_MEM_HEAP_END);
+    CpuWrite32 (NatMemZone + Z_HFREE,   0x00000000u);
+    CpuWrite32 (NatMemZone + Z_CBFREE,  0x00000000u);
+    CpuWrite32 (NatMemZone + Z_MOREMST, 0x00000020u);
+    CpuWrite32 (LM_SYSZONE,  NatMemZone);
+    CpuWrite32 (LM_APPLZONE, NatMemZone);
+    CpuWrite32 (LM_THEZONE,  NatMemZone);
+    NatMemAddFree (48);                          /* enough for the >=32 walk */
+    Print (L"  MEMMGR: zone @0x%08x wired to SysZone/ApplZone/TheZone; "
+           L"free master pointers=%u heap 0x%x..0x%x\n",
+           NatMemZone, NatMemFreeMps, NAT_MEM_HEAP_ADDR, NAT_MEM_HEAP_END);
+}
+
+/* Called from the PPC step loop when PC lands on a host stub. r3 carries the
+   result back; execution resumes at LR (the caller's `bl` return slot). */
+static VOID
+NatMemDispatchStub (
+    IN UINT32 Pc
+    )
+{
+    UINT32 Idx = (Pc - NAT_MEM_STUB_CODE) / 4u;
+    UINT32 H, R3, R4, R5, Res = 0;
+    if (Idx >= NatMemStubCount) { R3 = 0; goto done; }
+    H  = NatMemStubHandler[Idx];
+    if (H == NAT_MEM_H_NONE) {
+        if (NatMemStubName[Idx] != NULL && NatMemStubSeen[Idx] < 3u) {
+            NatMemStubSeen[Idx]++;
+            Print (L"  UNBOUNDCALL %a (stub %u seen %u)\n",
+                   NatMemStubName[Idx], Idx,
+                   (UINT32)NatMemStubSeen[Idx]);
+        }
+        R3 = 0;
+        g_PpcContext.Gpr[3] = 0;
+        g_PpcContext.Pc = g_PpcContext.Lr & 0xFFFFFFFFu;
+        return;
+    }
+    R3 = g_PpcContext.Gpr[3] & 0xFFFFFFFFu;
+    R4 = g_PpcContext.Gpr[4] & 0xFFFFFFFFu;
+    R5 = g_PpcContext.Gpr[5] & 0xFFFFFFFFu;
+    switch (H) {
+    case NAT_MEM_H_MORE:
+        NatMemAddFree (R3 == 0 ? 32u : R3);
+        Res = 0;
+        break;
+    case NAT_MEM_H_NEWHANDLE:      Res = NatMemNewHandle (R3, FALSE); break;
+    case NAT_MEM_H_NEWHANDLECLEAR: Res = NatMemNewHandle (R3, TRUE);  break;
+    case NAT_MEM_H_NEWPTR:         Res = NatMemNewBlock  (R3, FALSE); break;
+    case NAT_MEM_H_NEWPTRCLEAR:    Res = NatMemNewBlock  (R3, TRUE);  break;
+    case NAT_MEM_H_DISPOSEHANDLE:
+        if (R3 != 0) {
+            UINT32 Head = CpuRead32 (NatMemZone + Z_HFREE);
+            CpuWrite32 (R3, Head | 1u);
+            CpuWrite32 (NatMemZone + Z_HFREE, R3);
+            NatMemFreeMps++;
+        }
+        Res = 0;
+        break;
+    case NAT_MEM_H_DISPOSEPTR:     Res = 0; break;
+    case NAT_MEM_H_HLOCK:
+    case NAT_MEM_H_HUNLOCK:
+    case NAT_MEM_H_HNOPURGE:
+    case NAT_MEM_H_HPURGE:         Res = R3; break;
+    case NAT_MEM_H_GETHSIZE:
+        Res = (R3 != 0) ? CpuRead32 (CpuRead32 (R3) - 4u) : 0; break;
+    case NAT_MEM_H_GETPSIZE:
+        Res = (R3 != 0) ? CpuRead32 (R3 - 4u) : 0; break;
+    case NAT_MEM_H_GETZONE:        Res = CpuRead32 (LM_THEZONE); break;
+    case NAT_MEM_H_SYSZONE:        Res = CpuRead32 (LM_SYSZONE); break;
+    case NAT_MEM_H_SETZONE:
+        Res = CpuRead32 (LM_THEZONE);
+        CpuWrite32 (LM_THEZONE, R3);
+        break;
+    case NAT_MEM_H_MAXAPPLZONE:
+        CpuWrite32 (LM_APPLZONE, CpuRead32 (LM_SYSZONE));
+        Res = 0;
+        break;
+    case NAT_MEM_H_BLOCKMOVE:
+        if (R5 != 0) { PpcCopyGuestMemory (R4, R3, R5); }
+        Res = 0;
+        break;
+    case NAT_MEM_H_MEMERROR:       Res = 0; break;
+    case NAT_MEM_H_COMPACTMEM:     Res = CpuRead32 (NatMemZone + Z_CBFREE); break;
+    case NAT_MEM_H_PURGEMEM:       Res = 1; break;
+    case NAT_MEM_H_TOOLTRAPGET:    Res = R3; break;
+    case NAT_MEM_H_TOOLTRAPSET:    Res = 0; break;
+    default:                       Res = 0; break;
+    }
+done:
+    g_PpcContext.Gpr[3] = Res;
+    g_PpcContext.Pc = g_PpcContext.Lr & 0xFFFFFFFFu;
+}
+
+typedef struct { const char *name; UINT32 addr; } NatCfmExport;
+
+static UINT32 NatCfmLookup(const NatCfmExport *m, UINTN n, const char *name)
+{
+    UINTN i;
+    if (name == NULL) return 0;
+    for (i = 0; i < n; i++) {
+        const char *a = m[i].name, *b = name;
+        if (a == NULL) continue;
+        while (*a && *a == *b) { a++; b++; }
+        if (*a == 0 && *b == 0) return m[i].addr;
+    }
+    return 0;
+}
+
+/* Place code in place (file offset) and writable data in the bump region. */
+static void NatCfmPlace(PefFragment *f, UINT32 *bump, UINT32 *entryToc)
+{
+    UINT32 codeCur = 0, dataCur = *bump;
+    int i, dataIx = -1;
+    for (i = 0; i < f->sectionCount; i++) {
+        PefSectionHeader *s = &f->sections[i];
+        UINT32 align = (s->alignment <= 15) ? (1u << s->alignment) : 16u;
+        if (s->sectionKind == kPefCodeSection || s->sectionKind == kPefExecDataSection) {
+            if (codeCur == 0) codeCur = (UINT32)(f->base + (UINT32)s->containerOffset);
+            codeCur = (codeCur + align - 1) & ~(align - 1);
+            f->secBase[i] = codeCur;
+            codeCur += s->totalLength;
+        } else if (s->sectionKind != kPefLoaderSection) {
+            if (dataIx < 0) dataIx = i;
+            dataCur = (dataCur + align - 1) & ~(align - 1);
+            f->secBase[i] = dataCur;
+            dataCur += s->totalLength;
+        } else {
+            f->secBase[i] = 0;
+        }
+    }
+    *bump = dataCur;
+    f->toc = 0;
+    if (f->initSection >= 0 && f->initSection < f->sectionCount &&
+        f->expanded[f->initSection] != NULL) {
+        PefSectionHeader *s = &f->sections[f->initSection];
+        UINT32 raw = PeiBe32((const UINT8 *)(f->expanded[f->initSection] + f->initOffset + 4));
+        f->toc = f->secBase[f->initSection] + (raw - s->defaultAddress);
+    } else if (dataIx >= 0) {
+        f->toc = f->secBase[dataIx] + 4u;
+    }
+    /* Remember the TOC of whichever fragment owns code address 0x100000 so the
+       DR handoff can enter native code with the right r2 (not QuickDraw's). */
+    if (entryToc != NULL && f->sections[0].sectionKind == kPefCodeSection) {
+        UINT32 c0 = f->secBase[0];
+        if (0x00100000u >= c0 && 0x00100000u < c0 + f->sections[0].totalLength) {
+            *entryToc = f->toc;
+            g_NatCfmEntryToc = f->toc;
+        }
+    }
+}
+
+static void
+NatCfmRelocLog (
+    unsigned long addr,
+    unsigned      imp
+    )
+{
+    if (g_NatCfmEntryFrag != 0 && imp < (unsigned)g_NatCfmEntryFrag->symCount) {
+        const char *nm = g_NatCfmEntryFrag->imports[imp].name;
+        Print(L"  PEFRELOC abs=0x%08x imp=%u name=%a\n",
+              (UINT32)addr, (UINT32)imp, nm ? nm : "(null)");
+    } else {
+        Print(L"  PEFRELOC abs=0x%08x imp=%u\n", (UINT32)addr, (UINT32)imp);
+    }
+}
+
+static int NatCfmLoadSystem(void)
+{
+    UINT8 *file;
+    PefFragment *frags;
+    NatCfmExport *map;
+    UINTN mapN = 0, i, k;
+    UINT32 bump = NAT_CFM_DATA_BUMP;
+    UINT32 entryToc = 0;
+    int nf;
+
+    file = (UINT8 *)NatCfmAlloc(NULL, NAT_CFM_FORK_LEN);
+    frags = (PefFragment *)NatCfmAlloc(NULL, (UINTN)NAT_CFM_MAXFRAGS * sizeof(PefFragment));
+    map = (NatCfmExport *)NatCfmAlloc(NULL, (UINTN)NAT_CFM_MAXEXPORTS * sizeof(NatCfmExport));
+    if (file == NULL || frags == NULL || map == NULL)
+        return -1;
+    for (i = 0; i < NAT_CFM_FORK_LEN; i += 4) {
+        UINT32 v = CpuRead32(PPC_OS_RUNTIME_GUEST_BASE + (UINT32)i);
+        file[i + 0] = (UINT8)(v >> 24); file[i + 1] = (UINT8)(v >> 16);
+        file[i + 2] = (UINT8)(v >> 8);  file[i + 3] = (UINT8)v;
+    }
+    PeiNull(frags, (UINTN)NAT_CFM_MAXFRAGS * sizeof(PefFragment));
+    for (i = 0; i < NAT_CFM_MAXFRAGS; i++) {
+        frags[i].alloc = NatCfmAlloc;
+        frags[i].free_ = NatCfmFree;
+    }
+    nf = PefEnumFragments(file, NAT_CFM_FORK_LEN, frags, NAT_CFM_MAXFRAGS);
+    Print(L"  CFM: enumerated %d PEF fragments in System fork\n", nf);
+
+    /* Pass 1: expand + place every fragment, collect exports (skip 0 and 1,
+       the two QuickDraw images: fragment 0 is loaded by the caller, and
+       fragment 1's code overlaps the caller's data region). */
+    for (i = 2; i < (UINTN)nf; i++) {
+        PefFragment *f = &frags[i];
+        if (f->sectionCount == 0) continue;
+        if (PefExpandSections(f) != 0) {
+            Print(L"  CFM: expand failed frag %u (base 0x%x)\n", (UINT64)i, (UINT32)f->base);
+            continue;
+        }
+        NatCfmPlace(f, &bump, &entryToc);
+        /* Record the real 'main' transition vector for the OS entry fragment.
+           The TVector lives in mainSection at mainOffset; word0 is the entry
+           (code section) address, word1 is the TOC (data section) address,
+           both pre-relocation relative to their section default. */
+        if ((UINT32)f->base == NAT_CFM_ENTRY_BASE) {
+            g_NatCfmEntryFrag = f;
+        }
+        if ((UINT32)f->base == NAT_CFM_ENTRY_BASE &&
+            f->mainSection >= 0 && f->mainSection < f->sectionCount &&
+            f->expanded[f->mainSection] != NULL) {
+            const UINT8 *tv = f->expanded[f->mainSection] + f->mainOffset;
+            UINT32 d0 = f->sections[0].defaultAddress;
+            UINT32 dm = f->sections[f->mainSection].defaultAddress;
+            g_NatCfmMainEntry = f->secBase[0] + (PeiBe32(tv) - d0);
+            g_NatCfmMainToc   = f->secBase[f->mainSection] + (PeiBe32(tv + 4) - dm);
+            Print(L"  CFM: entry frag base 0x%x main TVector -> entry 0x%08x "
+                  L"toc 0x%08x (mainSec=%d off=0x%x)\n",
+                  (UINT32)f->base, g_NatCfmMainEntry, g_NatCfmMainToc,
+                  (INT32)f->mainSection, (UINT32)f->mainOffset);
+        }
+        for (k = 0; k < f->exportCount && mapN < NAT_CFM_MAXEXPORTS; k++) {
+            if (f->exports[k].name == NULL) continue;
+            map[mapN].name = f->exports[k].name;
+            map[mapN].addr = PefExportAddress(f, &f->exports[k]);
+            mapN++;
+        }
+    }
+    Print(L"  CFM: %u exports mapped; data bump ends 0x%x; entry frag r2=0x%x\n",
+          (UINT64)mapN, bump, entryToc);
+
+    /* Pass 2: resolve imports, relocate and instantiate into guest RAM. */
+    g_PelRelocLog = NatCfmRelocLog;
+    NatMemStubCount = 0;
+    for (i = 2; i < (UINTN)nf; i++) {
+        PefFragment *f = &frags[i];
+        UINT32 *imp;
+        int s;
+        if (f->sectionCount == 0) continue;
+        imp = (UINT32 *)NatCfmAlloc(NULL, (UINTN)(f->symCount ? f->symCount : 1) * sizeof(UINT32));
+        if (imp == NULL) continue;
+        for (k = 0; k < f->symCount; k++) {
+            UINT32 a = NatCfmLookup(map, mapN, f->imports[k].name);
+            UINT32 hm;
+            if (a) {
+                imp[k] = a;
+            } else {
+                hm = NatMemFindHandler(f->imports[k].name);
+                if (hm != NAT_MEM_H_NONE) {
+                    imp[k] = NatMemBindImport(hm, f->imports[k].name);
+                } else if ((UINT32)f->base == NAT_CFM_ENTRY_BASE) {
+                    /* Trace-only unique stub so we can log which Toolbox call
+                       the fragment reaches (returns 0 like the catch-all). */
+                    imp[k] = NatMemBindImport(NAT_MEM_H_NONE, f->imports[k].name);
+                } else {
+                    imp[k] = 0x0000BA20u;
+                }
+            }
+ 
+            if ((UINT32)f->base == NAT_CFM_ENTRY_BASE && imp[k] == 0x0000BA20u) {
+                const char *nm = f->imports[k].name ? f->imports[k].name : "(null)";
+                Print(L"  FRAG84 unbound import k=%u name=%a\\n", (UINT64)k, nm);
+            }
+        }
+        for (s = 0; s < f->sectionCount; s++) {
+            UINT32 b, w;
+            if (f->expanded[s] == NULL) continue;
+            if (f->sections[s].sectionKind == kPefLoaderSection) continue;
+            if (f->secBase[s] == 0) continue;
+            PefRelocateSection(f, s, f->expanded[s], imp);
+            b = f->secBase[s];
+            for (w = 0; w + 4 <= f->sections[s].totalLength; w += 4)
+                CpuWrite32(b + w, PeiBe32((const UINT8 *)(f->expanded[s] + w)));
+        }
+    }
+    Print(L"  CFM: fragments instantiated into guest RAM\n");
+    g_PelRelocLog = NULL;
+    return (int)entryToc;
+}
+// ---------------------------------------------------------------------------
 // Continuous guest execution harness. Runs up to MaxInstructions of real
 // guest code from the current PC, delivering pending exceptions through the
 // CPU vector mechanism so interrupt/syscall handlers run like on hardware.
@@ -5487,8 +6258,52 @@ static UINT32 RegSyscallSeen = 0;
     // MaxInstructions == 0 means run indefinitely until error or halt.
     while (MaxInstructions == 0 || Executed < MaxInstructions) {
         UINT32 Current;
-        UINT32 Instr = CpuRead32(g_PpcContext.Pc);
+        UINT32 Instr;
+        /* Host Memory Manager import stub: dispatch to the host handler and
+           resume at the caller's `bl` return slot instead of running the
+           placeholder `blr` in guest RAM. Must run before the fetch below. */
+        if (g_PpcContext.Pc >= NAT_MEM_STUB_CODE &&
+            g_PpcContext.Pc < NAT_MEM_STUB_CODE + NAT_MEM_MAXSTUB * 4u) {
+            NatMemDispatchStub (g_PpcContext.Pc);
+            Executed++;
+            continue;
+        }
+        Instr = CpuRead32(g_PpcContext.Pc);
         Current = g_PpcContext.Pc;
+        {
+            static UINT32 StkSnapDone = 0;
+            if (StkSnapDone == 0) {
+                UINT32 A; UINT32 Nz = 0;
+                StkSnapDone = 1;
+                for (A = 0x0000FF00u; A < 0x00010000u; A += 4) {
+                    UINT32 V = ((UINT32)PpcDefaultReadByte(A) << 24) |
+                               ((UINT32)PpcDefaultReadByte(A + 1) << 16) |
+                               ((UINT32)PpcDefaultReadByte(A + 2) << 8) |
+                               PpcDefaultReadByte(A + 3);
+                    if (V != 0) { Nz++; Print(L"  LOWSNAP0 %08x=%08x\n", A, V); }
+                }
+                Print(L"  LOWSNAP0 nonzero=%u at Executed=%u\n", Nz, Executed);
+            }
+        }
+        {
+            static UINT32 LowPromoDone = 0;
+            if (LowPromoDone == 0) {
+                UINT32 Lv = ((UINT32)PpcDefaultReadByte(0xFFDEu) << 24) |
+                            ((UINT32)PpcDefaultReadByte(0xFFDFu) << 16) |
+                            ((UINT32)PpcDefaultReadByte(0xFFE0u) << 8) |
+                            PpcDefaultReadByte(0xFFE1u);
+                if (Lv != 0) {
+                    LowPromoDone = 1;
+                    Print(L"  LOWPROMO first-nonzero [0xFFDE..0xFFE1]=%08x "
+                          L"pc=%08x lastpc=%08x instr=%08x r1=%08x r24=%08x "
+                          L"sdr1=%08x msr=%08x\n",
+                          Lv, Current, g_LastPc, Instr,
+                          g_PpcContext.Gpr[1] & 0xFFFFFFFFu,
+                          g_PpcContext.Gpr[24] & 0xFFFFFFFFu,
+                          g_PpcContext.Sdr1, g_PpcContext.Msr);
+                }
+            }
+        }
         {
             static UINT32 P2PrevPc = 0;
             static UINT32 P2First = 0;
@@ -5520,7 +6335,7 @@ static UINT32 RegSyscallSeen = 0;
         // arrival there. One-shot; must run before the stub executes.
         {
             static UINT32 DiagStubIntercepted = 0;
-            if (DiagStubIntercepted == 0 &&
+            if (DiagStubIntercepted == 0 && g_DrNativeHandoff == 0 &&
                 Current >= 0x00100000u && Current < 0x00100010u) {
                 DiagStubIntercepted = 1;
                 Print(L"  DIAGSTUB-ENTER Current=0x%08x handoff=%u steer=%u "
@@ -5847,10 +6662,11 @@ if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 48) {
             if (g_DrNativeHandoff == 0 && g_DrNativeSteer == 0 &&
                 Pc24 >= 0x00100000u && Pc24 < 0x00101000u) {
                 g_DrNativeSteer = 1;
-                Pc24 = 0x0001B823u;
+                Pc24 = 0x0001B7C0u; // use fork entry, not 0x1B823
                 g_PpcContext.Gpr[24] = Pc24;
-                Print(L"  PATH2-HANDOFF 68K diag jump 0x100000 -> staged native "
-                      L"bootstrap 0x1B823 (exec=%u PPC=0x%08x)\n",
+                g_PpcContext.Pc = Pc24;
+                Print(L"  PATH2-HANDOFF 68K diag jump 0x100000 -> fork entry "
+                      L"0x1B7C0 (exec=%u PPC=0x%08x)\n",
                       (UINT32)Executed, Current);
             }
             if (g_DrNativeHandoff == 0 && g_DrNativeSteer != 0 &&
@@ -5866,6 +6682,7 @@ if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 48) {
                 // written, r28 frozen): only the fork's own entry can seed them.
                 UINT32 Np = 0x0001B7C0u;
                 g_DrNativeHandoff = 1;
+                g_NatTermPending = 1;
                 g_ForkResumePc = g_PpcContext.Gpr[24] & 0xFFFFFFFF;
                 g_PpcContext.Pc = Np;
                 // Hooked = 1;  (trimmed)
@@ -5924,8 +6741,11 @@ if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 48) {
                                 // cannot bind it, and the fork stops on it before
                                 // touching any other import.
                                 for (UINT32 Gi = 0; Gi < Frag.symCount; Gi++) {
-                                    if (Imports[Gi] == 0)
+                                    if (Imports[Gi] == 0) {
+                                        const char *nm = Frag.imports[Gi].name ? Frag.imports[Gi].name : "(null)";
+                                        Print(L"  FRAG84 SYS unbound Gi=%u name=%a\\n", (UINT64)Gi, nm);
                                         Imports[Gi] = 0x0000BA20u;
+                                    }
                                 }
                                 PefRelocateSection(&Frag, 1, Frag.expanded[1], Imports);
                             }
@@ -5982,7 +6802,7 @@ if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 48) {
                     // import, so the fork continues instead of halting).
                     CpuWrite32(0x0000BA20u + 0x00, 0x0000BA28u);
                     CpuWrite32(0x0000BA20u + 0x04, 0x00000000u);
-                    CpuWrite32(0x0000BA28u + 0x00, 0x38600000u);
+                    CpuWrite32(0x0000BA28u + 0x00, 0x38601000u); // li r3,0x1000
                     CpuWrite32(0x0000BA28u + 0x04, 0x4E800020u);
                     CpuWrite32(0x0000B900u + 0xCA, 0x0000B940u);   // [+0xCA] = record
                     CpuWrite32(0x0000B900u + 0x470, 0x68E96000u); // [+0x470] = stream base
@@ -6010,6 +6830,11 @@ if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 48) {
                       L"RAM (file offset == runtime addr); [0x100000]=0x%08x "
                       L"[0x100004]=0x%08x\n",
                       CpuRead32(0x00100000u), CpuRead32(0x00100004u));
+                // Real CFM loader: expand+relocate every other fragment and
+                // layer the properly-instantiated images over the raw mirror.
+                // Also records the TOC of the fragment that owns 0x100000 so the
+                // native handoff can set r2 to that fragment's TOC, not QD's.
+                NatCfmLoadSystem();
                 // Session state for the decoder 0x3873C, entered by the fork's
                 // own `bl 0x4618C` at 0x1B89C. Decoder SP is built by the fork
                 // prologue: r1 starts 0x9EFE (the ROM glue's sthu already ran),
@@ -6044,7 +6869,11 @@ if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 48) {
                     // instead (Dst stays live in r21/r29).
                     CpuWrite32(Frm + 0x60, 0x40B67C60u);               // DR dispatch continuation
                     CpuWrite32(Frm + 0x64, 0x00000000u);               // progress
-                    CpuWrite32(Frm + 0x68, Dst);                       // dest (r29) -> r21+4
+                    // The stub at 0x100000 reads its return address from
+                    // 8(r1) with r1=Frm+0x60, i.e. [Frm+0x68] (NOT [Frm+0x60]).
+                    // Seed the real slot with the DR continuation so the stub's
+                    // blr returns to 0x40B67C60 instead of self-looping on Dst.
+                    CpuWrite32(Frm + 0x68, 0x40B67C60u);               // stub ret slot 8(r1)
                     CpuWrite32(Frm + 0x6C, C);                         // reader arg0 = container
                     CpuWrite32(Frm + 0x70, 0x00000020u);               // bits-in-word (r23)
                     CpuWrite32(Frm + 0x74, 0x00000020u);
@@ -6117,7 +6946,123 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x1B7C0: GetQDGlobals "
                       L"@0xB940 (rec+6=0 rec+60=0 rec+42=-1); decoder frame "
                       L"@0x9E9E seeded; stream 0x68E96000 len 0x1CB0A\n");
                 }
+                // The Pc=Np assignment above must take effect THIS iteration:
+                // otherwise the loop's trailing PpcExecuteInstruction call runs
+                // the pre-handoff Current and overwrites Pc with Next, so the
+                // fork entry 0x1B7C0 is never executed (the decoder never runs
+                // and 0x100000 keeps the raw fork bytes). Restart the loop so
+                // the next iteration begins at the fork entry.
+                g_Snap100a = CpuRead32(0x00100000u);
+                g_Snap100b = CpuRead32(0x00100004u);
+                continue;
             }
+        }
+        // ---- NATIVE-TERMINAL: the fork's return must not re-enter the DR ----
+        // Once the fork has run (g_DrNativeHandoff == 1) the ROM 68K DR is
+        // supposed to be left behind permanently. The fork's tail `blr` at
+        // 0x1B930 restores its entry LR -- 0x40BA7680, the ROM's JMP(A0) hub,
+        // seeded by the NATIVE-HANDOFF -- and returns there. The hub then does
+        // `addi r24,r16,0` (r24 := A0 = 0x100000, the raw System fork bytes)
+        // and `b 0x40B67CE4`, re-entering the 68K dispatch: the dispatch's
+        // `mtlr r29`/`bclr` would branch through r29, which the fork left
+        // clobbered at an arbitrary fork address (0x132000, a bogus mid-function
+        // entry), whose epilogue then reads a stale frame slot [r1+0x78]=0x7C38A0
+        // as its return address and dies on a reserved opcode (GUEST STOP at
+        // PC=0x7C38A0). Break the return at the hub and continue as plain PPC
+        // at the diag/OS entry 0x100000 instead. The fork's epilogue already
+        // restored [r1+8] to its entry LR (the hub), while the leaf stub at
+        // 0x100000 (`lwz r0,8(r1); mtlr r0; lwz r31,-4(r1); blr`) returns via
+        // that slot -- seed it with the next real diag prologue 0x100010 so
+        // native execution continues there, and treat any later hub re-entry
+        // post-handoff as a terminal diagnostic, never a DR dispatch.
+        {
+            if (g_DrNativeHandoff != 0 &&
+                Current >= 0x40BA7680u && Current <= 0x40BA7684u) {
+                if (g_NatTermPending != 0u) {
+                    g_NatTermPending = 0u;         // consume the one-shot
+                    UINT32 R1 = g_PpcContext.Gpr[1] & 0xFFFFFFFF;
+                    Print(L"  NATIVE-TERMINAL fork return at hub 0x%08x exec=%u "
+                          L"r1=0x%08x [r1+8]=0x%08x LR=0x%08x r24=0x%08x "
+                          L"r29=0x%08x -> native diag entry 0x100000->0x100010\n",
+                          Current, (UINT32)Executed, R1,
+                          CpuRead32(R1 + 8u), g_PpcContext.Lr & 0xFFFFFFFF,
+                          g_PpcContext.Gpr[24] & 0xFFFFFFFF,
+                          g_PpcContext.Gpr[29] & 0xFFFFFFFF);
+                    CpuWrite32(R1 + 8u, 0x00100010u);   // stub returns into the real diag prologue
+                    if (g_NatCfmMainEntry != 0u) {
+                        // Real program-fragment entry: enter the fragment's
+                        // 'main' transition vector with its own TOC instead of
+                        // the bogus 0x100000 diag target (a mid-stub epilogue
+                        // inside NativePowerMgrLib).  The CFM loader placed the
+                        // fragment's code in place (file offset == runtime
+                        // address) and its data in the bump region, so the
+                        // entry + r2 are fully resolved.
+                        NatMemInit ();
+                        g_PpcContext.Gpr[2] = g_NatCfmMainToc;
+                        g_PpcContext.Pc = g_NatCfmMainEntry;
+                        // Program fragments use the FPU; the CFM launches
+                        // programs with MSR[FP] enabled.  Without it the first
+                        // `mffs` raises the FP-unavailable exception and
+                        // dispatches through the (uninitialized) 0x800 vector.
+                        g_PpcContext.Msr |= 0x00002000u;   // MSR[FP]
+                        Print(L"  NATIVE-TERMINAL -> program fragment main "
+                              L"0x%08x (r2=0x%08x, MSR=0x%08x) [was diag 0x100000]\n",
+                              g_NatCfmMainEntry, g_NatCfmMainToc, g_PpcContext.Msr);
+                        continue;
+                    }
+                    if (g_NatCfmEntryToc != 0u) {
+                        // Native code at 0x100000 belongs to the CFM fragment the
+                        // loader placed there; enter it with that fragment's TOC
+                        // (its glues resolve *(r2-4) into its own import table)
+                        // rather than QuickDraw's leftover r2.
+                        g_PpcContext.Gpr[2] = g_NatCfmEntryToc;
+                        Print(L"  NATIVE-TERMINAL r2 := fragment TOC 0x%08x "
+                              L"for entry 0x100000\n", g_NatCfmEntryToc);
+                    }
+                    g_PpcContext.Pc = 0x00100000u;       // through the stub tail
+                    continue;
+                }
+                Print(L"  NATIVE-TERMINAL RE-ENTRY: post-handoff control is "
+                      L"looping through the hub (PC=0x%08x); terminating run\n",
+                      Current);
+                g_PpcContext.Pc = Current;
+                return EFI_ABORTED;
+            }
+        }
+        // NATDIAG-IMP diagnostic: the post-handoff diag/OS code at 0x100000
+        // funnels native calls through the import glue at 0x1008C4:
+        //   lwz r12,-4(r2); stw r2,0x14(r1); lwz r0,0(r12); lwz r2,4(r12);
+        //   mtctr r0; bcctr
+        // Dump the descriptor resolution (the bcctr target comes from [r12]).
+        if (Current == 0x1008C4u && LogUnsupported != 0) {
+            UINT32 R1 = g_PpcContext.Gpr[1] & 0xFFFFFFFF;
+            UINT32 R2 = g_PpcContext.Gpr[2] & 0xFFFFFFFF;
+            UINT32 RP = CpuRead32(R2 - 4u);
+            UINT32 RA = CpuRead32(RP + 0u);
+            UINT32 RB = CpuRead32(RP + 4u);
+            Print(L"  NATDIAG-IMP at 0x1008C4 exec=%u r2=0x%08x [r2-4]=0x%08x "
+                  L"r1=0x%08x [r1+8]=0x%08x LR=0x%08x ",
+                  (UINT32)Executed, R2, RP, R1,
+                  CpuRead32(R1 + 8u), g_PpcContext.Lr & 0xFFFFFFFF);
+            if (RP == 0x40BA7680u) {
+                Print(L"-> desc looped into hub (unresolved import)\n");
+            } else {
+                Print(L"-> desc{r0=0x%08x toc=0x%08x}\n", RA, RB);
+            }
+            g_NatImpProbes++;
+        }
+        if (Current == 0x1008D8u && g_NatImpProbes != 0) {
+            UINT32 R1 = g_PpcContext.Gpr[1] & 0xFFFFFFFF;
+            UINT32 R2 = g_PpcContext.Gpr[2] & 0xFFFFFFFF;
+            UINT32 RP = CpuRead32(R2 - 4u);
+            UINT32 RA = CpuRead32(RP + 0u);
+            UINT32 RB = CpuRead32(RP + 4u);
+            Print(L"  NATDIAG-BCTR at 0x1008D8 exec=%u r2=0x%08x [r2-4]=0x%08x "
+                  L"ctr->0x%08x r12=0x%08x r0=0x%08x r1=0x%08x [r1+8]=0x%08x "
+                  L"LR=0x%08x desc{r0=0x%08x toc=0x%08x}\n",
+                  (UINT32)Executed, R2, RP, g_PpcContext.Ctr & 0xFFFFFFFF,
+                  g_PpcContext.Gpr[12] & 0xFFFFFFFF, g_PpcContext.Gpr[0] & 0xFFFFFFFF,
+                  R1, CpuRead32(R1 + 8u), g_PpcContext.Lr & 0xFFFFFFFF, RA, RB);
         }
         // Post-OS-handoff native-DR continuation: the C-68K takerover
         // (DrC68kTrapRequest == 2 -> M68kExecuteFromPPC) has been REMOVED.
@@ -6256,9 +7201,10 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x1B7C0: GetQDGlobals "
                 A0RingN++;
                 if (A0Now == 0x00100000u) {
                     Print(L"  A0TRACE r16 <- 0x00100000 by PC=0x%08x w=0x%08x "
-                          L"LR=0x%08x r24=0x%08x r3=0x%08x r4=0x%08x r5=0x%08x "
-                          L"r6=0x%08x r27=0x%08x\n",
+                          L"LR=0x%08x r1=0x%08x r24=0x%08x r3=0x%08x r4=0x%08x "
+                          L"r5=0x%08x r6=0x%08x r27=0x%08x\n",
                           Current, Instr, g_PpcContext.Lr,
+                          g_PpcContext.Gpr[1] & 0xFFFFFFFF,
                           g_PpcContext.Gpr[24] & 0xFFFFFFFF,
                           g_PpcContext.Gpr[3] & 0xFFFFFFFF,
                           g_PpcContext.Gpr[4] & 0xFFFFFFFF,
@@ -6271,6 +7217,30 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x1B7C0: GetQDGlobals "
                             UINT32 p = (A0RingN - 1u - d) & 7u;
                             Print(L"  A0RING[-%u] PC=0x%08x old=0x%08x new=0x%08x\n",
                                   d, A0RingPc[p], A0RingOld[p], A0RingNew[p]);
+                        }
+                    }
+                    {
+                        // Stack-window dump around r1 so the slot that held
+                        // 0x100000 and its neighbours (return addrs / args)
+                        // identify who planted it.
+                        UINT32 Base = (g_PpcContext.Gpr[1] & 0xFFFFFFFFu) & ~3u;
+                        INT32  Off;
+                        for (Off = -0x40; Off <= 0x40; Off += 4) {
+                            UINT32 Addr = Base + (UINT32)Off;
+                            Print(L"  A0STK[%d] [0x%08x]=0x%08x%s\n",
+                                  Off, Addr, CpuRead32(Addr),
+                                  (Off == 0) ? L"  <== r1" : L"");
+                        }
+                        {
+                            UINT32 A;
+                            for (A = 0x0000FF00u; A < 0x00010040u; ) {
+                                UINT32 J;
+                                Print(L"  A0HEX %08x:", A);
+                                for (J = 0; J < 16 && A < 0x00010040u; J++, A++) {
+                                    Print(L" %02x", PpcDefaultReadByte(A));
+                                }
+                                Print(L"\n");
+                            }
                         }
                     }
                 }
@@ -6419,12 +7389,13 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x1B7C0: GetQDGlobals "
             UINT64 r3 = g_PpcContext.Gpr[3];
             UINT64 r12 = g_PpcContext.Gpr[12];
             Print(L"  BSNAP exec=%u PC=0x%08x r24=0x%08x op=0x%04x r1=0x%08x "
-                  L"lr=0x%08x ctr=0x%08x r3=0x%08x r12=0x%08x "
-                  L"[r3+27]=%u [r12+2]=%u\n",
+                  L"lr=0x%08x ctr=0x%08x r3=0x%08x r12=0x%08x r2=0x%08x "
+                  L"M118=0x%08x [M118+8]=0x%08x [r3+27]=%u [r12+2]=%u\n",
                   (UINT32)Executed, Current, g_PpcContext.Gpr[24] & 0xFFFFFFFF,
                   g_PpcContext.Gpr[27] & 0xFFFF, g_PpcContext.Gpr[1] & 0xFFFFFFFF,
                   g_PpcContext.Lr & 0xFFFFFFFF, g_PpcContext.Ctr & 0xFFFFFFFF,
-                  r3, r12,
+                  r3, r12, g_PpcContext.Gpr[2] & 0xFFFFFFFF,
+                  CpuRead32(0x118), CpuRead32(CpuRead32(0x118) + 8),
                   (r3 < 0x10000000 ? g_ReadByte((UINT32)r3 + 0x27) : 0),
                   (r12 < 0x10000000 ? g_ReadByte((UINT32)r12 + 0x02) : 0));
             if (g_LowRamDumped == 0) {
@@ -6685,6 +7656,8 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x1B7C0: GetQDGlobals "
             CpuWrite32(0x00009FEC, 0x0000B100);  // [KDP-0x14] ECB ptr (KCall save/restore frame slot)
             CpuWrite32(0x0000B074, 0x40B80000);  // ed.v[0x74] opcode table
             CpuWrite32(0x0000B078, 0x40B60000);  // ed.v[0x78] emulator base
+            CpuWrite32(0x0000B814, 0x40B6F7C0);  // ed.v[0x814] dispatch helper (ROM+0x36F7C0)
+            CpuWrite32(0x0000B818, 0x40B6F7D0);  // ed.v[0x818] opcode-class helper (ROM+0x36F7D0)
             // NK software-function dispatch table seed: the 0x40B1AED0 handler
             // reads its target slot from low RAM 0xACB8 + n*4 (n = soft-fn in
             // r15) and adds n*4, so each slot must hold (stub - n*4). Nothing in
@@ -8635,6 +9608,13 @@ CpuRead32(0x00100000u),
             CpuWrite32(R28S3 + 0x28, 0x00000052u);
             g_PpcContext.Gpr[8] = 0;
             g_DrA003Gate++;
+            if (g_DrA003Gate <= 4) {
+                Print(L"  A003GATE[%u] r24=0x%08x r1=0x%08x r28=0x%08x "
+                      L"[r28+0x28]=0x%08x win=%u\n",
+                      g_DrA003Gate, g_PpcContext.Gpr[24] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[1] & 0xFFFFFFFF, R28S3,
+                      CpuRead32(R28S3 + 0x28), g_DrPostYieldWindow);
+            }
         }
         // A003 land probe: after the A003 gate the stub should resume at 0x52
         // and fall into the `movea.l ($2AE).w,a0` native jump at 0x54.
@@ -10119,15 +11099,34 @@ static const UINT32 Ranges[8][2] = {
                     Print(L"GUEST STOP at PC=0x%08x inst=0x%08x (%s): %r\n",
                           g_PpcContext.Pc, Instr, StopMn, Status);
                 }
+                Print(L"  FORKPROBE instr=%lu first=0x%08x last=0x%08x dec=%lu "
+                      L"c4672c=%lu c8fdc=%lu low=%lu\n",
+                      g_ForkInstr, g_ForkFirst, g_ForkLast, g_DecInstr,
+                      g_Call4672c, g_Call8fdc, g_LowCode);
+                Print(L"  FORKPROBE2 dec14F=%lu snap100=%08x/%08x now100=%08x/%08x "
+                      L"now110=%08x/%08x/%08x/%08x\n",
+                      g_Dec14F, g_Snap100a, g_Snap100b,
+                      CpuRead32(0x00100000u), CpuRead32(0x00100004u),
+                      CpuRead32(0x00100010u), CpuRead32(0x00100014u),
+                      CpuRead32(0x00100018u), CpuRead32(0x0010001Cu));
+                {
+                    UINTN K;
+                    Print(L"  FORKRING (oldest..newest):");
+                    for (K = 0; K < 32 && K < g_ForkRingN; K++) {
+                        UINTN Idx = (g_ForkRingN - 32 + K) & 31u;
+                        Print(L" %08x", g_ForkRingPc[Idx]);
+                    }
+                    Print(L"\n");
+                }
                 // Cap the crash backtrace: the full 4096-entry ring buried the
                 // boot milestones under thousands of TRACE[-N] lines.
-                if (TailCount > 120) {
-                    Print(L"--- last 120 of %d instructions before stop ---\n",
+                if (TailCount > 4096) {
+                    Print(L"--- last 4096 of %d instructions before stop ---\n",
                           TailCount);
                 } else {
                     Print(L"--- last %d instructions before stop ---\n", TailCount);
                 }
-                for (I = 0; I < TailCount && I < 120; I++) {
+                for (I = 0; I < TailCount && I < 4096; I++) {
                     UINTN Idx = (TailStart + TailCount - 1 - I) % 4096;
                     PpcDecodeInstruction(TailInst[Idx], Mn, sizeof(Mn));
                     Print(L"  TRACE[-%d] PC=0x%08x 0x%08x %s -> 0x%08x r24=0x%08x r27=0x%08x r7=0x%08x r5=0x%08x r15=0x%08x r16=0x%08x CR=0x%08x r28=0x%08x LR=0x%08x\n",

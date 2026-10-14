@@ -22,6 +22,10 @@ static uint32_t rd32(const uint8_t *p) {
 static int32_t rds32(const uint8_t *p) { return (int32_t)rd32(p); }
 static int16_t rds16(const uint8_t *p) { return (int16_t)rd16(p); }
 
+void (*g_PelRelocLog)(unsigned long addr, unsigned imp) = 0;
+static uint32_t g_PelLogAbsBase;  /* absolute guest base of section being relocated */
+static int      g_PelLogEnable;   /* log import relocations for the entry fragment */
+
 static void PelMove(void *dst, const void *src, size_t n)
 {
     uint8_t *d = (uint8_t *)dst;
@@ -594,6 +598,8 @@ static int PefExecRange(const PefChunkStream *cs, size_t start, size_t count,
                     if (p + 4 > bufLen) return -1;
                     v = rd32(buf + p) + importAddrs[*importIndex + i];
                     PelMove(buf + p, &(uint8_t[4]){v>>24,v>>16,v>>8,v}, 4);
+                    if (g_PelLogEnable && g_PelRelocLog)
+                        g_PelRelocLog((unsigned long)(g_PelLogAbsBase + (uint32_t)p), (unsigned)(*importIndex + i));
                 }
                 *importIndex += run;
                 *relocAddr += run * 4; break;
@@ -608,6 +614,8 @@ static int PefExecRange(const PefChunkStream *cs, size_t start, size_t count,
                 if (p + 4 > bufLen) return -1;
                 v = rd32(buf + p) + importAddrs[idx];
                 PelMove(buf + p, &(uint8_t[4]){v>>24,v>>16,v>>8,v}, 4);
+                if (g_PelLogEnable && g_PelRelocLog)
+                    g_PelRelocLog((unsigned long)(g_PelLogAbsBase + (uint32_t)p), (unsigned)idx);
                 *importIndex = idx + 1;
                 *relocAddr += 4;
             } else if (sub == 1) { /* SmSetSectC */
@@ -652,6 +660,8 @@ static int PefExecRange(const PefChunkStream *cs, size_t start, size_t count,
             if (p + 4 > bufLen || idx >= (1u << 20)) return -1;
             v = rd32(buf + p) + importAddrs[idx];
             PelMove(buf + p, &(uint8_t[4]){v>>24,v>>16,v>>8,v}, 4);
+            if (g_PelLogEnable && g_PelRelocLog)
+                g_PelRelocLog((unsigned long)(g_PelLogAbsBase + (uint32_t)p), (unsigned)idx);
             *importIndex = (int)idx + 1;
             *relocAddr += 4;
             pc += 2;
@@ -709,6 +719,8 @@ int PefRelocateSection(PefFragment *f, int secIndex, uint8_t *buf,
             PefChunkStream cs;
             uint32_t relocAddr = f->sections[secIndex].defaultAddress;
             int importIndex = 0;
+            g_PelLogAbsBase = f->secBase[secIndex];
+            g_PelLogEnable  = (f->base == 0x0055CB40u);
             cs.chunks = f->file + relocBase + first;
             cs.nchunks = cnt;
             if (PefExecRange(&cs, 0, cnt, f->sections[secIndex].defaultAddress,

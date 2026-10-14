@@ -153,6 +153,11 @@ uint32_t PefPlaceFragment(PefFragment *f, uint32_t codeBase, uint32_t dataBase);
 int PefRelocateSection(PefFragment *f, int secIndex, uint8_t *buf,
                        uint32_t *importAddrs);
 
+/* Optional debug hook: called for each import-bound relocation in the entry
+   fragment (base 0x0055CB40).  addr is the absolute guest address written,
+   imp the import index.  Left NULL in normal operation. */
+extern void (*g_PelRelocLog)(unsigned long addr, unsigned imp);
+
 /* Resolve the runtime address of an exported symbol within a placed fragment.
    Returns 0 if the export does not live in an instantiated section. */
 uint32_t PefExportAddress(const PefFragment *f, const PefExportedSymbol *e);

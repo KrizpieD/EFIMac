@@ -118,6 +118,48 @@ BootOpenFile (
 
 static
 EFI_STATUS
+BootDumpBufferToFile (
+    IN CHAR16* FilePath,
+    IN VOID*   Data,
+    IN UINTN   Size
+    )
+{
+    EFI_FILE_IO_INTERFACE* Fs = NULL;
+    EFI_STATUS Status = PpcGetFileSystem(&Fs, NULL);
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+    EFI_FILE_HANDLE Root = NULL;
+    Status = Fs->OpenVolume(Fs, &Root);
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+    EFI_FILE_HANDLE File = NULL;
+    Status = Root->Open(Root, &File, FilePath,
+                        EFI_FILE_MODE_CREATE | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_READ,
+                        0);
+    if (EFI_ERROR(Status)) {
+        Root->Close(Root);
+        return Status;
+    }
+    UINTN Rem = Size;
+    UINTN Off = 0;
+    while (Rem > 0) {
+        UINTN Chunk = Rem;
+        Status = File->Write(File, &Chunk, (UINT8*)Data + Off);
+        if (EFI_ERROR(Status) || Chunk == 0) {
+            break;
+        }
+        Rem -= Chunk;
+        Off += Chunk;
+    }
+    File->Close(File);
+    Root->Close(Root);
+    return Status;
+}
+
+static
+EFI_STATUS
 BootReadFileInto (
     IN  EFI_FILE_HANDLE File,
     IN  CHAR16*         FilePath,
@@ -2879,9 +2921,12 @@ PpcStageOsRuntime (
         PpcWriteGuestByte(PPC_OS_RUNTIME_GUEST_BASE + (UINT32)I,
                           ((UINT8*)Host)[I]);
     }
+    {
+        EFI_STATUS DumpStatus = BootDumpBufferToFile(L"\\sysdump.bin", Host, FileSize);
+        Print(L"OS runtime: dump System data fork -> \\sysdump.bin (%r, %d bytes)\n",
+              DumpStatus, (UINT64)FileSize);
+    }
     BS->FreePool(Host);
-
-    // Record the staged guest base in the emulator boot-info block (+20) so
     // the interpreter's DR-handoff can relocate the 68K boot stub to low RAM.
     BootWriteWord32(PPC_LOW_MEM_GUEST_BASE + PPC_LOW_MEM_BOOTINFO_OFFSET +
                         PPC_LOW_MEM_BOOTINFO_OSRUNTIME_OFFSET,
@@ -2923,6 +2968,13 @@ PpcPrepareSystemForBoot (
         Status = PpcPatchNewWorldRom();
         if (EFI_ERROR(Status)) {
             Print(L"Warning: 68K emulator ROM patch failed: %r\n", Status);
+        }
+        {
+            EFI_STATUS Dr = BootDumpBufferToFile(L"\\romdump.bin",
+                                                  g_BootContext.RomHostBuffer,
+                                                  (UINTN)g_BootContext.RomSize);
+            Print(L"romdump: dumped %d ROM bytes -> \\romdump.bin (%r)\n",
+                  (UINT64)g_BootContext.RomSize, Dr);
         }
     }
 

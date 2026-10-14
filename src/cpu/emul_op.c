@@ -265,6 +265,15 @@ EmulDiskPrimeTransfer (
         return 64;                            // nsDrvErr
     }
 
+    {
+        static UINT32 DiskLog = 0;
+        DiskLog++;
+        if (DiskLog <= 64u || (DiskLog & 0xFFu) == 0u) {
+            Print(L"  DISKPRIME[%u] ref=%u wr=%u pos=0x%08x cnt=%u buf=0x%08x\n",
+                  DiskLog, RefNum, (UINT32)IsWrite, PosOffset, ReqCount, Buffer);
+        }
+    }
+
     // If the in-emulator HFS reader has a volume mounted on this same device,
     // present it as the boot disk: use its byte range to bound the PRIME reads
     // so the guest's own HFS driver never walks off the end of the filesystem.
@@ -422,6 +431,14 @@ EmulOpDispatch (
     IN UINT32 Selector
     )
 {
+    {
+        static UINT32 EmulOpLog = 0;
+        EmulOpLog++;
+        if (EmulOpLog <= 128u || (EmulOpLog & 0x3FFu) == 0u) {
+            Print(L"  EMULOP[%u] sel=%u D0=%08x A0=%08x A1=%08x A2=%08x A3=%08x\n",
+                  EmulOpLog, Selector, RD(0), RA(0), RA(1), RA(2), RA(3));
+        }
+    }
     switch (Selector) {
 
     case PPC_OP_BREAK:
