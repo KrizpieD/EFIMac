@@ -6,7 +6,7 @@
 #       -OldWorldRom "mac_roms\1997-11 - 79D68D63 - Power Mac G3 desktop.ROM"
 #   .\scripts\run-qemu-windows.ps1 -MacDisc mac_discs\MacOS 8 (...8.1...).iso
 #
-# Validation matrix targets (see TODO.md "Validation Matrix"):
+# Validation matrix targets (see ARCHITECTURE.md "Open work"):
 #   Mac OS 9.2.2  -MacDisc mac_discs\Apple Mac OS 9.2.2 [PowerMac G4].7z  (New World)
 #   Mac OS 8.1    -MacDisc mac_discs\MacOS 8 (...8.1...).iso             (New World)
 #   System 7.5.3  -MacDisc mac_discs\System7_5_3.img  + -OldWorldRom      (Old World)

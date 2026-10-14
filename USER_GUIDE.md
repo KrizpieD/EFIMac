@@ -4,11 +4,14 @@
 
 The boot layer is functional as a UEFI application: it builds, boots under
 QEMU/OVMF, runs its self-tests, stages System Folder files and drivers from real
-classic Mac discs, and executes a genuine New World `Mac OS ROM` continuously —
-the nano-kernel boots through init, PMDT→areas, and task creation to the live
-DR console wait. It does not yet reach the OS desktop: the SCC receive
-interrupt path and MMU/translation model are still to come. This guide covers
-what works today and how to exercise it.
+classic Mac discs, and executes a genuine New World `Mac OS ROM` continuously.
+The nano-kernel boots through init, PMDT→areas, and task creation; the 68K
+bootstrap and the System's CFM entry fragment run; and, with the host Memory
+Manager backing the Toolbox zone calls, the System completes its manager
+initialization and enters its `WaitNextEvent` event loop. It does not yet reach
+the OS desktop: the remaining wall is Toolbox import coverage (window/menu/
+event content), plus the MMU/translation model. This guide covers what works
+today and how to exercise it.
 
 ## What You Need
 
@@ -67,8 +70,10 @@ What to expect:
   firmware executes continuously.
 - The nano-kernel milestone stream appears: `Hello from the replacement
   multitasking NanoKernel`, `converting PMDTs to areas`, scheduler ticks, and
-  the DR console wait (`0x40B27530`/`0x40B265CC` shows in the milestone
-  timeline).
+  the DR console wait. The boot then proceeds through the 68K bootstrap and the
+  System's CFM entry fragment, completes manager initialization under the host
+  Memory Manager, and enters the System's `WaitNextEvent` event loop (no
+  desktop yet — see Limitations).
 - System Folder staging: System, Finder, and up to 64 Extensions are staged from
   the disc; the system-files self-test passes 7/7.
 - The app reports `Boot state: ready=1 ...` and keeps executing the guest (use
@@ -98,15 +103,17 @@ The log will print `System ROM installed: ... (Old World)`.
   catalog lookup, auto block-size, multi-extent files.
 - Real New World ROM discovery + install at `0xFFF00000` (read-only) with CHRP
   signature verification, plus continuous guest execution: nano-kernel init,
-  PMDT→areas, task creation, and the DR console wait.
+  PMDT→areas, task creation, the 68K bootstrap and System CFM entry fragment,
+  and the System's `WaitNextEvent` event loop.
 - System Folder / driver staging into guest staging areas with read-back
   verification.
 
 ## Limitations
 
-- The OS desktop is not reached: the SCC receive interrupt → DRAM input ring
-  path and the MMU/translation model are not yet implemented; the guest sits in
-  the DR console read wait.
+- The OS desktop is not reached. On the order of ~109 Toolbox imports are still
+  unimplemented and return zero, so there is no window/menu/drawing/event
+  content and the guest idles in its event loop; the MMU/translation model is
+  also not yet implemented.
 - System 7 requires a user-supplied Old World ROM; a New World `Mac OS ROM`
   cannot serve System 7.
 - HFS filename bytes are MacRoman/Latin-1; names with high-bit characters print

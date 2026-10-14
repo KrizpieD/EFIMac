@@ -10,9 +10,12 @@ PowerPC CPU self-test (including the FPU core), sets up the guest memory map
 graphics/audio/storage/network, installs a real New World ROM from a Mac OS
 8.5+/9 disc when attached, stages the System Folder and drivers, and then
 executes the installed firmware continuously: the nano-kernel boots through
-init, PMDT->areas, and task creation to the live DR console wait. The full boot
-sequence has been verified under QEMU + OVMF on a Windows host (CPU 35/35,
-system files 7/7, NK milestones live).
+init, PMDT->areas, and task creation; the 68K bootstrap and the System's CFM
+entry fragment run; and, with the host Memory Manager in place, the System
+completes manager initialization and enters its `WaitNextEvent` event loop. The
+full boot sequence has been verified under QEMU + OVMF on a Windows host (CPU
+35/35, system files 7/7, NK milestones live). Reaching the desktop is still
+blocked on Toolbox import coverage; see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Overview
 
@@ -101,10 +104,11 @@ The sources use GNU-EFI idioms:
 
 ## Testing
 
-The EFI application has been smoke-tested under QEMU + OVMF: it boots, runs
-all of its initialization (UEFI pool allocation, memory map, loaded-image
-protocol, console output), prints its status report, and returns cleanly to the
-firmware.
+The EFI application boots under QEMU + OVMF: it runs all of its initialization
+(UEFI pool allocation, memory map, loaded-image protocol, console output), runs
+its self-tests, installs a ROM and stages the System Folder when a Mac disc is
+attached, and then enters the continuous guest-execution loop. A plain boot with
+no disc attached exercises everything up to the demo ROM.
 
 To reproduce:
 
@@ -152,8 +156,9 @@ Select-String -Path "$env:TEMP\opencode\boot_out.txt" -Pattern "self-test comple
 Expect CPU self-test 35/35 and the system-files self-test 7/7; with a Mac OS
 8.5+/9 disc the real New World ROM installs and the guest firmware runs
 continuously (nano-kernel milestones: "Hello from the replacement multitasking
-NanoKernel", "converting PMDTs to areas", scheduler ticks, DR console wait). Use
-`-NoReboot -StallSeconds 0` to stay in the console phase.
+NanoKernel", "converting PMDTs to areas", scheduler ticks, DR console wait, then
+the System entry fragment after the host Memory Manager breaks its bootstrap
+loop). Use `-NoReboot -StallSeconds 0` to stay in the console phase.
 
 ## Directory Structure
 
@@ -171,8 +176,8 @@ EFIMac/
 ├── Makefile                # Build configuration
 ├── README.md               # Project overview
 ├── ARCHITECTURE.md         # Design notes
-├── TODO.md                 # Implementation plan
-└── USER_GUIDE.md           # User documentation
+├── USER_GUIDE.md           # User documentation
+└── AGENTS.md               # Agent-oriented build/run/harness notes
 ```
 
 ## Troubleshooting

@@ -1,144 +1,106 @@
-# EFIMac — Heavy Bootloader for Classic Mac OS on x86_64 UEFI
+# EFIMac — A Heavy UEFI Bootloader for Classic Mac OS
 
-EFIMac is a **heavy UEFI bootloader** for classic Mac OS (System 7, Mac OS 8,
-Mac OS 9) on x86_64 UEFI systems. It boots as an EFI application, builds a
-classic PowerPC Mac memory image (guest RAM, low-memory globals, a read-only ROM
-window, staged System Folder files and drivers), installs Mac firmware into that
-image, and executes the guest's own firmware and operating system on a PowerPC
-interpreter backed by standard UEFI protocols.
+EFIMac boots classic Mac OS (System 7 through Mac OS 9) on ordinary x86_64
+machines. It ships as a single UEFI application: the firmware boots it, it
+builds the environment a PowerPC Mac expects, and then it runs that Mac's own
+firmware and operating system on an interpreter.
 
-> Terminology: EFIMac is a *bootloader*, not an emulator. It provides the
-> hardware environment a real PowerPC Mac firmware expects and then runs that
-> firmware (and the OS it boots) on the host CPU through an interpreter. The
-> abstraction surface is UEFI protocol implementations driving real x86_64
-> hardware.
+> **It is a bootloader, not an emulator.** EFIMac does not reimplement classic
+> Mac OS. It provides the memory image, ROM window, low-memory globals, device
+> windows and UEFI-backed hardware that a real PowerPC Mac's firmware expects,
+> and then executes the guest's *own* firmware and OS. UEFI protocols are the
+> hosting layer underneath.
 
-## Project Overview
+## Why
 
-Classic Mac OS expects a PowerPC Mac: a ROM window at `0xFFF00000` (New World)
-or the ROM/ISA windows of an Old World Mac, system globals in low memory, a boot
-volume holding the System Folder, and hardware devices behind specific register
-windows. EFIMac provides that environment from a UEFI bootloader:
+A PowerPC Mac's firmware (`Mac OS ROM`, or an Old World ROM dump) and the
+operating system it starts are ordinary PowerPC code. They only need a
+sufficiently faithful hardware environment. EFIMac supplies that environment
+using UEFI standard protocols so the result runs on commodity x86_64 hardware —
+no PowerPC CPU, no Mac logic board.
 
-- **UEFI standard protocols are the hardware abstraction.** Graphics (GOP),
-  storage (Block I/O / Simple File System), and networking (Simple Network
-  Protocol) are used directly as the platform's I/O; simulated Mac devices
-  (framebuffer window, audio ring buffer) are wired to those inputs.
-- **An in-emulator HFS reader** reads classic Mac discs directly (System 7
-  floppy/disc images and Mac OS 8/9 install discs), with automatic block-size
-  detection, catalog-based lookup, and multi-extent file support.
-- **A PowerPC interpreter with a continuous fetch/execute loop** runs the
-  installed firmware for real: fixed 32-bit opcodes, GPR/SPR/FPU state, a
-  multi-region guest memory map, a timebase/decrementer scheduler tick, and
-  PowerPC exception delivery through the firmware's own vector table.
-- **Mac firmware sourcing.** New World `Mac OS ROM` files are auto-discovered on
-  attached discs (verified with a genuine Mac OS 9.2.2 install disc); Old World
-  firmware is supplied by the user as a ROM dump on the boot volume; a demo ROM
-  keeps the full install path exercisable without either.
+The long-term goal is an EFI application that installs and boots a real classic
+Mac OS from a real Mac disc, end to end.
 
-## Current Status
+## What it does
 
-Booting today under QEMU + OVMF with a Mac OS 9.2.2 install disc attached:
+- **Reads real Mac discs in place.** An in-emulator HFS/HFS+ reader parses
+  attached floppy/disc/CD images directly (auto block size, catalog lookup,
+  multi-extent files) — no host mount required.
+- **Installs guest firmware.** A real New World `Mac OS ROM` is auto-discovered
+  on a Mac OS 8.5+ disc; an Old World firmware dump can be supplied on the boot
+  volume. A small demo ROM keeps the install path exercisable without either.
+- **Builds a classic Mac memory map.** Guest RAM, a 256 KB low-memory globals
+  region, the `0x68000000` nano-kernel system area, staging areas for the System
+  Folder, and a read-only ROM window are all wired into the interpreter.
+- **Runs the guest on a PowerPC interpreter.** Decode/execute of the full
+  integer + FPU instruction set, timebase/decrementer tick, exceptions delivered
+  through the guest's own vector table, and the guest's own 68K "DR" emulator
+  running natively as the PPC code it actually is.
+- **Hosts the guest's managers.** Where the guest's bootstrap expects a working
+  Toolbox (a Memory Manager zone, QuickDraw, the Window/Dialog/Menu/Event
+  managers), the bootloader backs the CFM imports with host implementations.
 
-- The 2,763,530-byte `Mac OS ROM` (`<CHRP-BOOT>` signature) is auto-discovered,
-  installed read-only at guest `0xFFF00000`, and executed continuously by the
-  interpreter.
-- The nano-kernel engine embedded in the ROM boots live: **"Hello from the
-  replacement multitasking NanoKernel. Version: ..."**, coherence group setup,
-  address spaces, BAT setup, ready queues, blue task, timeslicing, idle task,
-  then **"converting PMDTs to areas"** (VMM zone carving via the free-list
-  walker).
-- Task creation with PPC/68K interleave: scheduler context restore
-  (`RETTASK`), DRYIELD trap round-trips into 68K dispatch, and the DR console
-  path is reached.
-- The **DR console read loop is live** at guest `0x40B2751C`; the SCC receive
-  device is emulated (status `0x20002`, data `0x20006`) and the boot console
-  drains queued characters during the banner flush.
-- **Fix B (2026-09):** the NK scheduler idle-frame queue-head mirror is
-  implemented, eliminating the SBIDLE deadlock; the scheduler loops cleanly
-  (26× SBODY / 64× SCHEDENT) and terminal setup proceeds each pass.
-- Builds on Windows (git-bash + clang/lld-link) and macOS (`make`); runs a full
-  self-test suite (PowerPC CPU 35/35 incl. FPU, boot memory map, System
-  Folder/driver staging 7/7); drives real GOP/Block I/O/SNP hardware.
+## Status
 
-Not yet:
+EFIMac is an active research/engineering project. It boots real firmware well
+past early bring-up; it does not yet reach the desktop.
 
-- **Boot advances past the idle sell.** The emulator now fabricates the external
-  interrupt through the guest's own D0 level-9 dispatch (see
-  [ARCHITECTURE.md](ARCHITECTURE.md)): at the idle give-up (`0x40B24F04`) it
-  raises EXT, seeds the IC dispatch tables so the firmware's KCALLSAVE → level-9
-  ISR → dispatch rfi runs for real, forces a sane resume MSR, and lands the
-  preempted task back at its sell-glue continuation. This is a stable, repeatable
-  task switch (180 s soaks, no spinlock/crash), but it does **not yet advance
-  boot** — the idle task re-sells forever. The missing wake appears to be a
-  timer/DEC, the warm/CSR branch at `0x40B126E8`, or an unemulated KDP service
-  rather than more SCC input (the 4 queued `'g' CR 'g' CR` bytes are already
-  consumed).
-- **SCC receive interrupt → DRAM input ring.** The DR debugger wait ultimately
-  needs the SCC's Rx interrupt path to move received bytes from the SCC FIFO
-  into the nano-kernel's DRAM input ring; machine-level interrupt routing
-  (interrupt controller + SCC IRQ) is on the roadmap once the blocking wake is
-  identified.
-- No MMU/translation model yet (the nano-kernel runs on a flat alias today; the
-  firmware-side BAT/SDR1 handshake is not exercised).
-- Finder / OS desktop not reached; System 7 Old World ROM path not yet
-  validated end-to-end (a New World `Mac OS ROM` cannot serve System 7).
+**Working end to end:**
 
-For the current boot-state details and the interrupt-machinery roadmap, see
-[ARCHITECTURE.md](ARCHITECTURE.md) and [TODO.md](TODO.md).
+- Builds on Windows (git-bash + clang/lld-link) and macOS (`make`).
+- Self-tests pass: PowerPC CPU 35/35 (incl. FPU), boot memory map, System
+  Folder/driver staging 7/7.
+- With a Mac OS 9.2.2 install disc, the 2.4 MB New World `Mac OS ROM` is
+  discovered, installed read-only, and executed.
+- The ROM's nano-kernel boots: coherence groups, address spaces, BAT setup,
+  ready queues, blue/idle tasks, timeslicing, then VMM zone carving
+  ("converting PMDTs to areas").
+- The System's 68K bootstrap runs under the guest's own PPC DR emulator, reaches
+  the CFM entry fragment, and — now that a **host Memory Manager** backs the
+  Toolbox zone calls — completes its manager initialization
+  (`InitGraf`/`InitFonts`/`InitWindows`/`InitMenus`, Resource/Dialog/Event/
+  Process managers) and settles into its `WaitNextEvent` event loop.
 
-## ROM Priority
+**Not yet:**
 
-1. `\System\MacOS\ROM` on the boot volume (EFI System Partition) — a classic
-   Old World firmware dump (4 MB).
-2. A user-supplied `\System Folder\Extensions\Mac OS ROM` file on the ESP.
-3. `Mac OS ROM` auto-discovered on an attached Mac disc via the in-emulator HFS
-   reader (New World, Mac OS 8.5+).
-4. Demo ROM fallback (self-check only; cannot boot an OS).
+- **The desktop is not reached.** The biggest remaining wall is Toolbox
+  coverage: on the order of ~109 Toolbox imports are still unimplemented and
+  return zero, so no windowing, drawing, menu or event content is produced and
+  the guest idles in its event loop. These are being implemented manager by
+  manager.
+- **No MMU/translation model.** The guest runs on a flat direct map; the
+  firmware's BAT/SDR1 translation handshake is not yet exercised.
+- **System 7** needs a user-supplied Old World ROM (a New World `Mac OS ROM`
+  cannot serve it); that path is not validated end to end.
 
-## Guest Memory Map
+See [ARCHITECTURE.md](ARCHITECTURE.md) for how it works and what's next.
 
-| Region                | Guest address | Size    |
-|-----------------------|---------------|---------|
-| Low-memory globals    | `0x00000000`  | 16 KB   |
-| Guest RAM             | `0x10000000`  | 256 MB  |
-| Framebuffer window    | `0x18000000`  | 640x480x32 |
-| Audio ring buffer     | `0x18800000`  | 8 KB    |
-| System area           | `0x20000000`  | 16 MB   |
-| Driver area           | `0x21000000`  | 32 MB   |
-| System ROM window     | `0xFFF00000`  | 4 MB (read-only) |
+## Guest memory map
 
-Guest firmware executes with KDP at `0xA000` and the nano-kernel/DR working set
-around `0x40B00000`; the SCC console device is mapped at `0x20000`.
+| Region                  | Guest address | Size        | Access |
+|-------------------------|---------------|-------------|--------|
+| Low-memory globals      | `0x00000000`  | 256 KB      | R/W    |
+| Boot RAM bank           | `0x00000000`  | 16 MB       | R/W    |
+| System/Finder staging   | `0x20000000`  | 16 MB       | R/W    |
+| Extensions (drivers)    | `0x21000000`  | 32 MB       | R/W    |
+| Nano-kernel system area | `0x68000000`  | 128 MB      | R/W    |
+| OS-runtime staging      | `0x68E00000`  | 16 MB       | R/W    |
+| New World ROM window    | `0xFFF00000`  | 4 MB        | R (ROM)|
 
-## Source Layout
+The New World ROM is also mapped at `0x68000000 + 0x360000` style aliases and
+executed from there; the SCC console device sits at guest `0x20000`. This is a
+host-defined environment tuned so the guest's own expectations are met, not a
+byte-for-byte reproduction of a specific Mac.
 
-```
-src/
-├── main.c                     # efi_main: subsystem init + guest handoff
-├── cpu/
-│   ├── interpreter.c          # PowerPC decode/execute loop, register file,
-│   │                          #   guest memory map, SCC/timebase/decrementer
-│   ├── m68k.c                 # Legacy 68K layer (runtime-only, not the boot path)
-│   ├── translation.h/.c       # Exception delivery + shared PPC helpers
-├── memory/
-│   └── manager_impl.c         # Guest RAM (UEFI AllocatePages) + region mapping
-├── hardware/
-│   └── abstraction_impl.c     # GOP framebuffer, Block I/O, SNP, audio ring
-├── boot/
-│   ├── bootloader.h           # Guest map constants, ROM types, API
-│   └── bootloader_impl.c      # ROM install, HFS boot probe, System Folder staging
-├── fs/
-│   └── hfs.c                  # In-emulator HFS/HFS+ reader (catalog + extents)
-├── utils/
-│   └── debug_impl.c           # Debug log (boot.log) + timers
-└── platform/
-    └── uefi_interface_impl.c  # UEFI protocol discovery
-```
+## ROM sourcing
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for design details,
-[USER_GUIDE.md](USER_GUIDE.md) for running it, and [TODO.md](TODO.md) for the
-roadmap.
+1. `\System\MacOS\ROM` on the boot volume — an Old World firmware dump
+   (required for System 7).
+2. `\System Folder\Extensions\Mac OS ROM` on the boot volume.
+3. A `Mac OS ROM` file auto-discovered on an attached Mac OS 8.5+ disc
+   (New World).
+4. A demo ROM fallback (self-check only — cannot boot an OS).
 
 ## Building
 
@@ -152,55 +114,55 @@ macOS/Linux (`brew install llvm lld`):
 
 ```bash
 make
-make check
 ```
 
-Output: `build/EFI-Mac-Emulator.efi`. Details in
+Output: `build/EFI-Mac-Emulator.efi`. See
 [BUILD_INSTRUCTIONS.md](BUILD_INSTRUCTIONS.md).
 
-## Testing
+## Running
 
-Boot under QEMU + OVMF and attach a classic Mac disc:
+Boot the built image under QEMU + OVMF and attach a classic Mac disc:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-qemu-windows.ps1 `
-  -MacDisc "$env:TEMP\opencode\mac\Mac OS 9.2.2.iso"
+  -MacDisc "$env:TEMP\opencode\mac_disc\Mac OS 9.2.2.iso"
 ```
 
-The serial log is captured to `$env:TEMP\opencode\boot_out.txt`. With the 9.2.2
-install disc you should see the real ROM installed:
+Serial output is captured to `$env:TEMP\opencode\boot_out.txt`. See
+[USER_GUIDE.md](USER_GUIDE.md) for options, ROM staging and what to expect.
+
+## Layout
 
 ```
-System ROM loaded from HFS volume 'Power Mac G4 Install': 2763530 bytes
-System ROM installed: 2763530 bytes at guest 0xFFF00000 (New World)
-Boot state: ready=1, kernel=0, ROM at 0xFFF00000 (2763530 bytes, New World (Mac OS ROM)) ...
+src/
+├── main.c                     # efi_main: subsystem init + guest handoff
+├── cpu/
+│   ├── interpreter.c          # PPC decode/execute, guest map, SCC, host managers
+│   ├── m68k.c                 # 68K engine (used by the guest's DR layer)
+│   ├── emul_op.c              # EMUL_OP device-selector handlers
+│   └── translation_impl.c     # Exceptions + shared PPC helpers
+├── memory/manager_impl.c      # Guest RAM (UEFI pages) + region mapping
+├── hardware/abstraction_impl.c# GOP framebuffer, Block I/O, SNP, audio ring
+├── boot/bootloader_impl.c     # ROM install, HFS boot probe, System Folder staging
+├── boot/pef_loader.c          # PEF/CFM loader for the System fragment
+├── fs/hfs.c                   # In-emulator HFS/HFS+ reader
+├── ui/ui_impl.c               # On-screen UI
+├── utils/debug_impl.c         # Log + timers
+└── platform/uefi_interface_impl.c
 ```
 
-and then the nano-kernel milestone stream (`Hello from the replacement
-multitasking NanoKernel`, `REPLACEMENT_mK`, scheduler ticks, DR console reach).
+## Prior art
 
-## Important Notes
+EFIMac is an independent take, but it is not the first attempt at this and it
+leans on what others learned. It is **similar to SheepShaver in some ways** (the
+idea of supplying the guest's low-memory/ROM bootstrap globals and a
+paravirtual Host, and reusing the guest's own 68K emulator), and **takes a
+little from DingusPPC** (its treatment of the nanokernel/DR as PPC code and its
+device/interrupt models). Basilisk II and QEMU are additional references for
+classic Mac device behaviour.
 
-- Classic Mac OS files are copyrighted by Apple. This project does not include
-  any Mac OS or Mac firmware files; you must supply your own ROMs and discs.
-- For System 7, place a genuine Old World ROM dump at `\System\MacOS\ROM` on
-  the boot volume. A New World `Mac OS ROM` (from Mac OS 8.5+) is detected
-  automatically from discs and booted, but cannot serve System 7.
-- The guest currently runs firmware on a flat alias; real MMU/translation
-  (BATs/SDR1) serving is future work.
-- Existing open-source projects (SheepShaver, Basilisk II, QEMU, DingusPPC)
-  are valuable references for the PowerPC and Mac device semantics this project
-  re-creates on UEFI. DingusPPC's interrupt-controller (Grand Central / VIA) and
-  SCC models are the reference for EFIMac's machine wiring work.
+## Notes
 
-## License
-
-GPL-3.0-or-later. See [LICENSE](LICENSE).
-
-## Version
-
-- **Version**: 0.3
-- **Status**: Nano-kernel boots through init, PMDT->areas, and task creation to
-  the live DR console wait; interrupt machinery (SCC->IRQ->input ring) is the
-  current work.
-- **Target**: x86_64 UEFI.
+- Classic Mac OS and Mac firmware are copyrighted by Apple. This repository
+  contains none of them; you must supply your own ROMs and discs.
+- License: GPL-3.0-or-later. See [LICENSE](LICENSE).
