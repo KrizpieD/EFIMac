@@ -158,6 +158,14 @@ int PefRelocateSection(PefFragment *f, int secIndex, uint8_t *buf,
    imp the import index.  Left NULL in normal operation. */
 extern void (*g_PelRelocLog)(unsigned long addr, unsigned imp);
 
+/* Last relocation opcode PefExecRange could not decode (diagnostic). */
+extern int g_PelFailOp;
+
+/* TEMP diagnostic: raw (expanded) and post-relocation words at section-1
+   offset 0x738 of the ROM MixedMode fragment (base sec 0x408EB880). */
+extern uint32_t g_PelRaw738, g_PelAfter738;
+extern int g_PelSet738;
+
 /* Resolve the runtime address of an exported symbol within a placed fragment.
    Returns 0 if the export does not live in an instantiated section. */
 uint32_t PefExportAddress(const PefFragment *f, const PefExportedSymbol *e);

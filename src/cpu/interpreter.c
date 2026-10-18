@@ -4,8 +4,42 @@
 #include "m68k.h"
 #include "boot/bootloader.h"
 #include "boot/pef_loader.h"
+#include "fs/resfork.h"
+#include "hardware/abstraction.h"
 #include <efi.h>
 #include <efilib.h>
+// ---------------------------------------------------------------------------
+// Fragment 0 (System/QuickDraw) placement.
+// The System fork's fragment-0 native code is packed with ~953 absolute
+// (RA=0) references into 0x18..0x1DE0 -- the 68K low-memory globals, which
+// are identity-mapped (68K addr == native addr; see M68kReadByte).  Staging
+// the code at low 0x320 aliased every one of those globals to the staged
+// code bytes, so the fork read/wrote its own instructions instead of the
+// globals (and the same 0x58C/0xFB8 slots ROM InterfaceLib reads as UPPs
+// fed garbage to CallUniversalProc).  Place the fragment well clear of the
+// 68K world instead so the globals stay intact and the code's absolute
+// refs reach the real ones.
+//
+// The boot RAM bank (guest 0x0..0x1000000) is crowded: 68K globals at
+// 0x18..0x1DE0, the raw fork mirror at 0x96000..0x2A2B0A, System-fork
+// fragment code instantiated by NatCfmLoadSystem at their file offsets
+// 0x320..0x5DBDA0, the CFM data bump starting at 0x700000 (grows upward
+// to ~0x8A7828 as ROM fragment data expands into it), the NK trampoline
+// region at 0x7F0000..0x800000, and the NAT_MEM stub zone at
+// 0xA00000..0xF00000.  The only free gap large enough for the 0x47A88-byte
+// code section is 0x5DBDA0..0x700000 (~1.1 MB) between the last fragment
+// code and the data bump start.  Place code at 0x600000 and data at
+// 0x648000 (after the code, 0x800-aligned).
+// ---------------------------------------------------------------------------
+#define NAT_F0_CODE_BASE    0x00600000u
+#define NAT_F0_DATA_BASE    0x00648000u
+/* The fork's FUNCTION ENTRY, an offset within the (uncompressed) code
+   section.  The handoff resumes here so the fork's own prologue runs its
+   bookkeeping (bl 0x4672c; bl 0x8fdc) instead of a synthesized frame. */
+#define NAT_F0_ENTRY_OFF    0x0001B4A0u
+#define NAT_F0_CODE_LEN     0x00047A88u
+#define NAT_F0_CODE_END     (NAT_F0_CODE_BASE + NAT_F0_CODE_LEN)
+#define NAT_F0_AT(off)      (NAT_F0_CODE_BASE + (off))
 // Global PowerPC CPU context (backing store for the interpreter and the
 // public register accessor API)
 PPC_CPU_CONTEXT g_PpcContext = {0};
@@ -1032,9 +1066,28 @@ PpcCopyGuestMemory (
         Offset += Chunk;
     }
 }
+static UINT32 g_LowGlobWatchN;   // (LOWGLOB) capped write log into the A5 globe window
+static UINT32 g_LowGlobDumped;   // (LOWGLOB) one-shot window dump at first CallUniversalProc
+static UINT32 g_LastPc;          // branch source (previous executed PC)
 static UINT32 CpuRead16 (UINT32 A) { return ((UINT32)g_ReadByte(A) << 8) | g_ReadByte(A + 1); }
 static UINT32 CpuRead32 (UINT32 A) { return (CpuRead16(A) << 16) | CpuRead16(A + 2); }
-static VOID   CpuWrite16(UINT32 A, UINT32 V) { g_WriteByte(A, (UINT8)(V >> 8)); g_WriteByte(A + 1, (UINT8)V); }
+static VOID   CpuWrite16(UINT32 A, UINT32 V) {
+    if ((A >= 0x00000540u && A < 0x00000600u) ||
+        (A >= 0x00000F80u && A < 0x00001000u) ||
+        ((A & ~3) >= 0x00000540u && (A & ~3) < 0x00000600u) ||
+        ((A & ~3) >= 0x00000F80u && (A & ~3) < 0x00001000u)) {
+        if (g_LowGlobWatchN < 64u) {
+            g_LowGlobWatchN++;
+            Print(L"  LOWGLOB16[%u] W %08x <- %04x (pc=%08x last=%08x lr=%08x r24=%08x)\n",
+                  g_LowGlobWatchN - 1u, A, V & 0xFFFFu, g_PpcContext.Pc, g_LastPc,
+                  g_PpcContext.Lr & 0xFFFFFFFFu,
+                  g_PpcContext.Gpr[24] & 0xFFFFFFFFu,
+                  g_PpcContext.Gpr[2] & 0xFFFFFFFFu);
+        }
+    }
+    g_WriteByte(A, (UINT8)(V >> 8));
+    g_WriteByte(A + 1, (UINT8)V);
+}
 // ---- PPC-side DR bootstrap (pure PPC; no C-68K) ----
 // On real hardware the guest's 68K BootROM runs first (via the ROM's own PPC
 // DR emulator) and fabricates the emulator-task ECB context: [ECB+0x1C4] holds
@@ -1155,10 +1208,9 @@ static UINT64 g_NatDecSteps = 0;      // decoder(0x3873C) runaway canary count
 static UINT32 g_DrNativeHandoff = 0;  // one-shot: host switched to native PPC at 0x1B820
 static UINT32 g_NatTermPending = 0;   // NATIVE-TERMINAL one-shot arm (set at handoff; .bss is not zero-filled)
 static UINT32 g_NatImpProbes = 0;     // NATDIAG import-glue probe budget (fire-once)
-static UINT32 g_LastPc = 0;           // branch source (previous executed PC)
 static UINT32 PollRing[64];            // pre-first-poll PC ring
 static UINT32 PollRingIdx = 0;         // ring cursor
-static UINT64 g_ForkInstr = 0;         // instrs executed in fork range [0x1B7C0,0x1B940)
+static UINT64 g_ForkInstr = 0;         // instrs executed at the fork entry window
 static UINT32 g_ForkFirst = 0xFFFFFFFFu; // first fork PC seen
 static UINT32 g_ForkLast  = 0;         // last fork PC seen
 static UINT32 g_ForkRingPc[32];        // last 32 fork PCs
@@ -1180,6 +1232,12 @@ static UINT32 g_PcWatchLog    = 0;    // capped per-dispatch log in the 0x81.. z
 static UINT32 g_ForkResumePc = 0;     // 68K PC (@fork freeze) the DR must resume from
 static UINT32 g_DrForkSlotFixed = 0;
 static UINT32 g_LowRamDumped = 0;  // one-shot: ed.v[8] PC-slot repair for the fork glue
+static UINT32 g_QdProbeRender = 0; // QD render(0x1F640) hit count
+static UINT32 g_QdProbePixSrv = 0; // QD pixmap service(0x1B8D8) hit count
+static UINT32 g_QdProbeBmpWr  = 0; // QD bitmap write(0x1A974) hit count
+static UINT32 g_QdProbeGlue   = 0; // unbound-import glue stub(0xBA28) hit count
+static UINT32 g_NatCupPtrs[64];    // distinct CallUniversalProc targets seen
+static UINT32 g_NatCupN = 0;       // count of distinct targets logged
 static UINT32 g_DrNativeSteer = 0;    // latched by the tail-A207 0x1B823 write (never reset)
 // Single-shot gate: once the DR returns from its 0x116 service call (68K a6 =
 // 0x4080AA3C) with D0 bit0 cleared so the boot driver skips the unstaged low-
@@ -1281,6 +1339,37 @@ static VOID   CpuWrite32(UINT32 A, UINT32 V)
             Print(L"  TRACE100[%u] W %08x <- %08x (pc=%08x lr=%08x r1=%08x)\n",
                   T100N - 1, A, V, g_PpcContext.Pc, g_PpcContext.Lr,
                   g_PpcContext.Gpr[1]);
+        }
+    }
+    // TVWATCH: who writes the MixedMode TVector at frag6 sec1+0x738 (0x7AFCD8)?
+    if (A >= 0x007AFCD8u && A < 0x007AFCE0u) {
+        static UINT32 TvN = 0;
+        if (TvN < 64) {
+            TvN++;
+            Print(L"  TVWATCH[%u] W %08x <- %08x (pc=%08x last=%08x lr=%08x "
+                  L"r2=%08x r3=%08x r4=%08x r12=%08x)\n",
+                  TvN - 1, A, V, g_PpcContext.Pc, g_LastPc, g_PpcContext.Lr,
+                  g_PpcContext.Gpr[2], g_PpcContext.Gpr[3],
+                  g_PpcContext.Gpr[4], g_PpcContext.Gpr[12]);
+        }
+    }
+    // LOWGLOB: InterfaceLib (PPC trap glue) reads the 68K A5 world via absolute
+    // low-memory refs (e.g. `lwz r3,0x58c(0)`) and feeds the result to
+    // CallUniversalProc as a UPP.  Those globals live at 0x540..0x600 and
+    // 0xF80..0x1000; fragment 0's code no longer lands on them (it is staged
+    // at NAT_F0_CODE_BASE, clear of the 68K world), so any store here is now a
+    // genuine guest initialization.  Track them to see whether the guest ever
+    // writes a real UPP there, or whether InterfaceLib still reads stale/zero.
+    if ((A >= 0x00000540u && A < 0x00000600u) ||
+        (A >= 0x00000F80u && A < 0x00001000u)) {
+        if (g_LowGlobWatchN < 64u) {
+            g_LowGlobWatchN++;
+            Print(L"  LOWGLOB[%u] W %08x <- %08x (pc=%08x last=%08x lr=%08x "
+                  L"r24=%08x r2=%08x)\n",
+                  g_LowGlobWatchN - 1u, A, V, g_PpcContext.Pc, g_LastPc,
+                  g_PpcContext.Lr & 0xFFFFFFFFu,
+                  g_PpcContext.Gpr[24] & 0xFFFFFFFFu,
+                  g_PpcContext.Gpr[2] & 0xFFFFFFFFu);
         }
     }
     TaskStoreWatch(A, V, 4);
@@ -3692,20 +3781,21 @@ PpcExecuteInstruction (
         return EFI_INVALID_PARAMETER;
     }
     // Fork/decoder reachability probes: prove whether the resumed fork prologue
-    // (0x1B7C0) actually calls its bookkeeping (0x4672c), the decompressor
-    // (0x8fdc / decoder 0x3873C), or runs low staged code at all.
-    if (CurrentAddress >= 0x0001B7C0u && CurrentAddress < 0x0001B940u) {
+    // (NAT_F0_AT(0x1B4A0)) actually calls its bookkeeping (0x4672c), the
+    // decompressor (0x8fdc / decoder 0x3873C), or runs its own code at all.
+    if (CurrentAddress >= NAT_F0_AT(0x1B4A0u) &&
+        CurrentAddress <  NAT_F0_AT(0x1B620u)) {
         if (g_ForkFirst == 0xFFFFFFFFu) g_ForkFirst = CurrentAddress;
         g_ForkLast = CurrentAddress;
         g_ForkRingPc[g_ForkRingN & 31u] = CurrentAddress;
         g_ForkRingN++;
         g_ForkInstr++;
     }
-    if (CurrentAddress >= 0x00038700u && CurrentAddress < 0x00038900u) g_DecInstr++;
-    if (CurrentAddress == 0x0004672Cu) g_Call4672c++;
-    if (CurrentAddress == 0x00008FDCu) g_Call8fdc++;
-    if (CurrentAddress >= 0x00000300u && CurrentAddress < 0x00001000u) g_LowCode++;
-    if (CurrentAddress >= 0x00014F00u && CurrentAddress < 0x00015200u) g_Dec14F++;
+    if (CurrentAddress >= NAT_F0_AT(0x383E0u) && CurrentAddress < NAT_F0_AT(0x385E0u)) g_DecInstr++;
+    if (CurrentAddress == NAT_F0_AT(0x4640Cu)) g_Call4672c++;
+    if (CurrentAddress == NAT_F0_AT(0x8CBCu)) g_Call8fdc++;
+    if (CurrentAddress >= NAT_F0_CODE_BASE && CurrentAddress < NAT_F0_CODE_BASE + 0xCE0u) g_LowCode++;
+    if (CurrentAddress >= NAT_F0_AT(0x14BE0u) && CurrentAddress < NAT_F0_AT(0x14EE0u)) g_Dec14F++;
     // ---- DIAGSTUB: break the System-fork epilogue self-loop @0x100000 ----
     // The System data fork is mirrored into low RAM, so the ROM glue's diag
     // target 0x100000 lands in fork bytes that decode as a leaf epilogue:
@@ -3754,10 +3844,12 @@ PpcExecuteInstruction (
                         Print(L" %08x", CpuRead32(a));
                     Print(L"\n  DIAGSTUB-SLOT [0x2AE]=0x%08x [0x698]=0x%08x "
                           L"[0x2B0]=0x%08x [0x2B4]=0x%08x [0x96000]=0x%08x "
-                          L"[0x1B7C0]=0x%08x\n",
+                          L"[0x58C]=0x%08x [0xFB8]=0x%08x "
+                          L"[forkentry]=0x%08x\n",
                           CpuRead32(0x2AE), CpuRead32(0x698),
                           CpuRead32(0x2B0), CpuRead32(0x2B4),
-                          CpuRead32(0x96000), CpuRead32(0x1B7C0));
+                          CpuRead32(0x96000), CpuRead32(0x58C),
+                          CpuRead32(0xFB8), CpuRead32(NAT_F0_AT(0x1B4A0u)));
                 }
                 Print(L"  DIAGSTUB-PATH");
                 {
@@ -5590,6 +5682,11 @@ static UINT32 PeiBe32(const UINT8 *p)
    in the System data fork (file offset == runtime address).  Fragment 83 is the
    large program fragment (16 imported libs incl. MPLibrary/NameRegistryLib). */
 #define NAT_CFM_ENTRY_BASE 0x0055CB40u
+/* The staged New World ROM is itself a stream of PEF containers (InterfaceLib,
+   MixedMode, the native QuickDraw/GetQDGlobals library, ...). Their code already
+   lives in the ROM window, so loading them lets the System's InterfaceLib
+   imports bind to the guest's real Toolbox glue instead of host stubs. */
+#define NAT_CFM_ROM_SIZE    0x00400000u
 
 static VOID *NatCfmAlloc(void *ctx, size_t n)
 {
@@ -5674,7 +5771,99 @@ enum {
     NAT_MEM_H_COMPACTMEM,
     NAT_MEM_H_PURGEMEM,
     NAT_MEM_H_TOOLTRAPGET,
-    NAT_MEM_H_TOOLTRAPSET
+    NAT_MEM_H_TOOLTRAPSET,
+
+    /* --- generic --- */
+    NAT_MEM_H_NOERR,          /* void / OSErr-with-noErr: return 0, touch nothing */
+
+    /* --- Memory Manager extras --- */
+    NAT_MEM_H_RECOVERHANDLE,
+    NAT_MEM_H_SETHANDLESIZE,
+    NAT_MEM_H_HGETSTATE,
+    NAT_MEM_H_HSETSTATE,
+    NAT_MEM_H_PTRTOHAND,
+    NAT_MEM_H_HANDTOHAND,
+    NAT_MEM_H_MUNGER,
+    NAT_MEM_H_BLOCKZERO,
+
+    /* --- low-memory / globals --- */
+    NAT_MEM_H_LMGETCURAPNAME,
+    NAT_MEM_H_LMGETWMGRPORT,
+    NAT_MEM_H_EMUREG_GET,
+    NAT_MEM_H_EMUREG_SET,
+    NAT_MEM_H_GETOVERRIDEMAP,
+
+    /* --- QuickDraw rects --- */
+    NAT_MEM_H_SETRECT,
+    NAT_MEM_H_INSETRECT,
+    NAT_MEM_H_OFFSETRECT,
+    NAT_MEM_H_UNIONRECT,
+    NAT_MEM_H_SECTRECT,
+    NAT_MEM_H_EQUALRECT,
+    NAT_MEM_H_EMPTYRECT,
+    NAT_MEM_H_SETORIGIN,
+
+    /* --- QuickDraw regions (bbox-level) --- */
+    NAT_MEM_H_NEWRGN,
+    NAT_MEM_H_DISPOSERGN,
+    NAT_MEM_H_SETRECTRGN,
+    NAT_MEM_H_SETEMPTYRGN,
+    NAT_MEM_H_EMPTYRGN,
+    NAT_MEM_H_RECTINRGN,
+    NAT_MEM_H_PTINRGN,
+    NAT_MEM_H_UNIONRGN,
+    NAT_MEM_H_DIFFRGN,
+    NAT_MEM_H_SECTRGN,
+    NAT_MEM_H_COPYRGN,
+    NAT_MEM_H_OFFSETRGN,
+    NAT_MEM_H_INSETRGN,
+    NAT_MEM_H_EQUALRGN,
+
+    /* --- Resource Manager --- */
+    NAT_MEM_H_RES_CUR,
+    NAT_MEM_H_RES_USE,
+    NAT_MEM_H_RES_GET1,
+    NAT_MEM_H_RES_GET,
+    NAT_MEM_H_RES_GETSTR,
+    NAT_MEM_H_RES_ERROR,
+    NAT_MEM_H_RES_RELEASE,
+    NAT_MEM_H_RES_UPDATE,
+    NAT_MEM_H_RES_ADD,
+    NAT_MEM_H_RES_CHANGED,
+    NAT_MEM_H_RES_DETACH,
+
+    /* --- Menu Manager --- */
+    NAT_MEM_H_MENU_APPENDRES,
+    NAT_MEM_H_MENU_INSERT,
+    NAT_MEM_H_MENU_GET,
+    NAT_MEM_H_MENU_GETITEMTEXT,
+    NAT_MEM_H_MENU_SETITEMTEXT,
+    NAT_MEM_H_MENU_SELECT,
+    NAT_MEM_H_MENU_KEY,
+    NAT_MEM_H_MENU_DRAWBAR,
+
+    /* --- Process / Event / AppleEvents --- */
+    NAT_MEM_H_WNEXT,
+    NAT_MEM_H_GETCURPROC,
+    NAT_MEM_H_GETFRONTPROC,
+    NAT_MEM_H_SAMEPROC,
+    NAT_MEM_H_NEWROUTINEDESC,
+    NAT_MEM_H_CALLUNIVPROC,
+    NAT_MEM_H_AEINSTALL,
+
+    /* --- TextEdit / utility --- */
+    NAT_MEM_H_REPLACETEXT,
+    NAT_MEM_H_NEWSTRING,
+
+    /* --- File / FS --- */
+    NAT_MEM_H_FSMKEFSSPEC,
+    NAT_MEM_H_FSPGETFINFO,
+    NAT_MEM_H_PBGETFCBINFO,
+
+    /* --- QuickDraw point transforms --- */
+    NAT_MEM_H_GLOBALTOLOCAL,
+    NAT_MEM_H_LOCALTOGLOBAL,
+    NAT_MEM_H_PTINRECT
 };
 
 typedef struct { const char *name; UINT32 handler; } NatMemEntry;
@@ -5706,6 +5895,173 @@ static const NatMemEntry NatMemTable[] = {
     { "PurgeMem",            NAT_MEM_H_PURGEMEM },
     { "GetToolTrapAddress",  NAT_MEM_H_TOOLTRAPGET },
     { "SetToolTrapAddress",  NAT_MEM_H_TOOLTRAPSET },
+
+    /* Memory Manager extras */
+    { "RecoverHandle",       NAT_MEM_H_RECOVERHANDLE },
+    { "SetHandleSize",       NAT_MEM_H_SETHANDLESIZE },
+    { "HGetState",           NAT_MEM_H_HGETSTATE },
+    { "HSetState",           NAT_MEM_H_HSETSTATE },
+    { "PtrToHand",           NAT_MEM_H_PTRTOHAND },
+    { "HandToHand",          NAT_MEM_H_HANDTOHAND },
+    { "Munger",              NAT_MEM_H_MUNGER },
+    { "BlockZero",           NAT_MEM_H_BLOCKZERO },
+
+    /* low-memory / globals */
+    { "LMGetCurApName",      NAT_MEM_H_LMGETCURAPNAME },
+    { "LMGetWMgrPort",       NAT_MEM_H_LMGETWMGRPORT },
+    { "GetEmulatorRegister", NAT_MEM_H_EMUREG_GET },
+    { "SetEmulatorRegister", NAT_MEM_H_EMUREG_SET },
+    { "GetOverrideMap",      NAT_MEM_H_GETOVERRIDEMAP },
+
+    /* QuickDraw rects */
+    { "SetRect",             NAT_MEM_H_SETRECT },
+    { "InsetRect",           NAT_MEM_H_INSETRECT },
+    { "OffsetRect",          NAT_MEM_H_OFFSETRECT },
+    { "UnionRect",           NAT_MEM_H_UNIONRECT },
+    { "SectRect",            NAT_MEM_H_SECTRECT },
+    { "EqualRect",           NAT_MEM_H_EQUALRECT },
+    { "EmptyRect",           NAT_MEM_H_EMPTYRECT },
+    { "SetOrigin",           NAT_MEM_H_SETORIGIN },
+
+    /* QuickDraw regions */
+    { "NewRgn",              NAT_MEM_H_NEWRGN },
+    { "DisposeRgn",          NAT_MEM_H_DISPOSERGN },
+    { "SetRectRgn",          NAT_MEM_H_SETRECTRGN },
+    { "SetEmptyRgn",         NAT_MEM_H_SETEMPTYRGN },
+    { "EmptyRgn",            NAT_MEM_H_EMPTYRGN },
+    { "RectInRgn",           NAT_MEM_H_RECTINRGN },
+    { "PtInRgn",             NAT_MEM_H_PTINRGN },
+    { "UnionRgn",            NAT_MEM_H_UNIONRGN },
+    { "DiffRgn",             NAT_MEM_H_DIFFRGN },
+    { "SectRgn",             NAT_MEM_H_SECTRGN },
+    { "CopyRgn",             NAT_MEM_H_COPYRGN },
+    { "OffsetRgn",           NAT_MEM_H_OFFSETRGN },
+    { "InsetRgn",            NAT_MEM_H_INSETRGN },
+    { "EqualRgn",            NAT_MEM_H_EQUALRGN },
+    { "RectRgn",             NAT_MEM_H_SETRECTRGN },
+
+    /* Resource Manager */
+    { "CurResFile",          NAT_MEM_H_RES_CUR },
+    { "UseResFile",          NAT_MEM_H_RES_USE },
+    { "Get1Resource",        NAT_MEM_H_RES_GET1 },
+    { "GetResource",         NAT_MEM_H_RES_GET },
+    { "GetIndString",        NAT_MEM_H_RES_GETSTR },
+    { "ResError",            NAT_MEM_H_RES_ERROR },
+    { "ReleaseResource",     NAT_MEM_H_RES_RELEASE },
+    { "UpdateResFile",       NAT_MEM_H_RES_UPDATE },
+    { "AddResource",         NAT_MEM_H_RES_ADD },
+    { "ChangedResource",     NAT_MEM_H_RES_CHANGED },
+    { "DetachResource",      NAT_MEM_H_RES_DETACH },
+    { "HomeResFile",         NAT_MEM_H_RES_CUR },
+
+    /* Menu Manager */
+    { "AppendResMenu",       NAT_MEM_H_MENU_APPENDRES },
+    { "InsertMenu",          NAT_MEM_H_MENU_INSERT },
+    { "GetMenu",             NAT_MEM_H_MENU_GET },
+    { "GetMenuItemText",     NAT_MEM_H_MENU_GETITEMTEXT },
+    { "SetMenuItemText",     NAT_MEM_H_MENU_SETITEMTEXT },
+    { "MenuSelect",          NAT_MEM_H_MENU_SELECT },
+    { "MenuKey",             NAT_MEM_H_MENU_KEY },
+
+    /* Process / Event / AppleEvents */
+    { "WaitNextEvent",       NAT_MEM_H_WNEXT },
+    { "GetCurrentProcess",   NAT_MEM_H_GETCURPROC },
+    { "GetFrontProcess",     NAT_MEM_H_GETFRONTPROC },
+    { "SameProcess",         NAT_MEM_H_SAMEPROC },
+    { "NewRoutineDescriptor",NAT_MEM_H_NEWROUTINEDESC },
+    { "NewTrivialRoutineDescriptor",NAT_MEM_H_NEWROUTINEDESC },
+    { "NewRoutineDescriptorUPP",NAT_MEM_H_NEWROUTINEDESC },
+    { "CallUniversalProc",   NAT_MEM_H_CALLUNIVPROC },
+    { "CallUniversalProcPtr",NAT_MEM_H_CALLUNIVPROC },
+    { "CallUniversalProcToMP",NAT_MEM_H_CALLUNIVPROC },
+    { "CallOSTrapUniversalProc", NAT_MEM_H_CALLUNIVPROC },
+    { "MPCallUniversalProc", NAT_MEM_H_CALLUNIVPROC },
+    { "MPCallOSTrapUniversalProc", NAT_MEM_H_CALLUNIVPROC },
+    { "MPCallUniversalProcSWI", NAT_MEM_H_CALLUNIVPROC },
+    { "NewRoutineDescriptorForPascal", NAT_MEM_H_NEWROUTINEDESC },
+    { "DisposeRoutineDescriptor", NAT_MEM_H_NOERR },
+    { "AEInstallEventHandler", NAT_MEM_H_AEINSTALL },
+
+    /* TextEdit / utility */
+    { "ReplaceText",         NAT_MEM_H_REPLACETEXT },
+    { "NewString",           NAT_MEM_H_NEWSTRING },
+
+    /* File / FS */
+    { "FSMakeFSSpec",        NAT_MEM_H_FSMKEFSSPEC },
+    { "FSpGetFInfo",         NAT_MEM_H_FSPGETFINFO },
+    { "PBGetFCBInfoSync",    NAT_MEM_H_PBGETFCBINFO },
+    { "DIBadMount",          NAT_MEM_H_NOERR },
+
+    /* QuickDraw point transforms */
+    { "GlobalToLocal",       NAT_MEM_H_GLOBALTOLOCAL },
+    { "LocalToGlobal",       NAT_MEM_H_LOCALTOGLOBAL },
+    { "PtInRect",            NAT_MEM_H_PTINRECT },
+
+    /* void / noErr init traps */
+    { "InitGraf",            NAT_MEM_H_NOERR },
+    { "InitFonts",           NAT_MEM_H_NOERR },
+    { "InitWindows",         NAT_MEM_H_NOERR },
+    { "InitMenus",           NAT_MEM_H_NOERR },
+    { "InitDialogs",         NAT_MEM_H_NOERR },
+    { "InitCursor",          NAT_MEM_H_NOERR },
+    { "TEInit",              NAT_MEM_H_NOERR },
+    { "FlushEvents",         NAT_MEM_H_NOERR },
+    { "DrawMenuBar",         NAT_MEM_H_MENU_DRAWBAR },
+    { "SysBeep",             NAT_MEM_H_NOERR },
+    { "ExitToShell",         NAT_MEM_H_NOERR },
+    { "HiliteMenu",          NAT_MEM_H_NOERR },
+    { "HMGetBalloons",       NAT_MEM_H_NOERR },
+    { "SystemEdit",          NAT_MEM_H_NOERR },
+    { "PenNormal",           NAT_MEM_H_NOERR },
+    { "PenSize",             NAT_MEM_H_NOERR },
+    { "SetCursor",           NAT_MEM_H_NOERR },
+    { "HideCursor",          NAT_MEM_H_NOERR },
+    { "ShowCursor",          NAT_MEM_H_NOERR },
+    { "ObscureCursor",       NAT_MEM_H_NOERR },
+
+    /* Window / Dialog / Control / Scrap / Icon stubs: return NULL or 0.
+       (Unbound these already returned 0; binding just silences the trace.) */
+    { "GetNewDialog",        NAT_MEM_H_NOERR },
+    { "NewWindow",           NAT_MEM_H_NOERR },
+    { "NewCWindow",          NAT_MEM_H_NOERR },
+    { "GetNewWindow",        NAT_MEM_H_NOERR },
+    { "NewWindowPtr",        NAT_MEM_H_NOERR },
+    { "ShowWindow",          NAT_MEM_H_NOERR },
+    { "HideWindow",          NAT_MEM_H_NOERR },
+    { "FrontWindow",         NAT_MEM_H_NOERR },
+    { "MoveWindow",          NAT_MEM_H_NOERR },
+    { "SizeWindow",          NAT_MEM_H_NOERR },
+    { "SetWTitle",           NAT_MEM_H_NOERR },
+    { "BeginUpdate",         NAT_MEM_H_NOERR },
+    { "EndUpdate",           NAT_MEM_H_NOERR },
+    { "InvalRect",           NAT_MEM_H_NOERR },
+    { "ValidRect",           NAT_MEM_H_NOERR },
+    { "InvalRgn",            NAT_MEM_H_NOERR },
+    { "ValidRgn",            NAT_MEM_H_NOERR },
+    { "ModalDialog",         NAT_MEM_H_NOERR },
+    { "DialogSelect",        NAT_MEM_H_NOERR },
+    { "IsDialogEvent",       NAT_MEM_H_NOERR },
+    { "GetDialogItem",       NAT_MEM_H_NOERR },
+    { "SetDialogItem",       NAT_MEM_H_NOERR },
+    { "SetDialogItemText",   NAT_MEM_H_NOERR },
+    { "GetDialogItemText",   NAT_MEM_H_NOERR },
+    { "SetDialogDefaultItem", NAT_MEM_H_NOERR },
+    { "SetDialogCancelItem", NAT_MEM_H_NOERR },
+    { "UpdateDialog",        NAT_MEM_H_NOERR },
+    { "CloseDialog",         NAT_MEM_H_NOERR },
+    { "DisposeDialog",       NAT_MEM_H_NOERR },
+    { "DrawDialog",          NAT_MEM_H_NOERR },
+    { "NewControl",          NAT_MEM_H_NOERR },
+    { "GetNewControl",       NAT_MEM_H_NOERR },
+    { "ZeroScrap",           NAT_MEM_H_NOERR },
+    { "GetScrap",            NAT_MEM_H_NOERR },
+    { "InfoScrap",           NAT_MEM_H_NOERR },
+    { "TEToScrap",           NAT_MEM_H_NOERR },
+    { "TEFromScrap",         NAT_MEM_H_NOERR },
+    { "HMScanTemplateItems", NAT_MEM_H_NOERR },
+    { "StandardAlert",       NAT_MEM_H_NOERR },
+    { "PlotIconRef",         NAT_MEM_H_NOERR },
+    { "OpenDeskAcc",         NAT_MEM_H_NOERR },
     { NULL, NAT_MEM_H_NONE }
 };
 
@@ -5736,6 +6092,32 @@ NatMemFindHandler (
         }
     }
     return NAT_MEM_H_NONE;
+}
+
+/* The Mixed Mode family (routine-descriptor construction and dispatch) must run
+   on the host.  The ROM's own MixedMode fragment depends on a global boot-time
+   initialisation of its TOC routine vectors (e.g. sec1+0x738, see MMDATA) that
+   is never performed when fragments are instantiated standalone, so any call
+   into it dies on an uninitialised routine vector (GUEST STOP at 0xDEADBEEF).
+   These imports therefore prefer their host handlers over the ROM exports; every
+   other import keeps using the guest's real Toolbox (Route B). */
+static BOOLEAN
+NatMemHostPreferred (
+    IN const char *Name
+    )
+{
+    return NatMemNameEq (Name, "CallUniversalProc")
+        || NatMemNameEq (Name, "CallUniversalProcPtr")
+        || NatMemNameEq (Name, "CallUniversalProcToMP")
+        || NatMemNameEq (Name, "CallOSTrapUniversalProc")
+        || NatMemNameEq (Name, "MPCallUniversalProc")
+        || NatMemNameEq (Name, "MPCallOSTrapUniversalProc")
+        || NatMemNameEq (Name, "MPCallUniversalProcSWI")
+        || NatMemNameEq (Name, "NewRoutineDescriptor")
+        || NatMemNameEq (Name, "NewTrivialRoutineDescriptor")
+        || NatMemNameEq (Name, "NewRoutineDescriptorUPP")
+        || NatMemNameEq (Name, "NewRoutineDescriptorForPascal")
+        || NatMemNameEq (Name, "DisposeRoutineDescriptor");
 }
 
 /* Register a unique descriptor+stub for a host-bound import; returns the
@@ -5867,15 +6249,268 @@ NatMemInit (
            NatMemZone, NatMemFreeMps, NAT_MEM_HEAP_ADDR, NAT_MEM_HEAP_END);
 }
 
-/* Called from the PPC step loop when PC lands on a host stub. r3 carries the
-   result back; execution resumes at LR (the caller's `bl` return slot). */
+/* ---- low-level guest byte/word helpers for Toolbox primitives ---- */
+static UINT8
+NatMemRead8 (
+    IN UINT32 A
+    )
+{
+    UINT32 W = CpuRead32 (A & ~3u);
+    return (UINT8)(W >> ((3u - (A & 3u)) * 8u));
+}
 static VOID
+NatMemWrite8 (
+    IN UINT32 A,
+    IN UINT8  V
+    )
+{
+    UINT32 W = CpuRead32 (A & ~3u);
+    UINT32 Sh = (3u - (A & 3u)) * 8u;
+    W = (W & ~(0xFFu << Sh)) | ((UINT32)V << Sh);
+    CpuWrite32 (A & ~3u, W);
+}
+static UINT16
+NatMemRead16 (
+    IN UINT32 A
+    )
+{
+    UINT32 W = CpuRead32 (A & ~3u);
+    return (UINT16)(W >> ((2u - (A & 2u)) * 8u));
+}
+static VOID
+NatMemWrite16 (
+    IN UINT32 A,
+    IN UINT16 V
+    )
+{
+    NatMemWrite8 (A, (UINT8)(V >> 8));
+    NatMemWrite8 (A + 1u, (UINT8)V);
+}
+static VOID
+NatMemWrite32 (
+    IN UINT32 A,
+    IN UINT32 V
+    )
+{
+    NatMemWrite16 (A, (UINT16)(V >> 16));
+    NatMemWrite16 (A + 2u, (UINT16)V);
+}
+static UINT32
+NatMemRead32 (
+    IN UINT32 A
+    )
+{
+    return ((UINT32)NatMemRead8 (A) << 24) |
+           ((UINT32)NatMemRead8 (A + 1u) << 16) |
+           ((UINT32)NatMemRead8 (A + 2u) << 8) |
+           (UINT32)NatMemRead8 (A + 3u);
+}
+
+/* A classic QuickDraw Rect is { top, left, bottom, right } (16-bit each). */
+static VOID
+NatRectGet (
+    IN  UINT32 P,
+    OUT INT16 *T,
+    OUT INT16 *L,
+    OUT INT16 *B,
+    OUT INT16 *R
+    )
+{
+    *T = (INT16)NatMemRead16 (P + 0);
+    *L = (INT16)NatMemRead16 (P + 2);
+    *B = (INT16)NatMemRead16 (P + 4);
+    *R = (INT16)NatMemRead16 (P + 6);
+}
+static VOID
+NatRectPut (
+    IN UINT32 P,
+    IN INT16 T,
+    IN INT16 L,
+    IN INT16 B,
+    IN INT16 R
+    )
+{
+    NatMemWrite16 (P + 0, (UINT16)T);
+    NatMemWrite16 (P + 2, (UINT16)L);
+    NatMemWrite16 (P + 4, (UINT16)B);
+    NatMemWrite16 (P + 6, (UINT16)R);
+}
+static BOOLEAN
+NatRectEmpty (
+    IN INT16 T,
+    IN INT16 L,
+    IN INT16 B,
+    IN INT16 R
+    )
+{
+    return (T >= B || L >= R);
+}
+
+/* Minimal Region record: rgnSize(2), rgnBBox(8), data(2).
+   We only model the bounding box; complex region shapes fall back to it. */
+#define NAT_RGN_BBOX 2u
+static UINT32 NatQdOriginH = 0;
+static UINT32 NatQdOriginV = 0;
+
+/* --- Guest virtual screen -------------------------------------------------
+   The System's QuickDraw is native PowerPC and draws into a PixMap; it reaches
+   that PixMap through the QuickDraw globals block (the entry fragment's
+   GetQDGlobals container). Early in boot EFIMac hands the fork a synthetic
+   block that skips the device path, so the guest never draws. Install a real
+   (virtual) screen device here - QDGlobals + colour GrafPort + PixMap +
+   GDevice - all backed by the guest framebuffer window (0x18000000) that
+   PpcGraphicsBlitToDisplay copies to the GOP. Layouts follow Apple GrafTypes:
+   QDGlobals 0xCE bytes, GrafPort/CGrafPort, PixMap 0x32, GDevice. */
+#define NAT_QD_SCREEN_BASE 0x18000000u
+static VOID
+NatQdInstallScreen (
+    VOID
+    )
+{
+    PPC_FRAMEBUFFER_INFO Fb;
+    UINT16 SW = 1024, SH = 768, RB, RB8;
+    g_NatCupN = 0;
+    if (!EFI_ERROR (PpcGetFrameBufferInfo (&Fb))) {
+        SW = (UINT16)Fb.Width;
+        SH = (UINT16)Fb.Height;
+    }
+    RB  = (UINT16)(((UINT32)SW * 4u) | 0x8000u);   /* PixMap rowBytes + flag */
+    RB8 = (UINT16)((UINT32)SW * 4u);               /* BitMap rowBytes */
+
+    /* QuickDraw globals (returned by GetQDGlobals). */
+    CpuWrite32 (0x0000B900u + 0x50, NAT_QD_SCREEN_BASE); /* screenBits.baseAddr */
+    CpuWrite16 (0x0000B900u + 0x54, RB8);                /* screenBits.rowBytes */
+    CpuWrite16 (0x0000B900u + 0x56, 0);                  /* bounds.top */
+    CpuWrite16 (0x0000B900u + 0x58, 0);                  /* bounds.left */
+    CpuWrite16 (0x0000B900u + 0x5A, SH);                 /* bounds.bottom */
+    CpuWrite16 (0x0000B900u + 0x5C, SW);                 /* bounds.right */
+    CpuWrite32 (0x0000B900u + 0xCA, 0x0000B940u);        /* thePort */
+
+    /* Colour GrafPort @0xB940. */
+    CpuWrite32 (0x0000B940u + 0x00, 0x0000BD80u);        /* device (GDHandle) */
+    CpuWrite32 (0x0000B940u + 0x02, 0x0000BC80u);        /* portPixMap handle */
+    CpuWrite16 (0x0000B940u + 0x06, 0xFFFF);             /* portVersion = colour */
+    CpuWrite16 (0x0000B940u + 0x08, 0x0000);             /* grafVars = 0 */
+    CpuWrite16 (0x0000B940u + 0x10, 0);                  /* portRect.top */
+    CpuWrite16 (0x0000B940u + 0x12, 0);                  /* portRect.left */
+    CpuWrite16 (0x0000B940u + 0x14, SH);                 /* portRect.bottom */
+    CpuWrite16 (0x0000B940u + 0x16, SW);                 /* portRect.right */
+    CpuWrite16 (0x0000B940u + 0x42, 0x0000);             /* pnVis >= 0 */
+    CpuWrite32 (0x0000B940u + 0x60, 0x00000000u);        /* rgnSave */
+
+    /* PixMap @0xBC00. */
+    CpuWrite32 (0x0000BC00u + 0x00, NAT_QD_SCREEN_BASE);
+    CpuWrite16 (0x0000BC00u + 0x04, RB);
+    CpuWrite16 (0x0000BC00u + 0x06, 0);
+    CpuWrite16 (0x0000BC00u + 0x08, 0);
+    CpuWrite16 (0x0000BC00u + 0x0A, SH);
+    CpuWrite16 (0x0000BC00u + 0x0C, SW);
+    CpuWrite16 (0x0000BC00u + 0x0E, 0);                  /* pmVersion */
+    CpuWrite16 (0x0000BC00u + 0x10, 0);                  /* packType */
+    CpuWrite32 (0x0000BC00u + 0x12, 0);                  /* packSize */
+    CpuWrite32 (0x0000BC00u + 0x16, 0x00480000u);        /* hRes 72 dpi */
+    CpuWrite32 (0x0000BC00u + 0x1A, 0x00480000u);        /* vRes 72 dpi */
+    CpuWrite16 (0x0000BC00u + 0x1E, 16);                 /* pixelType RGBDirect */
+    CpuWrite16 (0x0000BC00u + 0x20, 32);                 /* pixelSize */
+    CpuWrite16 (0x0000BC00u + 0x22, 3);                  /* cmpCount */
+    CpuWrite16 (0x0000BC00u + 0x24, 8);                  /* cmpSize */
+    CpuWrite16 (0x0000BC00u + 0x2A, 0);                  /* pmTable */
+    CpuWrite16 (0x0000BC00u + 0x2C, 0);
+    CpuWrite32 (0x0000BC00u + 0x2E, 0);                  /* pmReserved */
+    CpuWrite32 (0x0000BC80u + 0x00, 0x0000BC00u);        /* PixMapHandle */
+
+    /* GDevice @0xBD00. */
+    CpuWrite16 (0x0000BD00u + 0x02, 0);                  /* gdID */
+    CpuWrite16 (0x0000BD00u + 0x14, 0x0100);             /* gdFlags bit 8 */
+    CpuWrite32 (0x0000BD00u + 0x16, 0x0000BC80u);        /* gdPMap */
+    CpuWrite16 (0x0000BD00u + 0x1A, 0);
+    CpuWrite16 (0x0000BD00u + 0x1C, 0);
+    CpuWrite16 (0x0000BD00u + 0x1E, SH);
+    CpuWrite16 (0x0000BD00u + 0x20, SW);
+    CpuWrite32 (0x0000BD80u + 0x00, 0x0000BD00u);        /* GDeviceHandle */
+
+    /* Low-memory video globals. */
+    CpuWrite32 (0x00000824u, NAT_QD_SCREEN_BASE);        /* ScrnBase */
+    CpuWrite32 (0x00000898u, NAT_QD_SCREEN_BASE);        /* ScrnBase copy */
+    CpuWrite32 (0x000008A4u, 0x0000BD80u);               /* MainDevice */
+    CpuWrite32 (0x000008A8u, 0x0000BD80u);               /* DeviceList */
+    CpuWrite32 (0x00000CC8u, 0x0000BD80u);               /* TheGDevice */
+}
+
+static UINT32 NatResErrVal = 0;
+static UINT32 g_MenuDrawLog = 0;
+
+static UINT32
+NatMemNewRgn (
+    VOID
+    )
+{
+    UINT32 Rgn = NatMemNewBlock (12u, TRUE);
+    if (Rgn != 0) { NatMemWrite16 (Rgn + 0, 10u); }
+    return Rgn;
+}
+
+/* Mixed-Mode UniversalProcPtr (RoutineDescriptor) builder. Faithful to
+   SheepShaver's SheepRoutineDescriptor (macos_util.h:332) / Apple's IM:
+   Mixed Mode. Layout (big-endian, 32 bytes):
+     +0  u16 goMixedModeTrap = 0xAAFE
+     +2  u8  version         = 7
+     +3  u8  routineDescriptorFlags
+     +4  u32 reserved1 = 0
+     +8  u8  reserved2 = 0
+     +9  u8  selectorInfo
+     +10 u16 routineCount = 1
+     +12 RoutineRecord[0]:
+         +0 u32 procInfo
+         +4 u8  reserved1
+         +5 u8  ISA            (0 = 68K, 1 = PowerPC)
+         +6 u16 routineFlags
+         +8 u32 procDescriptor (code / TVector)
+         +12 u32 reserved2
+         +16 u32 selector
+   Returns the descriptor address (the UniversalProcPtr the caller stores). */
+static UINT32
+NatMemMakeRoutineDesc (
+    IN UINT32 Proc,
+    IN UINT32 ProcInfo,
+    IN UINT8  Isa
+    )
+{
+    UINT32 D = NatMemNewBlock (32u, TRUE);
+    static UINT32 MrdN = 0;
+    if (MrdN < 24u) {
+        MrdN++;
+        Print(L"  NRD#%u proc=0x%08x info=%08x isa=%u -> desc=0x%08x "
+              L"LR=0x%08x r1=0x%08x\n",
+              MrdN, Proc, ProcInfo, (UINT32)Isa, D,
+              g_PpcContext.Lr & 0xFFFFFFFF, g_PpcContext.Gpr[1] & 0xFFFFFFFF);
+    }
+    if (D == 0) { return 0; }
+    NatMemWrite16 (D + 0u,  0xAAFEu);
+    NatMemWrite8  (D + 2u,  7u);
+    NatMemWrite8  (D + 3u,  0u);
+    NatMemWrite32 (D + 4u,  0u);
+    NatMemWrite8  (D + 8u,  0u);
+    NatMemWrite8  (D + 9u,  0u);
+    NatMemWrite16 (D + 10u, 1u);
+    NatMemWrite32 (D + 12u, ProcInfo);
+    NatMemWrite8  (D + 16u, 0u);
+    NatMemWrite8  (D + 17u, Isa);
+    NatMemWrite16 (D + 18u, 4u);          /* routineFlags: 0|0|4 */
+    NatMemWrite32 (D + 20u, Proc);
+    NatMemWrite32 (D + 24u, 0u);
+    NatMemWrite32 (D + 28u, 0u);
+    return D;
+}
+
+/* Called from the PPC step loop when PC lands on a host stub. r3 carries the
+   result back; execution resumes at LR (the caller's `bl` return slot). */static VOID
 NatMemDispatchStub (
     IN UINT32 Pc
     )
 {
     UINT32 Idx = (Pc - NAT_MEM_STUB_CODE) / 4u;
-    UINT32 H, R3, R4, R5, Res = 0;
+    UINT32 H, R3, R4, R5, R6, R7, Res = 0;
     if (Idx >= NatMemStubCount) { R3 = 0; goto done; }
     H  = NatMemStubHandler[Idx];
     if (H == NAT_MEM_H_NONE) {
@@ -5890,9 +6525,17 @@ NatMemDispatchStub (
         g_PpcContext.Pc = g_PpcContext.Lr & 0xFFFFFFFFu;
         return;
     }
+    if (NatMemStubSeen[Idx] == 0 && NatMemStubName[Idx] != NULL) {
+        NatMemStubSeen[Idx] = 1;
+        Print (L"  CALL %a (stub %u)\n", NatMemStubName[Idx], Idx);
+    } else if (NatMemStubSeen[Idx] != 0) {
+        NatMemStubSeen[Idx] = (UINT8)(NatMemStubSeen[Idx] + 1u);
+    }
     R3 = g_PpcContext.Gpr[3] & 0xFFFFFFFFu;
     R4 = g_PpcContext.Gpr[4] & 0xFFFFFFFFu;
     R5 = g_PpcContext.Gpr[5] & 0xFFFFFFFFu;
+    R6 = g_PpcContext.Gpr[6] & 0xFFFFFFFFu;
+    R7 = g_PpcContext.Gpr[7] & 0xFFFFFFFFu;
     switch (H) {
     case NAT_MEM_H_MORE:
         NatMemAddFree (R3 == 0 ? 32u : R3);
@@ -5939,6 +6582,545 @@ NatMemDispatchStub (
     case NAT_MEM_H_PURGEMEM:       Res = 1; break;
     case NAT_MEM_H_TOOLTRAPGET:    Res = R3; break;
     case NAT_MEM_H_TOOLTRAPSET:    Res = 0; break;
+
+    /* ---------- generic noErr (void / OSErr init traps) ---------- */
+    case NAT_MEM_H_NOERR:          Res = 0; break;
+
+    /* ---------- Memory Manager extras ---------- */
+    case NAT_MEM_H_RECOVERHANDLE:  Res = R3; break;
+    case NAT_MEM_H_SETHANDLESIZE:  Res = 0; break;
+    case NAT_MEM_H_HGETSTATE:      Res = 0; break;
+    case NAT_MEM_H_HSETSTATE:      Res = 0; break;
+    case NAT_MEM_H_PTRTOHAND: {
+        UINT32 Src = R3, Dst = R4, Len = R5, I;
+        UINT32 Hnd = NatMemNewHandle (Len, FALSE);
+        if (Hnd != 0) {
+            UINT32 Blk = CpuRead32 (Hnd);
+            for (I = 0; I < Len; I++) { NatMemWrite8 (Blk + I, NatMemRead8 (Src + I)); }
+            CpuWrite32 (Dst, Hnd);
+        }
+        Res = 0;
+        break;
+    }
+    case NAT_MEM_H_HANDTOHAND: {
+        UINT32 Hp = R3, Old = CpuRead32 (R3);
+        UINT32 Len = (Old != 0) ? CpuRead32 (Old - 4u) : 0u;
+        UINT32 Hnd = NatMemNewHandle (Len, FALSE);
+        if (Hnd != 0 && Old != 0) {
+            UINT32 Blk = CpuRead32 (Hnd), I;
+            for (I = 0; I < Len; I++) { NatMemWrite8 (Blk + I, NatMemRead8 (Old + I)); }
+            CpuWrite32 (Hp, Hnd);
+        }
+        Res = Hnd;
+        break;
+    }
+    case NAT_MEM_H_MUNGER:         Res = 0; break;
+    case NAT_MEM_H_BLOCKZERO: {
+        UINT32 I;
+        for (I = 0; I < R4; I++) { NatMemWrite8 (R3 + I, 0u); }
+        Res = 0;
+        break;
+    }
+
+    /* ---------- low-memory / globals ---------- */
+    case NAT_MEM_H_LMGETCURAPNAME: {
+        static const char Name[] = "EFIMac";
+        UINT32 I;
+        NatMemWrite8 (0x910u, (UINT8)(sizeof(Name) - 1u));
+        for (I = 0; I + 1u < sizeof(Name); I++) { NatMemWrite8 (0x911u + I, (UINT8)Name[I]); }
+        Res = 0x910u;
+        break;
+    }
+    case NAT_MEM_H_LMGETWMGRPORT:  Res = 0x09DEu; break;
+    /* GetEmulatorRegister / SetEmulatorRegister: the Mixed Mode "emulator"
+       register file. The 68K emulator keeps D0-D7/A0-A7/PC/SR here; native
+       Mixed Mode glue uses these to save/restore them around a 68K call. */
+    case NAT_MEM_H_EMUREG_GET: {
+        UINT32 Rn = R3 & 0xFFFFu;
+        if      (Rn < 8u)  { Res = g_M68kContext.D[Rn]; }
+        else if (Rn < 16u) { Res = g_M68kContext.A[Rn - 8u]; }
+        else if (Rn == 16u){ Res = g_M68kContext.PC; }
+        else if (Rn == 17u){ Res = g_M68kContext.SR; }
+        else               { Res = 0; }
+        break;
+    }
+    case NAT_MEM_H_EMUREG_SET: {
+        UINT32 Rn = R3 & 0xFFFFu;
+        if      (Rn < 8u)  { g_M68kContext.D[Rn] = R4; }
+        else if (Rn < 16u) { g_M68kContext.A[Rn - 8u] = R4; }
+        else if (Rn == 16u){ g_M68kContext.PC = R4; }
+        else if (Rn == 17u){ g_M68kContext.SR = R4 & 0xFFFFu; }
+        Res = 0;
+        break;
+    }
+    case NAT_MEM_H_GETOVERRIDEMAP: Res = 0; break;
+
+    /* ---------- QuickDraw rects ---------- */
+    case NAT_MEM_H_SETRECT:
+        NatRectPut (R3, (INT16)R5, (INT16)R4, (INT16)R7, (INT16)R6);
+        Res = 0; break;
+    case NAT_MEM_H_INSETRECT: {
+        INT16 T, L, B, R;
+        NatRectGet (R3, &T, &L, &B, &R);
+        L = (INT16)(L + (INT16)R4); R = (INT16)(R - (INT16)R4);
+        T = (INT16)(T + (INT16)R5); B = (INT16)(B - (INT16)R5);
+        NatRectPut (R3, T, L, B, R);
+        Res = 0; break;
+    }
+    case NAT_MEM_H_OFFSETRECT: {
+        INT16 T, L, B, R;
+        NatRectGet (R3, &T, &L, &B, &R);
+        L = (INT16)(L + (INT16)R4); R = (INT16)(R + (INT16)R4);
+        T = (INT16)(T + (INT16)R5); B = (INT16)(B + (INT16)R5);
+        NatRectPut (R3, T, L, B, R);
+        Res = 0; break;
+    }
+    case NAT_MEM_H_UNIONRECT: {
+        INT16 T1, L1, B1, R1, T2, L2, B2, R2;
+        NatRectGet (R3, &T1, &L1, &B1, &R1);
+        NatRectGet (R4, &T2, &L2, &B2, &R2);
+        if (NatRectEmpty (T1, L1, B1, R1)) { NatRectPut (R5, T2, L2, B2, R2); }
+        else if (NatRectEmpty (T2, L2, B2, R2)) { NatRectPut (R5, T1, L1, B1, R1); }
+        else {
+            INT16 T = T1 < T2 ? T1 : T2, L = L1 < L2 ? L1 : L2;
+            INT16 B = B1 > B2 ? B1 : B2, R = R1 > R2 ? R1 : R2;
+            NatRectPut (R5, T, L, B, R);
+        }
+        Res = 0; break;
+    }
+    case NAT_MEM_H_SECTRECT: {
+        INT16 T1, L1, B1, R1, T2, L2, B2, R2, T, L, B, R;
+        NatRectGet (R3, &T1, &L1, &B1, &R1);
+        NatRectGet (R4, &T2, &L2, &B2, &R2);
+        T = T1 > T2 ? T1 : T2; L = L1 > L2 ? L1 : L2;
+        B = B1 < B2 ? B1 : B2; R = R1 < R2 ? R1 : R2;
+        NatRectPut (R5, T, L, B, R);
+        Res = NatRectEmpty (T, L, B, R) ? 0u : 1u;
+        break;
+    }
+    case NAT_MEM_H_EQUALRECT: {
+        INT16 T1, L1, B1, R1, T2, L2, B2, R2;
+        NatRectGet (R3, &T1, &L1, &B1, &R1);
+        NatRectGet (R4, &T2, &L2, &B2, &R2);
+        Res = (T1 == T2 && L1 == L2 && B1 == B2 && R1 == R2) ? 1u : 0u;
+        break;
+    }
+    case NAT_MEM_H_EMPTYRECT: {
+        INT16 T, L, B, R;
+        NatRectGet (R3, &T, &L, &B, &R);
+        Res = NatRectEmpty (T, L, B, R) ? 1u : 0u;
+        break;
+    }
+    case NAT_MEM_H_SETORIGIN:
+        NatQdOriginH = R3 & 0xFFFFu;
+        NatQdOriginV = R4 & 0xFFFFu;
+        Res = 0; break;
+
+    /* ---------- QuickDraw regions (bbox-level model) ---------- */
+    case NAT_MEM_H_NEWRGN:         Res = NatMemNewRgn (); break;
+    case NAT_MEM_H_DISPOSERGN:     Res = 0; break;
+    case NAT_MEM_H_SETRECTRGN:
+        if (R3 != 0) { NatRectPut (R3 + NAT_RGN_BBOX, (INT16)R5, (INT16)R4, (INT16)R7, (INT16)R6); }
+        Res = 0; break;
+    case NAT_MEM_H_SETEMPTYRGN:
+        if (R3 != 0) { NatRectPut (R3 + NAT_RGN_BBOX, 0, 0, 0, 0); }
+        Res = 0; break;
+    case NAT_MEM_H_EMPTYRGN: {
+        INT16 T, L, B, R;
+        if (R3 == 0) { Res = 1; break; }
+        NatRectGet (R3 + NAT_RGN_BBOX, &T, &L, &B, &R);
+        Res = NatRectEmpty (T, L, B, R) ? 1u : 0u;
+        break;
+    }
+    case NAT_MEM_H_PTINRGN: {
+        INT16 T, L, B, R;
+        INT16 PH, PV;
+        if (R3 == 0) { Res = 0; break; }
+        PH = (INT16)NatMemRead16 (R4);
+        PV = (INT16)NatMemRead16 (R4 + 2);
+        NatRectGet (R3 + NAT_RGN_BBOX, &T, &L, &B, &R);
+        Res = (PV >= T && PV < B && PH >= L && PH < R) ? 1u : 0u;
+        break;
+    }
+    case NAT_MEM_H_RECTINRGN: {
+        INT16 rT, rL, rB, rR, T, L, B, R;
+        if (R3 == 0) { Res = 0; break; }
+        NatRectGet (R4, &rT, &rL, &rB, &rR);
+        NatRectGet (R3 + NAT_RGN_BBOX, &T, &L, &B, &R);
+        Res = (rT < B && rB > T && rL < R && rR > L) ? 1u : 0u;
+        break;
+    }
+    case NAT_MEM_H_COPYRGN:
+        if (R3 != 0 && R4 != 0) { PpcCopyGuestMemory (R4 + NAT_RGN_BBOX, R3 + NAT_RGN_BBOX, 8u); }
+        Res = 0; break;
+    case NAT_MEM_H_UNIONRGN: {
+        INT16 AT, AL, AB, AR, BT, BL, BB, BR;
+        if (R3 == 0 || R4 == 0) { Res = 0; break; }
+        NatRectGet (R3 + NAT_RGN_BBOX, &AT, &AL, &AB, &AR);
+        NatRectGet (R4 + NAT_RGN_BBOX, &BT, &BL, &BB, &BR);
+        if (NatRectEmpty (AT, AL, AB, AR)) { NatRectPut (R3 + NAT_RGN_BBOX, BT, BL, BB, BR); }
+        else if (!NatRectEmpty (BT, BL, BB, BR)) {
+            NatRectPut (R3 + NAT_RGN_BBOX,
+                        AT < BT ? AT : BT, AL < BL ? AL : BL,
+                        AB > BB ? AB : BB, AR > BR ? AR : BR);
+        }
+        Res = 0; break;
+    }
+    case NAT_MEM_H_SECTRGN: {
+        INT16 AT, AL, AB, AR, BT, BL, BB, BR;
+        if (R3 == 0 || R4 == 0 || R5 == 0) { Res = 0; break; }
+        NatRectGet (R3 + NAT_RGN_BBOX, &AT, &AL, &AB, &AR);
+        NatRectGet (R4 + NAT_RGN_BBOX, &BT, &BL, &BB, &BR);
+        NatRectPut (R5 + NAT_RGN_BBOX,
+                    AT > BT ? AT : BT, AL > BL ? AL : BL,
+                    AB < BB ? AB : BB, AR < BR ? AR : BR);
+        Res = 0; break;
+    }
+    case NAT_MEM_H_DIFFRGN:
+        if (R3 != 0 && R4 != 0 && R5 != 0) {
+            PpcCopyGuestMemory (R5 + NAT_RGN_BBOX, R3 + NAT_RGN_BBOX, 8u);
+        }
+        Res = 0; break;
+    case NAT_MEM_H_OFFSETRGN:
+    case NAT_MEM_H_INSETRGN: {
+        INT16 T, L, B, R;
+        if (R3 == 0) { Res = 0; break; }
+        NatRectGet (R3 + NAT_RGN_BBOX, &T, &L, &B, &R);
+        L = (INT16)(L + (INT16)R4);
+        R = (H == NAT_MEM_H_OFFSETRGN) ? (INT16)(R + (INT16)R4) : (INT16)(R - (INT16)R4);
+        T = (INT16)(T + (INT16)R5);
+        B = (H == NAT_MEM_H_OFFSETRGN) ? (INT16)(B + (INT16)R5) : (INT16)(B - (INT16)R5);
+        NatRectPut (R3 + NAT_RGN_BBOX, T, L, B, R);
+        Res = 0; break;
+    }
+    case NAT_MEM_H_EQUALRGN: {
+        INT16 T1, L1, B1, R1, T2, L2, B2, R2;
+        if (R3 == 0 || R4 == 0) { Res = 0; break; }
+        NatRectGet (R3 + NAT_RGN_BBOX, &T1, &L1, &B1, &R1);
+        NatRectGet (R4 + NAT_RGN_BBOX, &T2, &L2, &B2, &R2);
+        Res = (T1 == T2 && L1 == L2 && B1 == B2 && R1 == R2) ? 1u : 0u;
+        break;
+    }
+
+    /* ---------- Resource Manager (backed by the staged System rsrc fork) ---------- */
+    case NAT_MEM_H_RES_CUR:        Res = PpcResForkCurRef () & 0xFFFFu; break;
+    case NAT_MEM_H_RES_USE:        PpcResForkUseRef (R3); Res = 0; break;
+    case NAT_MEM_H_RES_GET1:
+    case NAT_MEM_H_RES_GET: {
+        /* GetResource/Get1Resource(type=R3, id=(INT16)R4). Return a real
+           resource handle when present, resNotFound otherwise. */
+        PPC_RESOURCE Rsc;
+        UINT32 Type = R3;
+        INT16  Id   = (INT16)(R4 & 0xFFFFu);
+        if (PpcResForkGet (Type, Id, &Rsc)) {
+            UINT32 Hnd = NatMemNewHandle (Rsc.Size ? Rsc.Size : 1u, FALSE);
+            if (Hnd == 0) {
+                NatResErrVal = 0xFFFFFF40u;      /* memFullErr */
+                Res = 0;
+            } else {
+                UINT32 Data = NatMemRead32 (Hnd);
+                UINT32 I;
+                for (I = 0; I < Rsc.Size; I++) {
+                    NatMemWrite8 (Data + I, Rsc.Data[I]);
+                }
+                NatResErrVal = 0;
+                Res = Hnd;
+            }
+        } else {
+            NatResErrVal = 0xFFFFFF40u;          /* resNotFound */
+            Res = 0;
+        }
+        break;
+    }
+    case NAT_MEM_H_RES_GETSTR: {
+        /* GetIndString(Str255 theString=R3, short strListID=R4,
+           short index=R5): the index-th Pascal string of the 'STR#' resource
+           with id strListID (1-based). */
+        PPC_RESOURCE Rsc;
+        if (R3 != 0) {
+            UINT16 Idx = (UINT16)R5;
+            if (PpcResForkGet (0x53545223u /* 'STR#' */, (INT16)(R4 & 0xFFFFu),
+                               &Rsc) &&
+                Rsc.Size >= 2u && Idx >= 1u) {
+                UINT16 N   = (UINT16)(((UINT16)Rsc.Data[0] << 8) | Rsc.Data[1]);
+                UINT32 Off = 2u;
+                UINT16 K;
+                BOOLEAN Ok = FALSE;
+                for (K = 0; K < N && Off < Rsc.Size; K++) {
+                    UINT8 L = Rsc.Data[Off];
+                    if ((UINT16)(K + 1u) == Idx) {
+                        UINT8 J;
+                        NatMemWrite8 (R3, L);
+                        for (J = 0; J < L; J++) {
+                            if (Off + 1u + J < Rsc.Size) {
+                                NatMemWrite8 (R3 + 1u + J, Rsc.Data[Off + 1u + J]);
+                            }
+                        }
+                        Ok = TRUE;
+                        break;
+                    }
+                    Off += 1u + (UINT32)L;
+                }
+                if (!Ok) { NatMemWrite8 (R3, 0u); }
+            } else {
+                NatMemWrite8 (R3, 0u);
+            }
+        }
+        Res = 0;
+        break;
+    }
+    case NAT_MEM_H_RES_ERROR:      Res = NatResErrVal; break;
+    case NAT_MEM_H_RES_RELEASE:    Res = 0; break;
+    case NAT_MEM_H_RES_UPDATE:     Res = 0; break;
+    case NAT_MEM_H_RES_ADD:        Res = 0; break;
+    case NAT_MEM_H_RES_CHANGED:    Res = 0; break;
+    case NAT_MEM_H_RES_DETACH:     Res = 0; break;
+
+    /* ---------- Menu Manager (diagnostic: log what the guest builds) ---------- */
+    case NAT_MEM_H_MENU_INSERT: {
+        UINT32 Data = (R3 != 0) ? NatMemRead32 (R3) : 0u;
+        UINT16 MenuId = (Data != 0) ? NatMemRead16 (Data + 0u) : 0u;
+        UINT8  TL = (Data != 0) ? NatMemRead8 (Data + 14u) : 0u;
+        CHAR8  T[64];
+        UINT8  Ti;
+        if (TL > 63u) { TL = 63u; }
+        for (Ti = 0; Ti < TL; Ti++) { T[Ti] = (CHAR8)NatMemRead8 (Data + 15u + Ti); }
+        T[TL] = 0;
+        Print (L"  MENU: InsertMenu hnd=%08x id=%d beforeID=%d title=\"%a\"\n",
+               R3, (INT32)(INT16)MenuId, (INT32)(INT16)(R4 & 0xFFFFu), T);
+        Res = 0;
+        break;
+    }
+    case NAT_MEM_H_MENU_APPENDRES: {
+        UINT32 Data = (R3 != 0) ? NatMemRead32 (R3) : 0u;
+        UINT16 MenuId = (Data != 0) ? NatMemRead16 (Data + 0u) : 0u;
+        Print (L"  MENU: AppendResMenu hnd=%08x id=%d type=%c%c%c%c\n",
+               R3, (INT32)(INT16)MenuId,
+               (char)((R4 >> 24) & 0xFFu), (char)((R4 >> 16) & 0xFFu),
+               (char)((R4 >> 8) & 0xFFu), (char)(R4 & 0xFFu));
+        Res = 0;
+        break;
+    }
+    case NAT_MEM_H_MENU_GET:
+        Print (L"  MENU: GetMenu id=%d\n", (INT32)(INT16)(R3 & 0xFFFFu));
+        Res = 0;
+        break;
+    case NAT_MEM_H_MENU_GETITEMTEXT:
+        Print (L"  MENU: GetMenuItemText menu=%08x item=%d\n",
+               R3, (INT32)(INT16)(R4 & 0xFFFFu));
+        if (R5 != 0) { NatMemWrite8 (R5, 0u); }
+        Res = 0;
+        break;
+    case NAT_MEM_H_MENU_SETITEMTEXT: Res = 0; break;
+    case NAT_MEM_H_MENU_SELECT:    Res = 0; break;
+    case NAT_MEM_H_MENU_KEY:       Res = 0; break;
+    case NAT_MEM_H_MENU_DRAWBAR:
+        if (g_MenuDrawLog < 8u) {
+            g_MenuDrawLog++;
+            Print (L"  MENU: DrawMenuBar called (PC=%08x)\n",
+                   g_PpcContext.Pc & 0xFFFFFFFF);
+        }
+        Res = 0;
+        break;
+
+    /* ---------- Process / Event / AppleEvents ---------- */
+    case NAT_MEM_H_WNEXT: {
+        UINT32 I;
+        if (R4 != 0) { for (I = 0; I < 16u; I++) { NatMemWrite8 (R4 + I, 0u); } }
+        Res = 0;
+        break;
+    }
+    case NAT_MEM_H_GETCURPROC:
+    case NAT_MEM_H_GETFRONTPROC:
+        if (R3 != 0) { NatMemWrite32 (R3, 0u); NatMemWrite32 (R3 + 4u, 2u); }
+        Res = 0; break;
+    case NAT_MEM_H_SAMEPROC:
+        if (R5 != 0) { NatMemWrite16 (R5, 1u); }
+        Res = 0; break;
+    case NAT_MEM_H_NEWROUTINEDESC:
+        /* NewRoutineDescriptor(proc=R3, procInfo=R4, isa=R5). Build a real
+           RoutineDescriptor in guest memory and return its address (the UPP
+           the caller stores and later passes to CallUniversalProc). ISA:
+           0 = 68K, 1 = PowerPC. Respect the caller's ISA (no defaulting). */
+        Res = NatMemMakeRoutineDesc (R3, R4, (UINT8)(R5 & 0xFFu));
+        break;
+    case NAT_MEM_H_CALLUNIVPROC: {
+        /* UniversalProcPtr in R3, ProcInfoType in R4. Faithful Mixed-Mode
+           dispatch: a UPP is either a RoutineDescriptor (goMixedModeTrap
+           0xAAFE at base+0) or a plain procedure / native TVector {entry,toc}.
+           For PowerPC routines, jump to procDescriptor (or TVector entry) with
+           the matching TOC in r2. */
+        if (g_LowGlobDumped == 0) {
+            g_LowGlobDumped = 1;
+            {
+                UINT32 a;
+                Print(L"  LOWGLOB-DUMP [540-5C0]:\n");
+                for (a = 0x00000540u; a < 0x000005C0u; a += 4) {
+                    UINT32 v = CpuRead32(a);
+                    Print(L"    %08x: %08x\n", a, v);
+                }
+                Print(L"  LOWGLOB-DUMP [F80-1000]:\n");
+                for (a = 0x00000F80u; a < 0x00001000u; a += 4) {
+                    UINT32 v = CpuRead32(a);
+                    Print(L"    %08x: %08x\n", a, v);
+                }
+            }
+        }
+        UINT32 Up      = R3;
+        UINT32 Base    = Up & ~1u;
+        BOOLEAN IsDesc = (NatMemRead16 (Base) == 0xAAFEu);
+        UINT32 CodePtr, TocPtr = 0u, Isa = 1u;
+        if (IsDesc) {
+            CodePtr = NatMemRead32 (Base + 20u);   /* procDescriptor */
+            Isa     = NatMemRead8  (Base + 17u);   /* ISA: 0=68K, 1=PPC */
+            if (Isa == 1u) {
+                /* procDescriptor may be a native TVector {entry,toc}. */
+                TocPtr = NatMemRead32 (CodePtr + 4u);
+                if (!(CodePtr >= 0x00040000u && CodePtr < 0x01000000u &&
+                      (CodePtr & 3u) == 0u)) {
+                    TocPtr = 0u;   /* not a TVector; treat as a raw entry */
+                }
+            }
+        } else {
+            CodePtr = Base;                        /* plain proc / TVector */
+            TocPtr  = NatMemRead32 (Base + 4u);    /* {entry,toc} second word */
+            if (!(TocPtr >= 0x00040000u && TocPtr < 0x01000000u)) { TocPtr = 0u; }
+        }
+        if (g_NatCupN < 64u) {
+            UINT32 Ci, Seen = 0;
+            for (Ci = 0; Ci < g_NatCupN; Ci++) {
+                if (g_NatCupPtrs[Ci] == R3) { Seen = 1; break; }
+            }
+            if (!Seen) {
+                g_NatCupPtrs[g_NatCupN++] = R3;
+                Print(L"  CUP ptr=0x%08x(info%08x) desc=%u isa=%u code=0x%08x toc=0x%08x LR=0x%08x\n",
+                      R3, R4, IsDesc ? 1u : 0u, Isa, CodePtr, TocPtr,
+                      g_PpcContext.Lr & 0xFFFFFFFF);
+                for (Ci = 0; Ci < 32u; Ci += 8u) {
+                    Print(L"    [%08x]=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                          Base + Ci,
+                          NatMemRead8(Base + Ci + 0u), NatMemRead8(Base + Ci + 1u),
+                          NatMemRead8(Base + Ci + 2u), NatMemRead8(Base + Ci + 3u),
+                          NatMemRead8(Base + Ci + 4u), NatMemRead8(Base + Ci + 5u),
+                          NatMemRead8(Base + Ci + 6u), NatMemRead8(Base + Ci + 7u));
+                }
+                /* One-time dump of the routine's target block (procDescriptor)
+                   so an empty / 68K-closure proc is visible. */
+                if (IsDesc && CodePtr != 0u) {
+                    UINT32 Di;
+                    Print(L"    proc@%08x=", CodePtr);
+                    for (Di = 0; Di < 24u; Di += 4u) {
+                        Print(L"%08x ", NatMemRead32(CodePtr + Di));
+                    }
+                    Print(L"\n");
+                }
+            }
+        }
+        /* A PowerPC routine: dispatch. Accept the fragment code window and the
+           host stub arena (native-op thunks live there). 68K routines (isa 0)
+           need the DR path and are not handled here. */
+        if (Isa == 1u &&
+            CodePtr >= 0x00100000u && CodePtr < 0x00800000u && (CodePtr & 3u) == 0u) {
+            if (TocPtr != 0u) { g_PpcContext.Gpr[2] = TocPtr; }
+            g_PpcContext.Pc = CodePtr;
+            return;
+        }
+        if (Isa == 1u && CodePtr >= NAT_MEM_STUB_CODE &&
+            CodePtr < NAT_MEM_STUB_CODE + NAT_MEM_MAXSTUB * 4u) {
+            g_PpcContext.Pc = CodePtr;   /* host thunk; step loop dispatches it */
+            return;
+        }
+        if (Isa == 0u && CodePtr != 0u) {
+            /* 68K Mixed-Mode routine. The PPC->68K trampoline (0x55CBC0) has
+               already marshalled the emulator registers via Get/SetEmulator-
+               Register (which map onto g_M68kContext); the 68K engine is the
+               context the routine must run in. EFIMac's synthetic System image
+               does not carry the 68K body for these callbacks (proc@0xB0007C is
+               zero), so an empty body is treated as a completed host routine
+               (success) so the caller's success gate opens and boot advances;
+               a non-empty body is reported so real dispatch can be wired next. */
+            UINT32 FirstWord = NatMemRead32 (CodePtr);
+            static UINT32 Cup68kCallers[24];
+            static UINT32 Cup68kCallerN = 0;
+            static UINT32 Cup68kTotal = 0;
+            UINT32 Caller = 0u;
+            UINT32 Ci;
+            Cup68kTotal++;
+            Caller = (g_PpcContext.Gpr[1] < 0x10000000u)
+                     ? CpuRead32 ((g_PpcContext.Gpr[1] & 0xFFFFFFFFu) + 0xE8u)
+                     : 0u;
+            for (Ci = 0; Ci < Cup68kCallerN; Ci++) {
+                if (Cup68kCallers[Ci] == Caller) { break; }
+            }
+            if (Ci == Cup68kCallerN && Cup68kCallerN < 24u) {
+                Cup68kCallers[Cup68kCallerN++] = Caller;
+                Print(L"  CUP68K#%u proc=0x%08x info=%08x first=0x%08x "
+                      L"LR=0x%08x caller=0x%08x r1=0x%08x %s\n",
+                      Cup68kTotal, CodePtr, R4, FirstWord,
+                      g_PpcContext.Lr & 0xFFFFFFFF, Caller,
+                      g_PpcContext.Gpr[1] & 0xFFFFFFFF,
+                      (FirstWord == 0u) ? L"empty->success" : L"nonempty");
+            }
+            Res = 0u;
+            break;
+        }
+        Res = 0;
+        break;
+    }
+    case NAT_MEM_H_AEINSTALL:      Res = 0; break;
+
+    /* ---------- TextEdit / utility ---------- */
+    case NAT_MEM_H_REPLACETEXT:    Res = 0; break;
+    case NAT_MEM_H_NEWSTRING: {
+        UINT32 Blk, Len, I;
+        if (R3 == 0 || R4 == 0) { Res = 0; break; }
+        Blk = CpuRead32 (R3);
+        Len = NatMemRead8 (R4);
+        NatMemWrite8 (Blk, (UINT8)Len);
+        for (I = 0; I < Len; I++) { NatMemWrite8 (Blk + 1u + I, NatMemRead8 (R4 + 1u + I)); }
+        Res = 0;
+        break;
+    }
+
+    /* ---------- File / FS (synthetic: report empty volumes/files) ---------- */
+    case NAT_MEM_H_FSMKEFSSPEC: {
+        UINT32 I;
+        if (R6 != 0) { for (I = 0; I < 70u; I++) { NatMemWrite8 (R6 + I, 0u); } }
+        Res = 0; break;
+    }
+    case NAT_MEM_H_FSPGETFINFO: {
+        UINT32 I;
+        if (R4 != 0) { for (I = 0; I < 16u; I++) { NatMemWrite8 (R4 + I, 0u); } }
+        Res = 0; break;
+    }
+    case NAT_MEM_H_PBGETFCBINFO:   Res = 0; break;
+
+    /* ---------- QuickDraw point transforms ---------- */
+    case NAT_MEM_H_GLOBALTOLOCAL:
+        if (R3 != 0) {
+            INT16 V = (INT16)NatMemRead16 (R3);
+            INT16 H = (INT16)NatMemRead16 (R3 + 2u);
+            NatMemWrite16 (R3, (UINT16)(V - (INT16)NatQdOriginV));
+            NatMemWrite16 (R3 + 2u, (UINT16)(H - (INT16)NatQdOriginH));
+        }
+        Res = 0; break;
+    case NAT_MEM_H_LOCALTOGLOBAL:
+        if (R3 != 0) {
+            INT16 V = (INT16)NatMemRead16 (R3);
+            INT16 H = (INT16)NatMemRead16 (R3 + 2u);
+            NatMemWrite16 (R3, (UINT16)(V + (INT16)NatQdOriginV));
+            NatMemWrite16 (R3 + 2u, (UINT16)(H + (INT16)NatQdOriginH));
+        }
+        Res = 0; break;
+    case NAT_MEM_H_PTINRECT: {
+        INT16 PV, PH, T, L, B, R;
+        if (R3 == 0 || R4 == 0) { Res = 0; break; }
+        PV = (INT16)NatMemRead16 (R3);
+        PH = (INT16)NatMemRead16 (R3 + 2u);
+        NatRectGet (R4, &T, &L, &B, &R);
+        Res = (PV >= T && PV < B && PH >= L && PH < R) ? 1u : 0u;
+        break;
+    }
     default:                       Res = 0; break;
     }
 done:
@@ -6028,6 +7210,10 @@ static int NatCfmLoadSystem(void)
     UINT32 bump = NAT_CFM_DATA_BUMP;
     UINT32 entryToc = 0;
     int nf;
+    UINT8 *rfile = NULL;
+    PefFragment *rfrags = NULL;
+    int rnf = 0;
+    UINT32 romBase = PPC_NEW_WORLD_ROM_GUEST_BASE;
 
     file = (UINT8 *)NatCfmAlloc(NULL, NAT_CFM_FORK_LEN);
     frags = (PefFragment *)NatCfmAlloc(NULL, (UINTN)NAT_CFM_MAXFRAGS * sizeof(PefFragment));
@@ -6088,6 +7274,82 @@ static int NatCfmLoadSystem(void)
     Print(L"  CFM: %u exports mapped; data bump ends 0x%x; entry frag r2=0x%x\n",
           (UINT64)mapN, bump, entryToc);
 
+    /* Pass 1b: the staged ROM is itself a PEF stream.  Its exporting fragments
+       (InterfaceLib, MixedMode, the GetQDGlobals library, ...) are the guest's
+       real Toolbox glue.  Add their exports to the same map so the System's
+       InterfaceLib imports bind to native code instead of host stubs.  ROM code
+       already lives in the ROM window, so bias f->base after expansion: code
+       sections keep their ROM addresses while packed data/TVectors expand into
+       the shared bump region. */
+    rfile = (UINT8 *)NatCfmAlloc(NULL, NAT_CFM_ROM_SIZE);
+    rfrags = (PefFragment *)NatCfmAlloc(NULL, (UINTN)NAT_CFM_MAXFRAGS * sizeof(PefFragment));
+    if (rfile != NULL && rfrags != NULL) {
+        for (i = 0; i < NAT_CFM_ROM_SIZE; i += 4) {
+            UINT32 v = CpuRead32(romBase + (UINT32)i);
+            rfile[i + 0] = (UINT8)(v >> 24); rfile[i + 1] = (UINT8)(v >> 16);
+            rfile[i + 2] = (UINT8)(v >> 8);  rfile[i + 3] = (UINT8)v;
+        }
+        PeiNull(rfrags, (UINTN)NAT_CFM_MAXFRAGS * sizeof(PefFragment));
+        for (i = 0; i < NAT_CFM_MAXFRAGS; i++) {
+            rfrags[i].alloc = NatCfmAlloc;
+            rfrags[i].free_ = NatCfmFree;
+        }
+        rnf = PefEnumFragments(rfile, NAT_CFM_ROM_SIZE, rfrags, NAT_CFM_MAXFRAGS);
+        Print(L"  CFM: enumerated %d PEF fragments in ROM\n", rnf);
+        for (i = 0; i < (UINTN)rnf; i++) {
+            PefFragment *f = &rfrags[i];
+            if (f->sectionCount == 0 || f->exportCount == 0) continue;
+            if (PefExpandSections(f) != 0) {
+                Print(L"  CFM: ROM expand failed frag %u (base 0x%x)\n",
+                      (UINT64)i, (UINT32)f->base);
+                continue;
+            }
+            f->base += romBase;
+            NatCfmPlace(f, &bump, &entryToc);
+            if (f->initSection >= 0 && f->initSection < f->sectionCount &&
+                f->expanded[f->initSection] != NULL) {
+                const UINT8 *tv = f->expanded[f->initSection] + f->initOffset;
+                UINT32 w0 = PeiBe32(tv), w1 = PeiBe32(tv + 4);
+                UINT32 d0 = f->sections[0].defaultAddress;
+                UINT32 dI = f->sections[f->initSection].defaultAddress;
+                Print(L"  ROMINIT frag %u initSec=%d off=0x%x tvguest=0x%08x "
+                      L"routine=0x%08x toc=0x%08x\n",
+                      (UINT64)i, (INT32)f->initSection, (UINT32)f->initOffset,
+                      f->secBase[f->initSection] + (f->initOffset - dI),
+                      f->secBase[0] + (w0 - d0),
+                      f->secBase[f->initSection] + (w1 - dI));
+            }
+            {
+                int ds;
+                for (ds = 0; ds < f->sectionCount; ds++) {
+                    if (f->secBase[ds] == 0) continue;
+                    Print(L"  ROMFRAG %u sec%d kind=%d base=0x%08x len=0x%x "
+                          L"coff=0x%x tob=0x%x\n",
+                          (UINT64)i, ds, (int)f->sections[ds].sectionKind,
+                          (UINT32)f->secBase[ds], f->sections[ds].totalLength,
+                          f->sections[ds].containerOffset, (UINT32)f->base);
+                }
+            }
+            for (k = 0; k < f->exportCount && mapN < NAT_CFM_MAXEXPORTS; k++) {
+                if (f->exports[k].name == NULL) continue;
+                map[mapN].name = f->exports[k].name;
+                map[mapN].addr = PefExportAddress(f, &f->exports[k]);
+                mapN++;
+            }
+        }
+        {
+            static const char *const probe[] = {
+                "DrawMenuBar", "GetMenu", "InsertMenu", "GetQDGlobals",
+                "CallUniversalProc"
+            };
+            UINTN pi;
+            for (pi = 0; pi < sizeof(probe) / sizeof(probe[0]); pi++) {
+                Print(L"  CFM: export %a -> 0x%08x\n", probe[pi],
+                      (UINT32)NatCfmLookup(map, mapN, probe[pi]));
+            }
+        }
+    }
+
     /* Pass 2: resolve imports, relocate and instantiate into guest RAM. */
     g_PelRelocLog = NatCfmRelocLog;
     NatMemStubCount = 0;
@@ -6099,9 +7361,11 @@ static int NatCfmLoadSystem(void)
         imp = (UINT32 *)NatCfmAlloc(NULL, (UINTN)(f->symCount ? f->symCount : 1) * sizeof(UINT32));
         if (imp == NULL) continue;
         for (k = 0; k < f->symCount; k++) {
-            UINT32 a = NatCfmLookup(map, mapN, f->imports[k].name);
-            UINT32 hm;
-            if (a) {
+            UINT32 a, hm;
+            if (NatMemHostPreferred(f->imports[k].name) &&
+                (hm = NatMemFindHandler(f->imports[k].name)) != NAT_MEM_H_NONE) {
+                imp[k] = NatMemBindImport(hm, f->imports[k].name);
+            } else if ((a = NatCfmLookup(map, mapN, f->imports[k].name)) != 0) {
                 imp[k] = a;
             } else {
                 hm = NatMemFindHandler(f->imports[k].name);
@@ -6126,13 +7390,59 @@ static int NatCfmLoadSystem(void)
             if (f->expanded[s] == NULL) continue;
             if (f->sections[s].sectionKind == kPefLoaderSection) continue;
             if (f->secBase[s] == 0) continue;
-            PefRelocateSection(f, s, f->expanded[s], imp);
+            if (PefRelocateSection(f, s, f->expanded[s], imp) != 0) {
+                Print(L"  CFM: RELOC FAIL base=0x%08x sec=%d op=0x%x\n",
+                      (UINT32)f->base, s, (UINT32)g_PelFailOp);
+            }
             b = f->secBase[s];
             for (w = 0; w + 4 <= f->sections[s].totalLength; w += 4)
                 CpuWrite32(b + w, PeiBe32((const UINT8 *)(f->expanded[s] + w)));
         }
     }
-    Print(L"  CFM: fragments instantiated into guest RAM\n");
+    /* Pass 2b: relocate + instantiate the ROM fragments (code stays in the ROM
+       window, packed data into the shared bump region). */
+    for (i = 0; i < (UINTN)rnf; i++) {
+        PefFragment *f = &rfrags[i];
+        UINT32 *imp;
+        int s;
+        if (f->sectionCount == 0 || f->exportCount == 0 || f->expanded == NULL)
+            continue;
+        imp = (UINT32 *)NatCfmAlloc(NULL, (UINTN)(f->symCount ? f->symCount : 1) * sizeof(UINT32));
+        if (imp == NULL) continue;
+        for (k = 0; k < f->symCount; k++) {
+            UINT32 a, hm;
+            if (NatMemHostPreferred(f->imports[k].name) &&
+                (hm = NatMemFindHandler(f->imports[k].name)) != NAT_MEM_H_NONE) {
+                imp[k] = NatMemBindImport(hm, f->imports[k].name);
+            } else if ((a = NatCfmLookup(map, mapN, f->imports[k].name)) != 0) {
+                imp[k] = a;
+            } else {
+                hm = NatMemFindHandler(f->imports[k].name);
+                imp[k] = (hm != NAT_MEM_H_NONE)
+                             ? NatMemBindImport(hm, f->imports[k].name)
+                             : 0x0000BA20u;
+            }
+            if ((UINT32)f->base == 0x408F17D0u)
+                Print(L"  IFLIB imp%d name=%a -> 0x%08x\n", (UINT64)k,
+                      f->imports[k].name ? f->imports[k].name : "(null)",
+                      (UINT32)imp[k]);
+        }
+        for (s = 0; s < f->sectionCount; s++) {
+            UINT32 b, w;
+            if (f->expanded[s] == NULL) continue;
+            if (f->sections[s].sectionKind == kPefLoaderSection) continue;
+            if (f->secBase[s] == 0) continue;
+            if (PefRelocateSection(f, s, f->expanded[s], imp) != 0) {
+                Print(L"  CFM: RELOC FAIL base=0x%08x sec=%d op=0x%x\n",
+                      (UINT32)f->base, s, (UINT32)g_PelFailOp);
+            }
+            b = f->secBase[s];
+            for (w = 0; w + 4 <= f->sections[s].totalLength; w += 4)
+                CpuWrite32(b + w, PeiBe32((const UINT8 *)(f->expanded[s] + w)));
+        }
+    }
+    Print(L"  CFM: fragments instantiated into guest RAM (bump end 0x%08x)\n",
+          bump);
     g_PelRelocLog = NULL;
     return (int)entryToc;
 }
@@ -6335,14 +7645,15 @@ static UINT32 RegSyscallSeen = 0;
         // arrival there. One-shot; must run before the stub executes.
         {
             static UINT32 DiagStubIntercepted = 0;
-            if (DiagStubIntercepted == 0 && g_DrNativeHandoff == 0 &&
-                Current >= 0x00100000u && Current < 0x00100010u) {
-                DiagStubIntercepted = 1;
-                Print(L"  DIAGSTUB-ENTER Current=0x%08x handoff=%u steer=%u "
-                      L"r1=0x%08x LR=0x%08x [r1+8]=0x%08x -> 0x40B67C60\n",
-                      Current, g_DrNativeHandoff, g_DrNativeSteer,
-                      g_PpcContext.Gpr[1], g_PpcContext.Lr,
-                      CpuRead32((g_PpcContext.Gpr[1] & 0xFFFFFFFFu) + 8u));
+            if (Current >= 0x00100000u && Current < 0x00100010u) {
+                if (DiagStubIntercepted < 4u) {
+                    DiagStubIntercepted++;
+                    Print(L"  DIAGSTUB-ENTER[%u] Current=0x%08x handoff=%u steer=%u "
+                          L"r1=0x%08x LR=0x%08x [r1+8]=0x%08x -> 0x40B67C60\n",
+                          DiagStubIntercepted, Current, g_DrNativeHandoff, g_DrNativeSteer,
+                          g_PpcContext.Gpr[1], g_PpcContext.Lr,
+                          CpuRead32((g_PpcContext.Gpr[1] & 0xFFFFFFFFu) + 8u));
+                }
                 g_PpcContext.Lr = 0x40B67C60u;
                 g_PpcContext.Pc = 0x40B67C60u;
                 continue;
@@ -6662,43 +7973,51 @@ if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 48) {
             if (g_DrNativeHandoff == 0 && g_DrNativeSteer == 0 &&
                 Pc24 >= 0x00100000u && Pc24 < 0x00101000u) {
                 g_DrNativeSteer = 1;
-                Pc24 = 0x0001B7C0u; // use fork entry, not 0x1B823
+                Pc24 = NAT_F0_CODE_BASE + NAT_F0_ENTRY_OFF; // fork entry
                 g_PpcContext.Gpr[24] = Pc24;
                 g_PpcContext.Pc = Pc24;
                 Print(L"  PATH2-HANDOFF 68K diag jump 0x100000 -> fork entry "
-                      L"0x1B7C0 (exec=%u PPC=0x%08x)\n",
+                      L"0x%08x (exec=%u PPC=0x%08x)\n",
+                      (UINT32)Pc24,
                       (UINT32)Executed, Current);
             }
+            // The fork entry now lives at NAT_F0_CODE_BASE + 0x1B4A0 (clear of
+            // the 68K world).  The tail-A207 steer still seeds the DR resume
+            // slot with the low 68K bootstrap 0x1B823, so accept both the low
+            // steer value and the native entry region as the handoff trigger.
             if (g_DrNativeHandoff == 0 && g_DrNativeSteer != 0 &&
-                Pc24 >= 0x0001B000u && Pc24 < 0x0001C000u) {
-                // Resume at the fork's FUNCTION ENTRY (0x1B7C0), not the
-                // shared 0x1B820 pad, so the fork's own prologue runs its
-                // bookkeeping (bl 0x4672c; bl 0x8fdc), initializes the decoder
-                // accumulators, and builds the decompressor frame itself --
-                // instead of trusting an emulator-synthesized frame. The last
-                // faithful-frame run proved the reader's state regs were
-                // uninitialized at 0x1B820 (r31 parked on the real chunk table
-                // word 0x0200099B but never advanced, outer slots never
-                // written, r28 frozen): only the fork's own entry can seed them.
-                UINT32 Np = 0x0001B7C0u;
+                ((Pc24 >= 0x0001B000u && Pc24 < 0x0001C000u) ||
+                 (Pc24 >= NAT_F0_CODE_BASE && Pc24 < NAT_F0_CODE_END))) {
+                // Resume at the fork's FUNCTION ENTRY, not the shared pad, so
+                // the fork's own prologue runs its bookkeeping (bl 0x4672c;
+                // bl 0x8fdc), initializes the decoder accumulators, and builds
+                // the decompressor frame itself -- instead of trusting an
+                // emulator-synthesized frame. The last faithful-frame run
+                // proved the reader's state regs were uninitialized when
+                // resumed at the pad (r31 parked on the real chunk table word
+                // 0x0200099B but never advanced, outer slots never written,
+                // r28 frozen): only the fork's own entry can seed them.
+                UINT32 Np = NAT_F0_CODE_BASE + NAT_F0_ENTRY_OFF;
                 g_DrNativeHandoff = 1;
                 g_NatTermPending = 1;
                 g_ForkResumePc = g_PpcContext.Gpr[24] & 0xFFFFFFFF;
                 g_PpcContext.Pc = Np;
                 // Hooked = 1;  (trimmed)
                 // Load fragment 0 (QuickDraw) with the real CFM/PEF loader and
-                // stage it into low RAM.  The code section is placed at low
-                // 0x320 (preserving the mapping so the resumed 0x1B7C0 ==
-                // code + 0x1B4A0), the pattern-initialized data section is
-                // expanded, relocated and placed at 0x48000, and r2 is set to
-                // the loader's TOC (dataBase + 0xB98).  The relocation
-                // bytecode fills the import slots inside the data section, so
-                // the fork's first service call (`lwz r12,-0xB7C(r2)` -> slot
-                // data+0x1C == import[32] "GetQDGlobals") dispatches via the
-                // descriptor @0xBA00 below, and the decoder slot [r2+0x2B0]
-                // == data+0xE48 == {code+0x14EEC, dataBase+0xB98} comes out
-                // correct with no hand-patching.  Only import[32] is bound
-                // (the other 276 stay 0, matching the old heuristic).
+                // stage it OUTSIDE the 68K low-memory world.  The code section
+                // is placed at NAT_F0_CODE_BASE and the pattern-initialized
+                // data section at NAT_F0_DATA_BASE; r2 is set to the loader's
+                // TOC (dataBase + 0xB98).  Staging it below 0x10000 would alias
+                // the 68K low-memory globals (the fork makes ~953 absolute
+                // refs into 0x18..0x1DE0) to the staged code bytes.  The
+                // relocation bytecode fills the import slots inside the data
+                // section, so the fork's first service call (`lwz r12,-0xB7C
+                // (r2)` -> slot data+0x1C == import[32] "GetQDGlobals")
+                // dispatches via the descriptor @0xBA00 below, and the decoder
+                // slot [r2+0x2B0] == data+0xE48 == {code+0x14EEC, dataBase+
+                // 0xB98} comes out correct with no hand-patching.  Only
+                // import[32] is bound (the other 276 stay 0, matching the old
+                // heuristic).
                 {
                     PefFragment Frag;
                     UINT8 *SysHead;
@@ -6722,7 +8041,8 @@ if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 48) {
                     if (SysHead != NULL &&
                         PefParse(&Frag, SysHead, 0x50000u, 0x2A0u) == 0 &&
                         PefExpandSections(&Frag) == 0) {
-                        PefPlaceFragment(&Frag, 0x320u, 0x48000u);
+                        PefPlaceFragment(&Frag, NAT_F0_CODE_BASE,
+                                         NAT_F0_DATA_BASE);
                         if (Frag.symCount != 0) {
                             UINT32 *Imports = (UINT32 *)PeiAlloc(
                                 NULL, (UINTN)Frag.symCount * sizeof(UINT32));
@@ -6743,28 +8063,44 @@ if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 48) {
                                 for (UINT32 Gi = 0; Gi < Frag.symCount; Gi++) {
                                     if (Imports[Gi] == 0) {
                                         const char *nm = Frag.imports[Gi].name ? Frag.imports[Gi].name : "(null)";
-                                        Print(L"  FRAG84 SYS unbound Gi=%u name=%a\\n", (UINT64)Gi, nm);
-                                        Imports[Gi] = 0x0000BA20u;
+                                        UINT32 H = NatMemFindHandler(Frag.imports[Gi].name);
+                                        if (H != NAT_MEM_H_NONE) {
+                                            Imports[Gi] = NatMemBindImport(H, Frag.imports[Gi].name);
+                                        } else {
+                                            Print(L"  FRAG84 SYS unbound Gi=%u name=%a\\n", (UINT64)Gi, nm);
+                                            Imports[Gi] = 0x0000BA20u;
+                                        }
                                     }
                                 }
                                 PefRelocateSection(&Frag, 1, Frag.expanded[1], Imports);
                             }
                         }
-                        // Mirror the instantiated sections into low RAM (big-
-                        // endian words preserved as stored).
+                        // Mirror the instantiated sections into guest RAM
+                        // (big-endian words preserved as stored), OUTSIDE the
+                        // 68K low-memory world so the globals stay intact.
                         for (W = 0; W < Frag.sections[0].totalLength; W += 4) {
-                            CpuWrite32(0x00000320u + W, PeiBe32(Frag.expanded[0] + W));
+                            CpuWrite32(NAT_F0_CODE_BASE + W,
+                                       PeiBe32(Frag.expanded[0] + W));
                         }
                         for (W = 0; W + 4 <= Frag.sections[1].totalLength; W += 4) {
-                            CpuWrite32(0x00048000u + W, PeiBe32(Frag.expanded[1] + W));
+                            CpuWrite32(NAT_F0_DATA_BASE + W,
+                                       PeiBe32(Frag.expanded[1] + W));
                         }
                         g_PpcContext.Gpr[2] = Frag.toc;
                         Loaded = 1;
+                        Print(L"  F0RDBK after-write [0x%08x]=0x%08x "
+                              L"[0x%08x]=0x%08x (expect 0x7C0802A6 0x9421FFA0)\n",
+                              (UINT32)(NAT_F0_CODE_BASE + NAT_F0_ENTRY_OFF),
+                              CpuRead32(NAT_F0_CODE_BASE + NAT_F0_ENTRY_OFF),
+                              (UINT32)(NAT_F0_CODE_BASE + NAT_F0_ENTRY_OFF + 0xC),
+                              CpuRead32(NAT_F0_CODE_BASE + NAT_F0_ENTRY_OFF + 0xC));
                         Print(L"  NATIVE-HANDOFF real PEF load frag0: code "
-                              L"0x320..0x%08x data 0x48000..0x%08x r2=0x%08x "
+                              L"0x%08x..0x%08x data 0x%08x..0x%08x r2=0x%08x "
                               L"(import GetQDGlobals=%d, %d slots glue-bound)\n",
-                              0x00000320u + Frag.sections[0].totalLength,
-                              0x00048000u + Frag.sections[1].totalLength,
+                              (UINT32)NAT_F0_CODE_BASE,
+                              (UINT32)(NAT_F0_CODE_BASE + Frag.sections[0].totalLength),
+                              (UINT32)NAT_F0_DATA_BASE,
+                              (UINT32)(NAT_F0_DATA_BASE + Frag.sections[1].totalLength),
                               Frag.toc, KiIdx, Frag.symCount - (KiIdx >= 0 ? 1 : 0));
                     }
                     if (!Loaded) {
@@ -6814,6 +8150,9 @@ if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 48) {
                     Print(L"  NATIVE-HANDOFF GetQDGlobals -> descriptor @0xBA00 "
                           L"{0xBA08,0} (container @0xB900, record @0xB940)\n");
                 }
+                // Give the guest a real colour screen device backed by the
+                // host framebuffer window (overrides the skip fields above).
+                NatQdInstallScreen();
                 // Real boot maps the System data fork 1:1 into low RAM (file
                 // offset == runtime address == PPC_OS_RUNTIME_GUEST_BASE+off).
                 // The ROM glue bcctr's into the diag region at Dst (0x100000);
@@ -6821,8 +8160,9 @@ if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 48) {
                 // NOT produced by the QD fragment (the "stream" at 0x96000 is
                 // QuickDraw's universal-proc name table). Mirror the fork's
                 // diag + name-table regions so the glue's bcctr lands on real
-                // code instead of zeros. The 0x320..0x1B400 code / 0x48000
-                // data placements above already cover the fragment itself.
+                // code instead of zeros. The NAT_F0_CODE_BASE code / NAT_F0_
+                // DATA_BASE data placements above already cover the fragment
+                // itself (clear of the 68K low-memory world).
                 for (UINT32 Mw = 0x00096000u; Mw < 0x002A2B0Au; Mw += 4) {
                     CpuWrite32(Mw, CpuRead32(PPC_OS_RUNTIME_GUEST_BASE + Mw));
                 }
@@ -6835,6 +8175,12 @@ if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 48) {
                 // Also records the TOC of the fragment that owns 0x100000 so the
                 // native handoff can set r2 to that fragment's TOC, not QD's.
                 NatCfmLoadSystem();
+                Print(L"  F0RDBK after-CFM [0x%08x]=0x%08x "
+                      L"[0x%08x]=0x%08x (expect 0x7C0802A6 0x9421FFA0)\n",
+                      (UINT32)(NAT_F0_CODE_BASE + NAT_F0_ENTRY_OFF),
+                      CpuRead32(NAT_F0_CODE_BASE + NAT_F0_ENTRY_OFF),
+                      (UINT32)(NAT_F0_CODE_BASE + NAT_F0_ENTRY_OFF + 0xC),
+                      CpuRead32(NAT_F0_CODE_BASE + NAT_F0_ENTRY_OFF + 0xC));
                 // Session state for the decoder 0x3873C, entered by the fork's
                 // own `bl 0x4618C` at 0x1B89C. Decoder SP is built by the fork
                 // prologue: r1 starts 0x9EFE (the ROM glue's sthu already ran),
@@ -6941,17 +8287,19 @@ if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 48) {
                           CpuRead32(0x68E96008u), CpuRead32(0x68E9600Cu),
                           CpuRead32(0x68E96010u), CpuRead32(0x68E96014u),
                           CpuRead32(0x68E96018u), CpuRead32(0x68E9601Cu));
-Print(L"  NATIVE-HANDOFF resume fork entry 0x1B7C0: GetQDGlobals "
+Print(L"  NATIVE-HANDOFF resume fork entry 0x%08x: GetQDGlobals "
                       L"(import slot data+0x1C) -> desc {0xBA08,0}; record "
                       L"@0xB940 (rec+6=0 rec+60=0 rec+42=-1); decoder frame "
-                      L"@0x9E9E seeded; stream 0x68E96000 len 0x1CB0A\n");
+                      L"@0x9E9E seeded; stream 0x68E96000 len 0x1CB0A\n",
+                      (UINT32)(NAT_F0_CODE_BASE + NAT_F0_ENTRY_OFF));
                 }
                 // The Pc=Np assignment above must take effect THIS iteration:
                 // otherwise the loop's trailing PpcExecuteInstruction call runs
                 // the pre-handoff Current and overwrites Pc with Next, so the
-                // fork entry 0x1B7C0 is never executed (the decoder never runs
-                // and 0x100000 keeps the raw fork bytes). Restart the loop so
-                // the next iteration begins at the fork entry.
+                // fork entry (NAT_F0_AT(0x1B4A0)) is never executed (the
+                // decoder never runs and 0x100000 keeps the raw fork bytes).
+                // Restart the loop so the next iteration begins at the fork
+                // entry.
                 g_Snap100a = CpuRead32(0x00100000u);
                 g_Snap100b = CpuRead32(0x00100004u);
                 continue;
@@ -7413,6 +8761,39 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x1B7C0: GetQDGlobals "
                           g_ReadByte(a + 12), g_ReadByte(a + 13), g_ReadByte(a + 14),
                           g_ReadByte(a + 15));
                 }
+            }
+        }
+        // Guest -> host display: periodically copy the guest framebuffer window
+        // (which the virtual screen device points the guest's QuickDraw at) up
+        // to the real GOP framebuffer.
+        if (g_DrNativeHandoff != 0 && (Executed & 0xFFFFFu) == 0x00000u) {
+            PpcGraphicsBlitToDisplay();
+        }
+        // QuickDraw-path probes: is the guest's own renderer actually reached?
+        if (g_DrNativeHandoff != 0) {
+            if (Current == 0x0001F640u && g_QdProbeRender < 6) {
+                Print(L"  QDRENDER #%u r3=0x%08x r4=0x%08x\n",
+                      g_QdProbeRender, g_PpcContext.Gpr[3] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[4] & 0xFFFFFFFF);
+                g_QdProbeRender++;
+            }
+            if (Current == 0x0001B8D8u && g_QdProbePixSrv < 6) {
+                Print(L"  QDPIXSERV #%u r3=0x%08x r4=0x%08x\n",
+                      g_QdProbePixSrv, g_PpcContext.Gpr[3] & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[4] & 0xFFFFFFFF);
+                g_QdProbePixSrv++;
+            }
+            if (Current == 0x0001A974u && g_QdProbeBmpWr < 6) {
+                Print(L"  QDBMPWR #%u r3=0x%08x\n", g_QdProbeBmpWr,
+                      g_PpcContext.Gpr[3] & 0xFFFFFFFF);
+                g_QdProbeBmpWr++;
+            }
+            if (Current == 0x0000BA28u && g_QdProbeGlue < 12) {
+                Print(L"  GLUE#%u LR=0x%08x CTR=0x%08x r3=0x%08x\n",
+                      g_QdProbeGlue, g_PpcContext.Lr & 0xFFFFFFFF,
+                      g_PpcContext.Ctr & 0xFFFFFFFF,
+                      g_PpcContext.Gpr[3] & 0xFFFFFFFF);
+                g_QdProbeGlue++;
             }
         }
         // Decoder runaway canary: once the native handoff has let the fork's
@@ -11099,6 +12480,37 @@ static const UINT32 Ranges[8][2] = {
                     Print(L"GUEST STOP at PC=0x%08x inst=0x%08x (%s): %r\n",
                           g_PpcContext.Pc, Instr, StopMn, Status);
                 }
+                {
+                    UINT32 Dr2 = g_PpcContext.Gpr[2];
+                    UINT32 Dp = 0, Dv = 0;
+                    if (Dr2 != 0 && Dr2 < 0x80000000u) {
+                        Dp = CpuRead32(Dr2 - 0x74u);
+                        if (Dp != 0 && Dp < 0x80000000u) {
+                            Dv = CpuRead32(Dp);
+                        }
+                    }
+                    Print(L"  MMDIAG r2=0x%08x r3=0x%08x r4=0x%08x r11=0x%08x LR=0x%08x\n",
+                          Dr2, g_PpcContext.Gpr[3], g_PpcContext.Gpr[4],
+                          g_PpcContext.Gpr[11], g_PpcContext.Lr);
+                    Print(L"  MMDIAG2 [-74]=0x%08x [-70]=0x%08x [-78]=0x%08x ptr=0x%08x "
+                          L"->[0]=0x%08x [4]=0x%08x [8]=0x%08x\n",
+                          CpuRead32(Dr2 - 0x74u), CpuRead32(Dr2 - 0x70u),
+                          CpuRead32(Dr2 - 0x78u), Dp,
+                          Dv, CpuRead32(Dp + 4), CpuRead32(Dp + 8));
+                    Print(L"  MMRELOC set=%d raw738=0x%08x after738=0x%08x addend=0x%08x\n",
+                          g_PelSet738, g_PelRaw738, g_PelAfter738,
+                          (UINT32)(g_PelAfter738 - g_PelRaw738));
+                    {
+                        UINTN Off;
+                        Print(L"  MMDATA 0x700..0x760:");
+                        for (Off = 0x700; Off <= 0x760; Off += 4)
+                            Print(L" %08x", CpuRead32(0x007AF5A0u + (UINT32)Off));
+                        Print(L"\n  MMDATA 0x110..0x130:");
+                        for (Off = 0x110; Off <= 0x130; Off += 4)
+                            Print(L" %08x", CpuRead32(0x007AF5A0u + (UINT32)Off));
+                        Print(L"\n");
+                    }
+                }
                 Print(L"  FORKPROBE instr=%lu first=0x%08x last=0x%08x dec=%lu "
                       L"c4672c=%lu c8fdc=%lu low=%lu\n",
                       g_ForkInstr, g_ForkFirst, g_ForkLast, g_DecInstr,
@@ -11120,13 +12532,13 @@ static const UINT32 Ranges[8][2] = {
                 }
                 // Cap the crash backtrace: the full 4096-entry ring buried the
                 // boot milestones under thousands of TRACE[-N] lines.
-                if (TailCount > 4096) {
-                    Print(L"--- last 4096 of %d instructions before stop ---\n",
+                if (TailCount > 600) {
+                    Print(L"--- last 600 of %d instructions before stop ---\n",
                           TailCount);
                 } else {
                     Print(L"--- last %d instructions before stop ---\n", TailCount);
                 }
-                for (I = 0; I < TailCount && I < 4096; I++) {
+                for (I = 0; I < TailCount && I < 600; I++) {
                     UINTN Idx = (TailStart + TailCount - 1 - I) % 4096;
                     PpcDecodeInstruction(TailInst[Idx], Mn, sizeof(Mn));
                     Print(L"  TRACE[-%d] PC=0x%08x 0x%08x %s -> 0x%08x r24=0x%08x r27=0x%08x r7=0x%08x r5=0x%08x r15=0x%08x r16=0x%08x CR=0x%08x r28=0x%08x LR=0x%08x\n",

@@ -541,6 +541,18 @@ HfsBuildClassicCatalog (
                     }
                 }
                 E->ExtentCount = Cnt;
+                E->RsrcSize    = HfsU32(Rec + 36);      // rsrc LgLen
+                UINT32 RCnt = 0;
+                for (UINTN X = 0; X < 3; X++) {         // rsrc ExtRec @86
+                    UINT16 Blk = HfsU16(Rec + 86 + X * 4);
+                    UINT16 C   = HfsU16(Rec + 86 + X * 4 + 2);
+                    if (C != 0 && RCnt < PPC_HFS_MAX_EXTENTS) {
+                        E->RsrcExtents[RCnt * 2]     = Blk;
+                        E->RsrcExtents[RCnt * 2 + 1] = C;
+                        RCnt++;
+                    }
+                }
+                E->RsrcExtentCount = RCnt;
                 HfsNameLatin1(E->Name, Key + 6, NLen);
                 g_HfsFileCount++;
             } else if (Type == PPC_HFS_CDR_DIR && g_HfsDirCount < PPC_HFS_MAX_DIRS) {
@@ -657,6 +669,18 @@ HfsBuildPlusCatalog (
                     }
                 }
                 E->ExtentCount = Cnt;
+                E->RsrcSize    = HfsU64(Rec + 168);      // resource fork size
+                UINT32 RCnt = 0;
+                for (UINTN X = 0; X < 8; X++) {          // resource extents @184
+                    UINT32 Blk = HfsU32(Rec + 184 + X * 8);
+                    UINT32 C   = HfsU32(Rec + 188 + X * 8);
+                    if (C != 0 && RCnt < PPC_HFS_MAX_EXTENTS) {
+                        E->RsrcExtents[RCnt * 2]     = Blk;
+                        E->RsrcExtents[RCnt * 2 + 1] = C;
+                        RCnt++;
+                    }
+                }
+                E->RsrcExtentCount = RCnt;
                 UINTN NLen = (KLen - 4) / 2;
                 HfsNameUtf16(E->Name, Key + 4, NLen);
                 g_HfsFileCount++;
@@ -1378,6 +1402,158 @@ PpcHfsReadFile (
     return EFI_SUCCESS;
 }
 
+// Read a chain of (block,count) allocation extents into a buffer.
+static EFI_STATUS
+HfsReadExtents (
+    IN  const UINT32* Extents,
+    IN  UINT32        ExtentCount,
+    OUT VOID*         Buffer,
+    IN  UINTN         ToRead
+    )
+{
+    UINTN AlBlk = g_HfsVolume.VolumeBlockSize;
+    UINTN Base  = g_HfsVolume.VolumeBase;
+    UINTN Have  = 0;
+
+    for (UINT32 X = 0; X < ExtentCount && Have < ToRead; X++) {
+        UINT32 Block = Extents[X * 2];
+        UINT32 Count = Extents[X * 2 + 1];
+        if (Count == 0) {
+            continue;
+        }
+        UINTN N = (UINTN)Count * AlBlk;
+        if (Have + N > ToRead) {
+            N = ToRead - Have;
+        }
+        EFI_STATUS S = HfsDeviceReadBytes(Base + g_HfsAllocBlockStart +
+                                          (UINTN)Block * AlBlk, N,
+                                          (UINT8*)Buffer + Have);
+        if (EFI_ERROR(S)) {
+            return S;
+        }
+        Have += N;
+    }
+    return (Have >= ToRead) ? EFI_SUCCESS : EFI_END_OF_MEDIA;
+}
+
+// Resource-fork overflow for classic HFS (extents key forkType 0xFF). The
+// overflow B-tree is scanned in key order, so matching records follow the
+// direct extents in ascending FABN.
+static EFI_STATUS
+HfsReadRsrcClassic (
+    IN  PPC_HFS_ENTRY* Entry,
+    OUT VOID*          Buffer,
+    IN  UINTN          ToRead
+    )
+{
+    UINTN Have = 0;
+    EFI_STATUS S = HfsReadExtents(Entry->RsrcExtents, Entry->RsrcExtentCount,
+                                  Buffer, ToRead);
+    if (!EFI_ERROR(S)) {
+        return EFI_SUCCESS;
+    }
+
+    // Determine how many bytes the direct extents covered.
+    UINTN AlBlk = g_HfsVolume.VolumeBlockSize;
+    for (UINT32 X = 0; X < Entry->RsrcExtentCount && Have < ToRead; X++) {
+        Have += (UINTN)Entry->RsrcExtents[X * 2 + 1] * AlBlk;
+    }
+    if (Have >= ToRead) {
+        return EFI_SUCCESS;
+    }
+
+    // Walk the extents-overflow B-tree for forkType 0xFF, FNum == Id.
+    UINTN XofNodes = g_XofNodeSize ? (g_XofSize / g_XofNodeSize) : 0;
+    for (UINTN N = 0; N < XofNodes && Have < ToRead; N++) {
+        UINT8* Node = g_XofData + N * g_XofNodeSize;
+        if (Node[8] != 0xFF) {
+            continue;
+        }
+        UINT16 NumRecs = HfsU16(Node + 10);
+        for (UINTN R = 0; R < NumRecs && Have < ToRead; R++) {
+            UINT16 ROff = HfsNodeRecOffset(Node, g_XofNodeSize, R);
+            if (ROff + 1 >= g_XofNodeSize) {
+                continue;
+            }
+            UINT8 KLen = Node[ROff];
+            if (KLen == 0) {
+                continue;
+            }
+            UINTN KeySize = (UINTN)((KLen | 1) + 1);
+            if (ROff + KeySize > g_XofNodeSize) {
+                continue;
+            }
+            UINT8* Key = Node + ROff + 1;
+            UINT8* Rec = Node + ROff + KeySize;
+            if (Key[0] != 0xFF) {                      // resource fork only
+                continue;
+            }
+            if (HfsU32(Key + 1) != Entry->Id) {
+                continue;
+            }
+            UINT32 Exts[6];
+            UINT32 ExtCnt = 0;
+            for (UINTN X = 0; X < 3; X++) {
+                UINT16 Blk = HfsU16(Rec + X * 4);
+                UINT16 C   = HfsU16(Rec + X * 4 + 2);
+                if (C != 0) {
+                    Exts[ExtCnt * 2]     = Blk;
+                    Exts[ExtCnt * 2 + 1] = C;
+                    ExtCnt++;
+                }
+            }
+            UINTN Rem = ToRead - Have;
+            S = HfsReadExtents(Exts, ExtCnt, (UINT8*)Buffer + Have, Rem);
+            for (UINTN X = 0; X < ExtCnt; X++) {
+                Have += (UINTN)Exts[X * 2 + 1] * AlBlk;
+            }
+            if (EFI_ERROR(S) && S != EFI_END_OF_MEDIA) {
+                return S;
+            }
+        }
+    }
+
+    return (Have >= ToRead) ? EFI_SUCCESS : EFI_END_OF_MEDIA;
+}
+
+EFI_STATUS
+PpcHfsReadResourceFork (
+    IN  PPC_HFS_ENTRY* Entry,
+    OUT VOID*          Buffer,
+    IN  OUT UINTN*     Size
+    )
+{
+    if (Entry == NULL || Buffer == NULL || Size == NULL) {
+        return EFI_INVALID_PARAMETER;
+    }
+    if (Entry->IsDirectory) {
+        return EFI_INVALID_PARAMETER;
+    }
+    if (!g_HfsMounted) {
+        return EFI_NOT_READY;
+    }
+    if (Entry->RsrcSize == 0 || Entry->RsrcExtentCount == 0) {
+        return EFI_NOT_FOUND;
+    }
+
+    UINTN Cap    = *Size;
+    UINTN ToRead = ((UINTN)Entry->RsrcSize < Cap) ? (UINTN)Entry->RsrcSize : Cap;
+    EFI_STATUS Status = (g_HfsVolume.Kind == PPC_HFS_KIND_CLASSIC)
+                            ? HfsReadRsrcClassic(Entry, Buffer, ToRead)
+                            : HfsReadExtents(Entry->RsrcExtents,
+                                             Entry->RsrcExtentCount,
+                                             Buffer, ToRead);
+    if (EFI_ERROR(Status) && Status != EFI_BUFFER_TOO_SMALL) {
+        return Status;
+    }
+
+    *Size = ToRead;
+    if ((UINTN)Entry->RsrcSize > Cap) {
+        return EFI_BUFFER_TOO_SMALL;
+    }
+    return EFI_SUCCESS;
+}
+
 // ---------------------------------------------------------------------------
 // Self-test
 // ---------------------------------------------------------------------------
@@ -1429,8 +1605,8 @@ PpcHfsRunSelfTest (
     HfsCheck(Info.FileCount > 0, L"catalog file entries found");
     HfsCheck(Info.DirCount > 0, L"catalog folder entries found");
 
-    PPC_HFS_ENTRY Root[16];
-    UINTN RootCount = 16;
+    PPC_HFS_ENTRY Root[8];
+    UINTN RootCount = 8;
     Status = PpcHfsListChildren(HFS_ROOT_CNID, Root, &RootCount);
     HfsCheck((Status == EFI_SUCCESS || Status == EFI_BUFFER_TOO_SMALL) &&
              RootCount > 0, L"root directory listing");

@@ -69,6 +69,7 @@ APP_SRCS := \
 	src/boot/bootloader_impl.c \
 	src/boot/pef_loader.c \
 	src/fs/hfs.c \
+	src/fs/resfork.c \
 	src/utils/debug_impl.c \
 	src/platform/uefi_interface_impl.c
 

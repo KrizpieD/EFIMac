@@ -23,6 +23,9 @@ static int32_t rds32(const uint8_t *p) { return (int32_t)rd32(p); }
 static int16_t rds16(const uint8_t *p) { return (int16_t)rd16(p); }
 
 void (*g_PelRelocLog)(unsigned long addr, unsigned imp) = 0;
+int g_PelFailOp = -1;             /* last unrecognized relocation opcode (debug) */
+uint32_t g_PelRaw738, g_PelAfter738;
+int g_PelSet738;
 static uint32_t g_PelLogAbsBase;  /* absolute guest base of section being relocated */
 static int      g_PelLogEnable;   /* log import relocations for the entry fragment */
 
@@ -691,6 +694,7 @@ static int PefExecRange(const PefChunkStream *cs, size_t start, size_t count,
             /* sub 1/2 set sectionC/D; unused in this model */
             pc += 2;
         } else {
+            g_PelFailOp = (int)op;
             return -1;
         }
     }
@@ -719,8 +723,10 @@ int PefRelocateSection(PefFragment *f, int secIndex, uint8_t *buf,
             PefChunkStream cs;
             uint32_t relocAddr = f->sections[secIndex].defaultAddress;
             int importIndex = 0;
+            int isProbe = (f->secBase[1] == 0x007AF5A0u && secIndex == 1);
             g_PelLogAbsBase = f->secBase[secIndex];
-            g_PelLogEnable  = (f->base == 0x0055CB40u);
+            g_PelLogEnable  = (f->base == 0x0055CB40u || f->base == 0x408EB880u);
+            if (isProbe) g_PelRaw738 = rd32(buf + 0x738);
             cs.chunks = f->file + relocBase + first;
             cs.nchunks = cnt;
             if (PefExecRange(&cs, 0, cnt, f->sections[secIndex].defaultAddress,
@@ -728,6 +734,7 @@ int PefRelocateSection(PefFragment *f, int secIndex, uint8_t *buf,
                              importAddrs, buf,
                              f->sections[secIndex].totalLength) != 0)
                 return -1;
+            if (isProbe) { g_PelAfter738 = rd32(buf + 0x738); g_PelSet738 = 1; }
         }
     }
     return 0; /* no header == nothing to relocate */

@@ -7,6 +7,7 @@
 #include "memory/manager.h"
 #include "hardware/abstraction.h"
 #include "fs/hfs.h"
+#include "fs/resfork.h"
 #include "platform/uefi_interface.h"
 
 // Bootloader context structure with more complete implementation
@@ -2927,6 +2928,31 @@ PpcStageOsRuntime (
               DumpStatus, (UINT64)FileSize);
     }
     BS->FreePool(Host);
+    // Stage the System file's resource fork so the interpreter's Resource
+    // Manager can serve GetResource/GetIndString out of real data. The buffer
+    // is pool memory and is intentionally never freed: the guest never calls
+    // ExitBootServices, so it stays valid for the interpreter's lifetime.
+    if (Sys.RsrcSize != 0) {
+        UINTN RfSize = (UINTN)Sys.RsrcSize;
+        VOID* RfBuf = NULL;
+        Status = BS->AllocatePool(EfiBootServicesData, RfSize, &RfBuf);
+        if (!EFI_ERROR(Status)) {
+            UINTN GotR = RfSize;
+            Status = PpcHfsReadResourceFork(&Sys, RfBuf, &GotR);
+            if (!EFI_ERROR(Status) && GotR == RfSize) {
+                PpcResForkLoad((const UINT8*)RfBuf, GotR);
+                Print(L"Resource Manager: loaded System rsrc fork (%d bytes, ready=%u)\n",
+                      (UINT64)GotR, PpcResForkReady() ? 1u : 0u);
+                PpcResForkValidate();
+            } else {
+                Print(L"Resource Manager: failed to read rsrc fork: %r (%d/%d)\n",
+                      Status, (UINT64)GotR, (UINT64)RfSize);
+                BS->FreePool(RfBuf);
+            }
+        } else {
+            Print(L"Resource Manager: rsrc fork alloc failed: %r\n", Status);
+        }
+    }
     // the interpreter's DR-handoff can relocate the 68K boot stub to low RAM.
     BootWriteWord32(PPC_LOW_MEM_GUEST_BASE + PPC_LOW_MEM_BOOTINFO_OFFSET +
                         PPC_LOW_MEM_BOOTINFO_OSRUNTIME_OFFSET,

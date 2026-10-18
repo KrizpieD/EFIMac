@@ -42,6 +42,9 @@ typedef struct {
     UINT64  Size;                       // logical data-fork size
     UINT32  ExtentCount;                // number of (block,count) pairs
     UINT32  Extents[PPC_HFS_MAX_EXTENTS * 2]; // Block,Count,Block,Count...
+    UINT64  RsrcSize;                   // logical resource-fork size
+    UINT32  RsrcExtentCount;            // resource-fork (block,count) pair count
+    UINT32  RsrcExtents[PPC_HFS_MAX_EXTENTS * 2];
 } PPC_HFS_ENTRY;
 
 // Mounted volume geometry and catalog totals.
@@ -197,6 +200,24 @@ PpcHfsGetEntryById (
 EFI_STATUS
 EFIAPI
 PpcHfsReadFile (
+    IN  PPC_HFS_ENTRY* Entry,
+    OUT VOID*          Buffer,
+    IN  OUT UINTN*     Size
+    );
+
+/**
+  Read the resource fork of a file into a buffer.
+  @param[in]  Entry    File entry (IsDirectory must be FALSE)
+  @param[out] Buffer   Destination buffer
+  @param[in,out] Size  Capacity on entry; bytes written on exit
+  @retval EFI_SUCCESS          File read
+  @retval EFI_NOT_FOUND        The entry has no resource fork
+  @retval EFI_BUFFER_TOO_SMALL Buffer too small for the full fork (partial read)
+  @retval EFI_INVALID_PARAMETER  Entry is a directory or Buffer is NULL
+**/
+EFI_STATUS
+EFIAPI
+PpcHfsReadResourceFork (
     IN  PPC_HFS_ENTRY* Entry,
     OUT VOID*          Buffer,
     IN  OUT UINTN*     Size
