@@ -465,6 +465,11 @@ uint32_t PefPlaceFragment(PefFragment *f, uint32_t codeBase, uint32_t dataBase)
 
 uint32_t PefExportAddress(const PefFragment *f, const PefExportedSymbol *e)
 {
+    /* kPEFAbsoluteExport is -2 (absolute address in symbolValue) */
+    if (e->sectionIndex == -2) {
+        return (uint32_t)e->symbolValue;
+    }
+    /* kPEFReexportedImport is -3 (import ordinal in symbolValue) */
     if (e->sectionIndex < 0 || (int)e->sectionIndex >= f->sectionCount)
         return 0;
     if (!f->expanded[e->sectionIndex])

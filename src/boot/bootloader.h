@@ -443,6 +443,29 @@ PpcStageOsRuntime (
     );
 
 /**
+  Get the preserved CHRP info section of a decoded New World "Mac OS ROM"
+  file.  The info section (appended after the LZSS parcels) carries PEF
+  fragments such as the QuickDraw cursor library that are not part of the
+  decompressed ROM image itself.
+  @param[out] Buffer Info section bytes (NULL if none was preserved)
+  @param[out] Size   Info section length in bytes
+  @retval EFI_SUCCESS   Valid buffer returned (possibly zero length)
+  @retval EFI_NOT_FOUND No info section was preserved
+**/
+EFI_STATUS
+EFIAPI
+PpcGetChrpInfoSection (
+    OUT VOID**  Buffer,
+    OUT UINTN*  Size
+    );
+
+EFI_STATUS
+EFIAPI
+PpcStageSystemFiles (
+    VOID
+    );
+
+/**
   Prepare the system for boot: ensure the guest memory map is installed,
   reset the CPU to the ROM reset vector with a boot-ready MSR, and write
   the emulator boot info block into low memory.

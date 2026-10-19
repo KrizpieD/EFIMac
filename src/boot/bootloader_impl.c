@@ -41,6 +41,8 @@ typedef struct {
     BOOLEAN FinderPresent;
     BOOLEAN ExtensionsPresent;
     BOOLEAN MacOsRomPresent;
+    VOID*   MacOsRomInfo;       // CHRP info section buffer (may contain PEF fragments)
+    UINTN   MacOsRomInfoSize;   // size of info section
     UINTN   SystemFileCount;
     UINTN   LoadedSystemFileCount;
     UINTN   DriverCount;
@@ -1365,6 +1367,37 @@ BootDecodeChrpRom (
             Print(L"%08X", BootReadBe32(Rom + 0xE180 + (UINTN)i * 4));
             if ((i & 3) == 3) Print(L"\n");
             else if ((i & 3) != 0 || i == 0) Print(L" ");
+        }
+    }
+
+    /* Preserve the CHRP info section (contains PEF fragments like NQD cursor lib). */
+    {
+        UINT32 InfoStart = ParcelsOffset + ParcelsSize;
+        UINTN  InfoSize  = 0;
+        if (InfoStart < (UINT32)Size) {
+            InfoSize = (UINTN)Size - (UINTN)InfoStart;
+        }
+        if (InfoSize > 0x00200000u) {
+            InfoSize = 0x00200000u;
+        }
+        if (InfoSize > 0) {
+            UINTN InfoPages = (InfoSize + EFI_PAGE_SIZE - 1) / EFI_PAGE_SIZE;
+            EFI_PHYSICAL_ADDRESS InfoBase = 0;
+            UINT8 *InfoBuf = NULL;
+            Status = BS->AllocatePages(AllocateAnyPages, EfiBootServicesData,
+                                       InfoPages, &InfoBase);
+            if (!EFI_ERROR(Status)) {
+                InfoBuf = (UINT8 *)(UINTN)InfoBase;
+                CopyMem(InfoBuf, (VOID*)(Buffer + InfoStart), InfoSize);
+                g_BootContext.MacOsRomInfo = InfoBuf;
+                g_BootContext.MacOsRomInfoSize = InfoSize;
+                Print(L"CHRP info section preserved: 0x%X bytes at %p\n",
+                      (UINT64)InfoSize, (void *)InfoBuf);
+            } else {
+                Print(L"Failed to allocate CHRP info buffer: %r\n", Status);
+                g_BootContext.MacOsRomInfo = NULL;
+                g_BootContext.MacOsRomInfoSize = 0;
+            }
         }
     }
 
@@ -2961,6 +2994,28 @@ PpcStageOsRuntime (
     g_BootContext.OsRuntimeStaged = TRUE;
     Print(L"OS runtime staged: System -> guest 0x%x (%d bytes)\n",
           PPC_OS_RUNTIME_GUEST_BASE, (UINT64)FileSize);
+    return EFI_SUCCESS;
+}
+
+// Return the CHRP info section preserved by BootDecodeChrpRom (PEF fragments
+// such as the QuickDraw cursor library that live after the LZSS parcels).
+EFI_STATUS
+EFIAPI
+PpcGetChrpInfoSection (
+    OUT VOID**  Buffer,
+    OUT UINTN*  Size
+    )
+{
+    if (Buffer == NULL || Size == NULL) {
+        return EFI_INVALID_PARAMETER;
+    }
+    if (g_BootContext.MacOsRomInfo == NULL || g_BootContext.MacOsRomInfoSize == 0) {
+        *Buffer = NULL;
+        *Size = 0;
+        return EFI_NOT_FOUND;
+    }
+    *Buffer = g_BootContext.MacOsRomInfo;
+    *Size = g_BootContext.MacOsRomInfoSize;
     return EFI_SUCCESS;
 }
 

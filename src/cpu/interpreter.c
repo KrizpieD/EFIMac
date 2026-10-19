@@ -5588,15 +5588,21 @@ g_DrA207Land = 0;
     // the NK's `blr` returns to whatever its saved LR slot held. Catch the exact
     // instruction that produced it instead of only seeing the "reserved" fault
     // at PC 0, and name the register that carried the null target.
-    if (Next == 0u && CurrentAddress != 0u && NullBranchN < 8) {
-        NullBranchN++;
-        Print(L"  NULLBRANCH[%u] 0x%08x -> 0 at PC=0x%08x LR=0x%08x CTR=0x%08x "
-              L"r1=0x%08x r3=0x%08x r4=0x%08x r5=0x%08x r6=0x%08x r7=0x%08x\n",
-              NullBranchN - 1, Instruction, CurrentAddress, g_PpcContext.Lr,
-              g_PpcContext.Ctr, g_PpcContext.Gpr[1] & 0xFFFFFFFFu,
-              g_PpcContext.Gpr[3] & 0xFFFFFFFFu, g_PpcContext.Gpr[4] & 0xFFFFFFFFu,
-              g_PpcContext.Gpr[5] & 0xFFFFFFFFu, g_PpcContext.Gpr[6] & 0xFFFFFFFFu,
-              g_PpcContext.Gpr[7] & 0xFFFFFFFFu);
+    if (Next == 0u && CurrentAddress != 0u) {
+        if (NullBranchN < 8) {
+            NullBranchN++;
+            Print(L"  NULLBRANCH[%u] 0x%08x -> 0 at PC=0x%08x LR=0x%08x CTR=0x%08x "
+                  L"r1=0x%08x r3=0x%08x r4=0x%08x r5=0x%08x r6=0x%08x r7=0x%08x\n",
+                  NullBranchN - 1, Instruction, CurrentAddress, g_PpcContext.Lr,
+                  g_PpcContext.Ctr, g_PpcContext.Gpr[1] & 0xFFFFFFFFu,
+                  g_PpcContext.Gpr[3] & 0xFFFFFFFFu, g_PpcContext.Gpr[4] & 0xFFFFFFFFu,
+                  g_PpcContext.Gpr[5] & 0xFFFFFFFFu, g_PpcContext.Gpr[6] & 0xFFFFFFFFu,
+                  g_PpcContext.Gpr[7] & 0xFFFFFFFFu);
+        }
+        // Skip the null call: report failure in r3 and continue at the next
+        // instruction instead of fetching the reserved opcode at physical 0.
+        g_PpcContext.Gpr[3] = 0;
+        Next = CurrentAddress + 4u;
     }
     *NextAddress = Next;
     return EFI_SUCCESS;
@@ -6494,13 +6500,175 @@ NatMemMakeRoutineDesc (
     NatMemWrite8  (D + 9u,  0u);
     NatMemWrite16 (D + 10u, 1u);
     NatMemWrite32 (D + 12u, ProcInfo);
-    NatMemWrite8  (D + 16u, 0u);
-    NatMemWrite8  (D + 17u, Isa);
-    NatMemWrite16 (D + 18u, 4u);          /* routineFlags: 0|0|4 */
-    NatMemWrite32 (D + 20u, Proc);
-    NatMemWrite32 (D + 24u, 0u);
-    NatMemWrite32 (D + 28u, 0u);
+    NatMemWrite8  (D + 16u,  0u);
+    NatMemWrite8  (D + 17u,  Isa);
+    NatMemWrite16 (D + 18u,  4u);          /* routineFlags: 0|0|4 */
+    NatMemWrite32 (D + 20u,  Proc);
+    NatMemWrite32 (D + 24u,  0u);
+    NatMemWrite32 (D + 28u,  0u);
     return D;
+}
+
+static UINT32 g_Cup68kCallsTotal = 0;
+static UINT32 g_Cup68kSnap[0x800];   /* 0x0..0x2000 low-global rollback */
+static BOOLEAN g_CupRmSeeded = FALSE;
+
+static UINT32
+NatCupRun68k (
+    IN UINT32 CodePtr,
+    IN UINT32 ProcInfo
+    )
+{
+    M68K_CPU_CONTEXT Saved = g_M68kContext;
+    const UINT32 Sentinel = 0x00FFF000u;
+    const UINTN  MaxTotal = 20000u;
+    UINT32 Sp = 0x00FF0000u;
+    UINTN  Executed = 0u;
+    UINT32 ResultD0;
+    UINT32 LrAtCall = g_PpcContext.Lr & 0xFFFFFFFFu;
+    UINT32 I;
+    const CHAR16 *Outcome = NULL;
+    BOOLEAN RunOk = FALSE;
+
+    /* Seed the 68K Resource Manager globals. Our guest never runs the
+       ROM's InitResources, so CurResFile (0xA5A) stays 0 and the ROM's
+       map-list walk (0x40865F84) dereferences the null queue head (0xA50),
+       wandering low memory until the instruction budget expires. Report
+       "no resource file open" instead: CurResFile = -1 takes every walk's
+       bmi not-found exit, and the head chain is a valid empty list for the
+       one path (0x40865F66) that derefs it unconditionally. Seeded before
+       the snapshot so a failure rollback preserves it. */
+    if (!g_CupRmSeeded) {
+        g_CupRmSeeded = TRUE;
+        CpuWrite32 (0x00000A50u, 0x00001F00u);  /* map-list head handle */
+        CpuWrite16 (0x00000A5Au, 0xFFFFu);      /* CurResFile = -1 */
+        CpuWrite32 (0x00001F00u, 0x00001F10u);  /* handle -> head node */
+        CpuWrite32 (0x00001F20u, 0u);           /* node+0x10 next = none */
+        CpuWrite16 (0x00001F24u, 0xFFFFu);      /* node+0x14 refnum = -1 */
+        Print (L"  CUP68K: seeded 68K RM globals (CurResFile=-1, empty map "
+               L"list)\n");
+    }
+
+    /* Snapshot the 68K low-global area: a half-broken routine (wrong
+       parameter layout) scribbles on $xxxx.w globals and corrupts the
+       fragment's callback slots; roll back unless the run completed. */
+    for (I = 0u; I < 0x800u; I++) {
+        g_Cup68kSnap[I] = CpuRead32 (I * 4u);
+    }
+
+    /* Push the eight PPC argument words right-to-left so that after the
+       routine's `link a6,#0` the first argument sits at 8(a6). The caller
+       uses the PowerPC MixedMode convention CallUniversalProc(proc, info,
+       ...args): r3 = the routine pointer, r4 = ProcInfo, and the real
+       arguments begin at r5, so the stack base is r5 (not r3). */
+    for (I = 8u; I >= 1u; I--) {
+        Sp -= 4u;
+        M68kWriteLong (Sp, g_PpcContext.Gpr[4u + I] & 0xFFFFFFFFu);
+    }
+    /* Sentinel return address: STOP #0x2700 parks the engine in
+       supervisor mode (Stopped=TRUE) when the routine returns via rts. */
+    M68kWriteWord (Sentinel, 0x4E72u);
+    M68kWriteWord (Sentinel + 2u, 0x2700u);
+    Sp -= 4u;
+    M68kWriteLong (Sp, Sentinel);
+
+    /* Register file: the ROM's Toolbox dispatcher uses D0 as the trap
+       selector (the glue loads `moveq #trap,d0` before entering the
+       dispatcher), so D0-D7 must NOT carry argument values for stack-based
+       ProcInfos. Leave the data/address registers clear; arguments reach
+       the routine through the stack frame above. */
+    for (I = 0u; I < 8u; I++) {
+        g_M68kContext.D[I] = 0u;
+    }
+    g_M68kContext.A[0] = 0u;
+    g_M68kContext.A[1] = 0u;
+    g_M68kContext.A[2] = 0u;
+    g_M68kContext.A[3] = 0u;
+    g_M68kContext.A[4] = 0u;
+    g_M68kContext.A[5] = 0u;
+    g_M68kContext.A[6] = 0u;
+    g_M68kContext.A[7] = 0u;
+    g_M68kContext.SSP = Sp;
+    g_M68kContext.Supervisor = TRUE;
+    g_M68kContext.SR = 0x2700u;
+    g_M68kContext.PC = CodePtr & 0xFFFFFFFEu;
+    g_M68kContext.Halted = FALSE;
+    g_M68kContext.Stopped = FALSE;
+
+    g_Cup68kCallsTotal++;
+    if (g_Cup68kCallsTotal <= 48u) {
+        Print (L"  CUP68K#%u ptr=0x%08x info=%08x first=%04x LR=0x%08x "
+               L"r3=0x%08x r4=0x%08x r5=0x%08x r6=0x%08x r7=0x%08x "
+               L"sp=0x%08x\n",
+               g_Cup68kCallsTotal, CodePtr, ProcInfo,
+               M68kReadWord (CodePtr & 0xFFFFFFFEu), LrAtCall,
+               g_PpcContext.Gpr[3] & 0xFFFFFFFFu,
+               g_PpcContext.Gpr[4] & 0xFFFFFFFFu,
+               g_PpcContext.Gpr[5] & 0xFFFFFFFFu,
+               g_PpcContext.Gpr[6] & 0xFFFFFFFFu,
+               g_PpcContext.Gpr[7] & 0xFFFFFFFFu, Sp);
+    }
+
+    while (Executed < MaxTotal) {
+        /* Small batches: M68kExecuteBlock only stops on Halted, so after
+           the sentinel STOP fires we may overshoot a few instructions
+           (zeros -> ori.b #0,d0); 8-wide batches keep that bounded. */
+        Executed += M68kExecuteBlock (8u);
+        if (g_M68kContext.Stopped &&
+            g_M68kContext.PC >= Sentinel &&
+            g_M68kContext.PC < Sentinel + 0x80u) {
+            Outcome = L"ok";
+            RunOk = TRUE;
+            break;
+        }
+        if (g_M68kContext.Halted) { Outcome = L"halt"; break; }
+        if (g_M68kContext.Stopped) { Outcome = L"stop"; break; }
+        {
+            /* Runaway guard: the routine must stay inside mapped guest
+               RAM, the ROM, the 68K RAM-Rom/sys-globals windows or any
+               of the four ROM alias windows (FF0/FF4/FF8/FFC). Anything
+               else is a wild jump. */
+            UINT32 Pc = g_M68kContext.PC;
+            BOOLEAN Ok = (Pc < 0x01000000u) ||
+                         (Pc >= 0x40800000u && Pc < 0x41000000u) ||
+                         (Pc >= 0x80000000u && Pc < 0x90000000u) ||
+                         (Pc >= 0xFF000000u);
+            if (!Ok) {
+                Outcome = L"wild";
+                if (g_Cup68kCallsTotal <= 8u) {
+                    Print (L"  CUP68K wild pc=0x%08x after %u ins "
+                           L"sp=0x%08x d0=0x%08x\n",
+                           Pc, (UINT32)Executed,
+                           g_M68kContext.Supervisor ? g_M68kContext.SSP
+                                                    : g_M68kContext.A[7],
+                           g_M68kContext.D[0]);
+                }
+                break;
+            }
+        }
+    }
+    if (Outcome == NULL) { Outcome = L"spin"; }
+
+    ResultD0 = g_M68kContext.D[0] & 0xFFFFFFFFu;
+    if (g_Cup68kCallsTotal <= 48u) {
+        Print (L"    CUP68K#%u -> %s exec=%u pc=0x%08x d0=0x%08x\n",
+               g_Cup68kCallsTotal, Outcome, (UINT32)Executed,
+               g_M68kContext.PC, ResultD0);
+    }
+
+    /* A routine that did not return via the sentinel has scribbled on
+       low globals with a wrong parameter layout; roll the area back so
+       the fragment's callback slots stay intact, and report failure. */
+    if (!RunOk) {
+        for (I = 0u; I < 0x800u; I++) {
+            CpuWrite32 (I * 4u, g_Cup68kSnap[I]);
+        }
+        g_M68kContext = Saved;
+        return 0u;
+    }
+
+    g_M68kContext = Saved;
+    return ResultD0;
 }
 
 /* Called from the PPC step loop when PC lands on a host stub. r3 carries the
@@ -7030,15 +7198,12 @@ NatMemDispatchStub (
             g_PpcContext.Pc = CodePtr;   /* host thunk; step loop dispatches it */
             return;
         }
+        /* Dispatch 68K UniversalProc targets (plain pointers in ROM). */
+        if (CodePtr >= 0x40800000u && CodePtr < 0x41000000u) {
+            Res = NatCupRun68k (CodePtr, R4);
+            break;
+        }
         if (Isa == 0u && CodePtr != 0u) {
-            /* 68K Mixed-Mode routine. The PPC->68K trampoline (0x55CBC0) has
-               already marshalled the emulator registers via Get/SetEmulator-
-               Register (which map onto g_M68kContext); the 68K engine is the
-               context the routine must run in. EFIMac's synthetic System image
-               does not carry the 68K body for these callbacks (proc@0xB0007C is
-               zero), so an empty body is treated as a completed host routine
-               (success) so the caller's success gate opens and boot advances;
-               a non-empty body is reported so real dispatch can be wired next. */
             UINT32 FirstWord = NatMemRead32 (CodePtr);
             static UINT32 Cup68kCallers[24];
             static UINT32 Cup68kCallerN = 0;
@@ -7054,12 +7219,16 @@ NatMemDispatchStub (
             }
             if (Ci == Cup68kCallerN && Cup68kCallerN < 24u) {
                 Cup68kCallers[Cup68kCallerN++] = Caller;
-                Print(L"  CUP68K#%u proc=0x%08x info=%08x first=0x%08x "
-                      L"LR=0x%08x caller=0x%08x r1=0x%08x %s\n",
+                Print(L"  CUP68K(isa0)#%u proc=0x%08x info=%08x first=0x%08x "
+                      L"LR=0x%08x caller=0x%08x r1=0x%08x\n",
                       Cup68kTotal, CodePtr, R4, FirstWord,
                       g_PpcContext.Lr & 0xFFFFFFFF, Caller,
-                      g_PpcContext.Gpr[1] & 0xFFFFFFFF,
-                      (FirstWord == 0u) ? L"empty->success" : L"nonempty");
+                      g_PpcContext.Gpr[1] & 0xFFFFFFFF);
+            }
+            /* If it's in ROM, run it via 68K engine. */
+            if (CodePtr >= 0x40800000u && CodePtr < 0x41000000u) {
+                Res = NatCupRun68k (CodePtr, R4);
+                break;
             }
             Res = 0u;
             break;
@@ -7129,6 +7298,12 @@ done:
 }
 
 typedef struct { const char *name; UINT32 addr; } NatCfmExport;
+
+/* Export map built by the last NatCfmLoadSystem (System + ROM fragments).
+   Kept so the NATIVE-HANDOFF fragment-0 loader can bind its imports to the
+   real cross-fragment providers instead of the 0-returning glue. */
+static NatCfmExport *g_NatCfmMap  = NULL;
+static UINTN          g_NatCfmMapN = 0;
 
 static UINT32 NatCfmLookup(const NatCfmExport *m, UINTN n, const char *name)
 {
@@ -7233,10 +7408,82 @@ static int NatCfmLoadSystem(void)
     nf = PefEnumFragments(file, NAT_CFM_FORK_LEN, frags, NAT_CFM_MAXFRAGS);
     Print(L"  CFM: enumerated %d PEF fragments in System fork\n", nf);
 
-    /* Pass 1: expand + place every fragment, collect exports (skip 0 and 1,
-       the two QuickDraw images: fragment 0 is loaded by the caller, and
-       fragment 1's code overlaps the caller's data region). */
-    for (i = 2; i < (UINTN)nf; i++) {
+    /* Diagnostic: does fragment 0 (QuickDraw, caller-loaded) export the cursor /
+       accelerator names that frag1 only re-exports? */
+    {
+        PefFragment *f0 = &frags[0];
+        int ok = 0;
+        if (f0->sectionCount != 0) {
+            if (f0->expanded != NULL) ok = 1;
+            else if (PefExpandSections(f0) == 0) ok = 1;
+        }
+        Print(L"  F0X frag0 base=0x%x sections=%u exports=%u syms=%u expand=%d\n",
+              (UINT32)f0->base, (UINT64)f0->sectionCount,
+              (UINT64)f0->exportCount, (UINT64)f0->symCount, ok);
+        if (ok) {
+            UINTN kk, shown = 0;
+            for (kk = 0; kk < f0->exportCount && shown < 40; kk++) {
+                const char *nm = f0->exports[kk].name;
+                if (nm && ((nm[0]=='N'&&nm[1]=='Q'&&nm[2]=='D') ||
+                           (nm[0]=='B'&&nm[1]=='A'&&nm[2]=='L'))) {
+                    Print(L"  F0X export %a sec=%d val=0x%x\n", nm,
+                          (INT32)f0->exports[kk].sectionIndex,
+                          (UINT32)f0->exports[kk].symbolValue);
+                    shown++;
+                }
+            }
+        }
+        Print(L"  F0X libs=%u\n", (UINT64)f0->libCount);
+        {
+            UINTN lj;
+            for (lj = 0; lj < f0->libCount; lj++) {
+                UINT32 fst = f0->libs[lj].firstImportedSymbol;
+                UINT32 cnt = f0->libs[lj].importedSymbolCount;
+                Print(L"  F0X lib %u %a first=%u cnt=%u %s\n", (UINT64)lj,
+                      f0->libs[lj].name, (UINT64)fst, (UINT64)cnt,
+                      (fst <= 0xAu && 0xAu < fst + cnt) ? L"<== import 0xA" : L"");
+            }
+        }
+    }
+
+    /* Diagnostic: find where the provider names occur in the fork and map each
+       occurrence to the owning fragment (base range). */
+    {
+        const char *names[3];
+        UINTN nn;
+        names[0] = "NQDShowCursor";
+        names[1] = "BAL_CGSShowCursor";
+        names[2] = "BlueAbstractionLayerLib";
+        for (nn = 0; nn < 3; nn++) {
+            const char *nt = names[nn];
+            UINT32 off, found = 0;
+            for (off = 0; off + 24u < NAT_CFM_FORK_LEN && found < 4; off++) {
+                UINTN j; for (j = 0; nt[j]; j++) if ((char)file[off+j] != nt[j]) break;
+                if (!nt[j]) {
+                    UINTN fi, owner = 0xFFFFFFFFu;
+                    for (fi = 0; fi < (UINTN)nf; fi++) {
+                        UINT32 b = (UINT32)frags[fi].base;
+                        UINT32 nb = (fi + 1 < (UINTN)nf) ?
+                                    (UINT32)frags[fi+1].base : 0xFFFFFFFFu;
+                        if (b <= off && off < nb) { owner = fi; break; }
+                    }
+                    Print(L"  OCC %a @0x%x owner frag %u (base 0x%x sect %u exp %p)\n",
+                          nt, off, (UINT64)owner,
+                          (owner != 0xFFFFFFFFu) ? (UINT32)frags[owner].base : 0u,
+                          (owner != 0xFFFFFFFFu) ? (UINT32)frags[owner].sectionCount : 0u,
+                          (owner != 0xFFFFFFFFu) ? (void *)frags[owner].expanded : (void *)0);
+                    found++;
+                }
+            }
+            if (found == 0) Print(L"  OCC %a NOT in fork\n", nt);
+        }
+    }
+    /* Pass 1: expand + place every fragment, collect exports.  Skip only
+       fragment 0 (loaded by the caller); fragment 1 is the second QuickDraw
+       image (the NQD/CGS provider: 324 exports) whose code sits at 0x4D350..
+       0x940A4 (just below the raw-mirror region) and whose exported TVectors
+       land in the shared data bump, so it must be placed and mapped too. */
+    for (i = 1; i < (UINTN)nf; i++) {
         PefFragment *f = &frags[i];
         if (f->sectionCount == 0) continue;
         if (PefExpandSections(f) != 0) {
@@ -7265,9 +7512,30 @@ static int NatCfmLoadSystem(void)
                   (INT32)f->mainSection, (UINT32)f->mainOffset);
         }
         for (k = 0; k < f->exportCount && mapN < NAT_CFM_MAXEXPORTS; k++) {
+            UINT32 exAddr;
+            int exists = -1;
             if (f->exports[k].name == NULL) continue;
+            exAddr = PefExportAddress(f, &f->exports[k]);
+            /* Try to replace existing zero-addr entry first */
+            for (UINTN xm = 0; xm < mapN; xm++) {
+                if (map[xm].name != NULL) {
+                    const char *a = map[xm].name, *b = f->exports[k].name;
+                    while (*a && *a == *b) { a++; b++; }
+                    if (*a == 0 && *b == 0) { exists = (int)xm; break; }
+                }
+            }
+            if (exAddr == 0) {
+                if (exists >= 0 && map[exists].addr == 0) {
+                    /* keep zero for now; don't overwrite better one */
+                }
+                continue;
+            }
+            if (exists >= 0) {
+                if (map[exists].addr == 0) map[exists].addr = exAddr;
+                continue;
+            }
             map[mapN].name = f->exports[k].name;
-            map[mapN].addr = PefExportAddress(f, &f->exports[k]);
+            map[mapN].addr = exAddr;
             mapN++;
         }
     }
@@ -7331,16 +7599,32 @@ static int NatCfmLoadSystem(void)
                 }
             }
             for (k = 0; k < f->exportCount && mapN < NAT_CFM_MAXEXPORTS; k++) {
+                UINT32 exAddr;
+                int exists = -1;
                 if (f->exports[k].name == NULL) continue;
+                exAddr = PefExportAddress(f, &f->exports[k]);
+                for (UINTN xm = 0; xm < mapN; xm++) {
+                    if (map[xm].name != NULL) {
+                        const char *a = map[xm].name, *b = f->exports[k].name;
+                        while (*a && *a == *b) { a++; b++; }
+                        if (*a == 0 && *b == 0) { exists = (int)xm; break; }
+                    }
+                }
+                if (exAddr == 0) continue;
+                if (exists >= 0) {
+                    if (map[exists].addr == 0) map[exists].addr = exAddr;
+                    continue;
+                }
                 map[mapN].name = f->exports[k].name;
-                map[mapN].addr = PefExportAddress(f, &f->exports[k]);
+                map[mapN].addr = exAddr;
                 mapN++;
             }
         }
         {
             static const char *const probe[] = {
-                "DrawMenuBar", "GetMenu", "InsertMenu", "GetQDGlobals",
-                "CallUniversalProc"
+                "DrawMenuBar", "NQDSetCursor", "NQDShowCursor",
+                "NQDBackColor", "gNotifyRectList", "InitializeCursors",
+                "ResetCursorToArrow", "CGSGetWindowShape"
             };
             UINTN pi;
             for (pi = 0; pi < sizeof(probe) / sizeof(probe[0]); pi++) {
@@ -7350,10 +7634,158 @@ static int NatCfmLoadSystem(void)
         }
     }
 
-    /* Pass 2: resolve imports, relocate and instantiate into guest RAM. */
+    g_NatCfmMap  = map;
+    g_NatCfmMapN = mapN;
+    /* Diagnostic: frag1 re-exported imports (sectionIndex == -3). */
+    if (nf > 1 && frags[1].expanded != NULL) {
+        UINTN kk;
+        for (kk = 0; kk < frags[1].exportCount; kk++) {
+            const char *nm = frags[1].exports[kk].name;
+            UINT32 iv;
+            if (!nm) continue;
+            if (frags[1].exports[kk].sectionIndex != -3) continue;
+            iv = (UINT32)frags[1].exports[kk].symbolValue;
+            Print(L"  F1X %a sec=%d val=0x%x -> import %a\n",
+                  nm, (INT32)frags[1].exports[kk].sectionIndex, iv,
+                  (iv < frags[1].symCount && frags[1].imports[iv].name)
+                      ? frags[1].imports[iv].name : "(oob)");
+        }
+    }
+    /* Diagnostic: which fragment/library defines NQDShowCursor / BAL_*? */
+    {
+        UINTN fi, kk;
+        /* frag1 import 0xA belongs to which library? */
+        for (kk = 0; kk < frags[1].libCount; kk++) {
+            UINT32 f0 = frags[1].libs[kk].firstImportedSymbol;
+            UINT32 n  = frags[1].libs[kk].importedSymbolCount;
+            if (0xA >= f0 && 0xA < f0 + n)
+                Print(L"  F1LIB import 0xA lib=%a (cnt=%u)\n",
+                      frags[1].libs[kk].name, (UINT64)kk);
+        }
+        for (fi = 1; fi < (UINTN)nf; fi++) {
+            UINTN kk2;
+            if (frags[fi].exports == NULL) continue;
+            for (kk2 = 0; kk2 < frags[fi].exportCount; kk2++) {
+                const char *nm = frags[fi].exports[kk2].name;
+                if (nm && nm[0]=='N' && nm[1]=='Q' && nm[2]=='D' &&
+                    nm[3]=='S' && nm[4]=='h' && nm[5]=='o' && nm[6]=='w') {
+                    Print(L"  F1PROV frag %u base=0x%x export %a sec=%d val=0x%x\n",
+                          (UINT64)fi, (UINT32)frags[fi].base, nm,
+                          (INT32)frags[fi].exports[kk2].sectionIndex,
+                          (UINT32)frags[fi].exports[kk2].symbolValue);
+                }
+            }
+        }
+    }
+    /* Also load CHRP info section PEF fragments (if present) */
+
+    {
+
+        extern EFI_STATUS PpcGetChrpInfoSection(VOID **buf, UINTN *sz);
+
+        VOID *ibuf = NULL;
+
+        UINTN isz = 0;
+
+        if (PpcGetChrpInfoSection(&ibuf, &isz) == EFI_SUCCESS && ibuf != NULL && isz > 0) {
+
+            UINT8 *ifile = (UINT8 *)NatCfmAlloc(NULL, isz);
+
+            PefFragment *ifrags = (PefFragment *)NatCfmAlloc(NULL, (UINTN)NAT_CFM_MAXFRAGS * sizeof(PefFragment));
+
+            if (ifile != NULL && ifrags != NULL) {
+
+                {
+                    UINT8 *d = ifile; UINT8 *sr = (UINT8 *)ibuf; UINTN x;
+                    for (x = 0; x < isz; x++) d[x] = sr[x];
+                }
+
+                PeiNull(ifrags, (UINTN)NAT_CFM_MAXFRAGS * sizeof(PefFragment));
+
+                for (i = 0; i < NAT_CFM_MAXFRAGS; i++) {
+
+                    ifrags[i].alloc = NatCfmAlloc;
+
+                    ifrags[i].free_ = NatCfmFree;
+
+                }
+
+                int inf = PefEnumFragments(ifile, isz, ifrags, NAT_CFM_MAXFRAGS);
+
+                Print(L"  CFM: enumerated %d PEF fragments in CHRP info\n", inf);
+
+                for (i = 0; i < (UINTN)inf; i++) {
+
+                    PefFragment *f = &ifrags[i];
+
+                    if (f->sectionCount == 0) continue;
+
+                    if (PefExpandSections(f) != 0) {
+
+                        Print(L"  CFM: CHRP expand failed frag %u\n", (UINT64)i);
+
+                        continue;
+
+                    }
+
+                    NatCfmPlace(f, &bump, &entryToc);
+
+                    for (k = 0; k < f->exportCount && mapN < NAT_CFM_MAXEXPORTS; k++) {
+                        UINT32 exAddr;
+                        int exists = -1;
+                        if (f->exports[k].name == NULL) continue;
+                        exAddr = PefExportAddress(f, &f->exports[k]);
+                        for (UINTN xm = 0; xm < mapN; xm++) {
+                            if (map[xm].name != NULL) {
+                                const char *a = map[xm].name, *b = f->exports[k].name;
+                                while (*a && *a == *b) { a++; b++; }
+                                if (*a == 0 && *b == 0) { exists = (int)xm; break; }
+                            }
+                        }
+                        if (exAddr == 0) continue;
+                        if (exists >= 0) {
+                            map[exists].addr = exAddr;
+                            continue;
+                        }
+                        map[mapN].name = f->exports[k].name;
+                        map[mapN].addr = exAddr;
+                        mapN++;
+                    }
+
+                }
+
+                Print(L"  CFM: CHRP exports added (mapN=%u)\n", (UINT64)mapN);
+
+            }
+
+        }
+
+    }
+
+    /* Publish after the CHRP merge so the frag0 loader and pass-2 import
+       binding see the info-section providers too. */
+    g_NatCfmMap  = map;
+    g_NatCfmMapN = mapN;
+    {
+        static const char *const probe2[] = {
+            "NQDSetCursor", "NQDShowCursor", "NQDHideCursor",
+            "InitializeCursors", "ResetCursorToArrow", "BAL_CGSShowCursor"
+        };
+        UINTN pi;
+        for (pi = 0; pi < sizeof(probe2) / sizeof(probe2[0]); pi++) {
+            Print(L"  CFM: export(final) %a -> 0x%08x\n", probe2[pi],
+                  (UINT32)NatCfmLookup(map, mapN, probe2[pi]));
+        }
+    }
+
+
+
+    /* Pass 2: resolve imports, relocate and instantiate into guest RAM.
+       Started at 1 (not 2) so the second QuickDraw image (frag 1, the NQD/CGS
+       provider) is relocated and instantiated too; only frag 0 is caller-loaded. */
     g_PelRelocLog = NatCfmRelocLog;
     NatMemStubCount = 0;
-    for (i = 2; i < (UINTN)nf; i++) {
+    for (i = 1; i < (UINTN)nf; i++) {
         PefFragment *f = &frags[i];
         UINT32 *imp;
         int s;
@@ -8002,6 +8434,20 @@ if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 48) {
                 g_NatTermPending = 1;
                 g_ForkResumePc = g_PpcContext.Gpr[24] & 0xFFFFFFFF;
                 g_PpcContext.Pc = Np;
+                // Reordered: build the cross-fragment CFM export map (and place
+                // every System/ROM fragment) BEFORE instantiating frag0, so the
+                // QuickDraw fragment's imports (NQD*/BAL_*) can bind to their
+                // real System-fragment providers instead of the 0-glue stub.
+                // The raw 1:1 fork mirror runs first so the CFM loader's
+                // expanded/relocated images land on top of it.
+                for (UINT32 Mw = 0x00096000u; Mw < 0x002A2B0Au; Mw += 4) {
+                    CpuWrite32(Mw, CpuRead32(PPC_OS_RUNTIME_GUEST_BASE + Mw));
+                }
+                Print(L"  NATIVE-HANDOFF mirrored fork 0x96000..0x2A2B0A into low "
+                      L"RAM (file offset == runtime addr); [0x100000]=0x%08x "
+                      L"[0x100004]=0x%08x\n",
+                      CpuRead32(0x00100000u), CpuRead32(0x00100004u));
+                NatCfmLoadSystem();
                 // Hooked = 1;  (trimmed)
                 // Load fragment 0 (QuickDraw) with the real CFM/PEF loader and
                 // stage it OUTSIDE the 68K low-memory world.  The code section
@@ -8046,6 +8492,7 @@ if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 48) {
                         if (Frag.symCount != 0) {
                             UINT32 *Imports = (UINT32 *)PeiAlloc(
                                 NULL, (UINTN)Frag.symCount * sizeof(UINT32));
+                            UINT32 QdResolved = 0, QdUnbound = 0;
                             if (Imports != NULL) {
                                 PeiNull(Imports, (UINTN)Frag.symCount * sizeof(UINT32));
                                 KiIdx = PefImportIndex(&Frag, "GetQDGlobals");
@@ -8060,6 +8507,8 @@ if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 48) {
                                 // glue with no fragment export; auto-resolution
                                 // cannot bind it, and the fork stops on it before
                                 // touching any other import.
+                                Print(L"  FRAG84 map: ptr=0x%08x n=%u\n",
+                                      (UINT64)g_NatCfmMap, (UINT64)g_NatCfmMapN);
                                 for (UINT32 Gi = 0; Gi < Frag.symCount; Gi++) {
                                     if (Imports[Gi] == 0) {
                                         const char *nm = Frag.imports[Gi].name ? Frag.imports[Gi].name : "(null)";
@@ -8067,11 +8516,29 @@ if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 48) {
                                         if (H != NAT_MEM_H_NONE) {
                                             Imports[Gi] = NatMemBindImport(H, Frag.imports[Gi].name);
                                         } else {
-                                            Print(L"  FRAG84 SYS unbound Gi=%u name=%a\\n", (UINT64)Gi, nm);
-                                            Imports[Gi] = 0x0000BA20u;
+                                            /* Bind to the real cross-fragment
+                                               provider (System/ROM export) when
+                                               one exists, instead of glue. */
+                                            UINT32 Ex = 0;
+                                            if (g_NatCfmMap != NULL &&
+                                                g_NatCfmMapN > 0u && g_NatCfmMapN < 65536u)
+                                                Ex = NatCfmLookup(g_NatCfmMap,
+                                                            g_NatCfmMapN, Frag.imports[Gi].name);
+                                            if (Ex != 0) {
+                                                Imports[Gi] = Ex;
+                                                QdResolved++;
+                                            } else {
+                                                Print(L"  FRAG84 SYS unbound Gi=%u name=%a\n", (UINT64)Gi, nm);
+                                                Imports[Gi] = 0x0000BA20u;
+                                                QdUnbound++;
+                                            }
                                         }
                                     }
                                 }
+                                Print(L"  FRAG84 import bind: %u via export map, "
+                                      L"%u unbound (of %u)\n",
+                                      (UINT64)QdResolved, (UINT64)QdUnbound,
+                                      (UINT64)Frag.symCount);
                                 PefRelocateSection(&Frag, 1, Frag.expanded[1], Imports);
                             }
                         }
@@ -8153,28 +8620,10 @@ if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 48) {
                 // Give the guest a real colour screen device backed by the
                 // host framebuffer window (overrides the skip fields above).
                 NatQdInstallScreen();
-                // Real boot maps the System data fork 1:1 into low RAM (file
-                // offset == runtime address == PPC_OS_RUNTIME_GUEST_BASE+off).
-                // The ROM glue bcctr's into the diag region at Dst (0x100000);
-                // that image lives in the fork at file offset 0x100000.. and is
-                // NOT produced by the QD fragment (the "stream" at 0x96000 is
-                // QuickDraw's universal-proc name table). Mirror the fork's
-                // diag + name-table regions so the glue's bcctr lands on real
-                // code instead of zeros. The NAT_F0_CODE_BASE code / NAT_F0_
-                // DATA_BASE data placements above already cover the fragment
-                // itself (clear of the 68K low-memory world).
-                for (UINT32 Mw = 0x00096000u; Mw < 0x002A2B0Au; Mw += 4) {
-                    CpuWrite32(Mw, CpuRead32(PPC_OS_RUNTIME_GUEST_BASE + Mw));
-                }
-                Print(L"  NATIVE-HANDOFF mirrored fork 0x96000..0x2A2B0A into low "
-                      L"RAM (file offset == runtime addr); [0x100000]=0x%08x "
-                      L"[0x100004]=0x%08x\n",
-                      CpuRead32(0x00100000u), CpuRead32(0x00100004u));
-                // Real CFM loader: expand+relocate every other fragment and
-                // layer the properly-instantiated images over the raw mirror.
-                // Also records the TOC of the fragment that owns 0x100000 so the
-                // native handoff can set r2 to that fragment's TOC, not QD's.
-                NatCfmLoadSystem();
+                // (The 1:1 fork mirror and the CFM export-map build now run
+                // earlier -- before the frag0 loader -- so frag0's imports can
+                // bind to their real providers; see the NATIVE-HANDOFF reorder.)
+
                 Print(L"  F0RDBK after-CFM [0x%08x]=0x%08x "
                       L"[0x%08x]=0x%08x (expect 0x7C0802A6 0x9421FFA0)\n",
                       (UINT32)(NAT_F0_CODE_BASE + NAT_F0_ENTRY_OFF),
