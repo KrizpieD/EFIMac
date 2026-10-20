@@ -972,6 +972,22 @@ PpcWriteGuestByte (
     IN UINT8  Value
     )
 {
+    // Boot gate byte at 0x4 ("prepared" flag): the A71E service forces it to
+    // 3, yet the gate re-prints on every subsequent A71E, so something writes
+    // a different value back between traps. All widths funnel here byte by
+    // byte; our own force writes value 3, so log only non-3 writers with the
+    // PPC and 68K PCs of the culprit.
+    if (Address == 0x00000004u && Value != 3u) {
+        static UINT32 Byte4WatchN = 0;
+        if (Byte4WatchN < 32u) {
+            Byte4WatchN++;
+            Print (L"  BYTE4-CLOBBER [%08x]<-%02x ppcpc=%08x lr=%08x "
+                   L"68kpc=%08x r1=%08x\n",
+                   Address, Value, g_PpcContext.Pc,
+                   g_PpcContext.Lr & 0xFFFFFFFFu,
+                   g_M68kContext.PC, g_PpcContext.Gpr[1] & 0xFFFFFFFFu);
+        }
+    }
     // Trampoline-region watch: who (if anyone) populates 0x7F0000-0x800000
     // where the NK expects continuation stubs? Both CPU paths funnel here.
     {
@@ -5869,7 +5885,10 @@ enum {
     /* --- QuickDraw point transforms --- */
     NAT_MEM_H_GLOBALTOLOCAL,
     NAT_MEM_H_LOCALTOGLOBAL,
-    NAT_MEM_H_PTINRECT
+    NAT_MEM_H_PTINRECT,
+
+    /* --- Blue Abstraction Layer family (no provider in any image) --- */
+    NAT_MEM_H_BAL
 };
 
 typedef struct { const char *name; UINT32 handler; } NatMemEntry;
@@ -6097,6 +6116,19 @@ NatMemFindHandler (
             return NatMemTable[I].handler;
         }
     }
+    /* Blue Abstraction Layer family (BAL_CGS*, BAL_IOK*, BALGet*, BALInit*,
+       BALLock*, BALMisc*, BALSet*, BALUnlock*) plus the three stray cursor /
+       path imports: no image in the ROM, System fork or CHRP info section
+       provides them, so bind them to the generic stub instead of the
+       0xBA20 catch-all.  Require BAL + '_' or an uppercase letter so a
+       lowercase continuation (e.g. "Balance") never matches. */
+    if ((Name[0] == 'B' && Name[1] == 'A' && Name[2] == 'L' &&
+         (Name[3] == '_' || (Name[3] >= 'A' && Name[3] <= 'Z'))) ||
+        NatMemNameEq (Name, "ProtectCursor") ||
+        NatMemNameEq (Name, "UnprotectCursor") ||
+        NatMemNameEq (Name, "InstCreatePathClass")) {
+        return NAT_MEM_H_BAL;
+    }
     return NAT_MEM_H_NONE;
 }
 
@@ -6137,7 +6169,9 @@ NatMemBindImport (
     UINT32 Desc, Code, I;
     if (Handler != NAT_MEM_H_NONE) {
         for (I = 0; I < NatMemStubCount; I++) {
-            if (NatMemStubHandler[I] == Handler) {
+            if (NatMemStubHandler[I] == Handler &&
+                (Handler != NAT_MEM_H_BAL ||
+                 NatMemNameEq (NatMemStubName[I], Name))) {
                 return NAT_MEM_STUB_BASE + I * 8u;   /* reuse existing stub */
             }
         }
@@ -6530,6 +6564,8 @@ NatCupRun68k (
     const CHAR16 *Outcome = NULL;
     BOOLEAN RunOk = FALSE;
 
+    g_M68kInNatCupRun = TRUE;
+
     /* Seed the 68K Resource Manager globals. Our guest never runs the
        ROM's InitResources, so CurResFile (0xA5A) stays 0 and the ROM's
        map-list walk (0x40865F84) dereferences the null queue head (0xA50),
@@ -6587,7 +6623,12 @@ NatCupRun68k (
     g_M68kContext.A[4] = 0u;
     g_M68kContext.A[5] = 0u;
     g_M68kContext.A[6] = 0u;
-    g_M68kContext.A[7] = 0u;
+    /* A user stack, not zero: a routine that drops to user mode (RTE or
+       move-to-SR clearing S) with A7=0 wraps its first push to
+       0xFFFFFFFC and smashes the top of the 0xFFC00000 ROM alias --
+       which backs the NanoKernel's live stack/KDP at 0x40BFxxxx. Keep it
+       below the supervisor stack at 0x00FF0000 (heap top is 0xF00000). */
+    g_M68kContext.A[7] = 0x00FE0000u;
     g_M68kContext.SSP = Sp;
     g_M68kContext.Supervisor = TRUE;
     g_M68kContext.SR = 0x2700u;
@@ -6596,7 +6637,7 @@ NatCupRun68k (
     g_M68kContext.Stopped = FALSE;
 
     g_Cup68kCallsTotal++;
-    if (g_Cup68kCallsTotal <= 48u) {
+    if (g_Cup68kCallsTotal <= 150u) {
         Print (L"  CUP68K#%u ptr=0x%08x info=%08x first=%04x LR=0x%08x "
                L"r3=0x%08x r4=0x%08x r5=0x%08x r6=0x%08x r7=0x%08x "
                L"sp=0x%08x\n",
@@ -6635,22 +6676,23 @@ NatCupRun68k (
                          (Pc >= 0xFF000000u);
             if (!Ok) {
                 Outcome = L"wild";
-                if (g_Cup68kCallsTotal <= 8u) {
-                    Print (L"  CUP68K wild pc=0x%08x after %u ins "
-                           L"sp=0x%08x d0=0x%08x\n",
-                           Pc, (UINT32)Executed,
-                           g_M68kContext.Supervisor ? g_M68kContext.SSP
-                                                    : g_M68kContext.A[7],
-                           g_M68kContext.D[0]);
-                }
+    if (g_Cup68kCallsTotal <= 20u) {
+        Print (L"  CUP68K wild pc=0x%08x after %u ins "
+               L"sp=0x%08x d0=0x%08x\n",
+               Pc, (UINT32)Executed,
+               g_M68kContext.Supervisor ? g_M68kContext.SSP
+                                        : g_M68kContext.A[7],
+               g_M68kContext.D[0]);
+    }
                 break;
             }
         }
     }
+    g_M68kInNatCupRun = FALSE;
     if (Outcome == NULL) { Outcome = L"spin"; }
 
     ResultD0 = g_M68kContext.D[0] & 0xFFFFFFFFu;
-    if (g_Cup68kCallsTotal <= 48u) {
+    if (g_Cup68kCallsTotal <= 150u) {
         Print (L"    CUP68K#%u -> %s exec=%u pc=0x%08x d0=0x%08x\n",
                g_Cup68kCallsTotal, Outcome, (UINT32)Executed,
                g_M68kContext.PC, ResultD0);
@@ -7290,6 +7332,11 @@ NatMemDispatchStub (
         Res = (PV >= T && PV < B && PH >= L && PH < R) ? 1u : 0u;
         break;
     }
+    case NAT_MEM_H_BAL:
+        /* Parity with the 0xBA20 catch-all (li r3,0x1000) these imports used
+           before; per-name stubs make the CALL log identify the caller. */
+        Res = 0x00001000u;
+        break;
     default:                       Res = 0; break;
     }
 done:
@@ -7408,76 +7455,6 @@ static int NatCfmLoadSystem(void)
     nf = PefEnumFragments(file, NAT_CFM_FORK_LEN, frags, NAT_CFM_MAXFRAGS);
     Print(L"  CFM: enumerated %d PEF fragments in System fork\n", nf);
 
-    /* Diagnostic: does fragment 0 (QuickDraw, caller-loaded) export the cursor /
-       accelerator names that frag1 only re-exports? */
-    {
-        PefFragment *f0 = &frags[0];
-        int ok = 0;
-        if (f0->sectionCount != 0) {
-            if (f0->expanded != NULL) ok = 1;
-            else if (PefExpandSections(f0) == 0) ok = 1;
-        }
-        Print(L"  F0X frag0 base=0x%x sections=%u exports=%u syms=%u expand=%d\n",
-              (UINT32)f0->base, (UINT64)f0->sectionCount,
-              (UINT64)f0->exportCount, (UINT64)f0->symCount, ok);
-        if (ok) {
-            UINTN kk, shown = 0;
-            for (kk = 0; kk < f0->exportCount && shown < 40; kk++) {
-                const char *nm = f0->exports[kk].name;
-                if (nm && ((nm[0]=='N'&&nm[1]=='Q'&&nm[2]=='D') ||
-                           (nm[0]=='B'&&nm[1]=='A'&&nm[2]=='L'))) {
-                    Print(L"  F0X export %a sec=%d val=0x%x\n", nm,
-                          (INT32)f0->exports[kk].sectionIndex,
-                          (UINT32)f0->exports[kk].symbolValue);
-                    shown++;
-                }
-            }
-        }
-        Print(L"  F0X libs=%u\n", (UINT64)f0->libCount);
-        {
-            UINTN lj;
-            for (lj = 0; lj < f0->libCount; lj++) {
-                UINT32 fst = f0->libs[lj].firstImportedSymbol;
-                UINT32 cnt = f0->libs[lj].importedSymbolCount;
-                Print(L"  F0X lib %u %a first=%u cnt=%u %s\n", (UINT64)lj,
-                      f0->libs[lj].name, (UINT64)fst, (UINT64)cnt,
-                      (fst <= 0xAu && 0xAu < fst + cnt) ? L"<== import 0xA" : L"");
-            }
-        }
-    }
-
-    /* Diagnostic: find where the provider names occur in the fork and map each
-       occurrence to the owning fragment (base range). */
-    {
-        const char *names[3];
-        UINTN nn;
-        names[0] = "NQDShowCursor";
-        names[1] = "BAL_CGSShowCursor";
-        names[2] = "BlueAbstractionLayerLib";
-        for (nn = 0; nn < 3; nn++) {
-            const char *nt = names[nn];
-            UINT32 off, found = 0;
-            for (off = 0; off + 24u < NAT_CFM_FORK_LEN && found < 4; off++) {
-                UINTN j; for (j = 0; nt[j]; j++) if ((char)file[off+j] != nt[j]) break;
-                if (!nt[j]) {
-                    UINTN fi, owner = 0xFFFFFFFFu;
-                    for (fi = 0; fi < (UINTN)nf; fi++) {
-                        UINT32 b = (UINT32)frags[fi].base;
-                        UINT32 nb = (fi + 1 < (UINTN)nf) ?
-                                    (UINT32)frags[fi+1].base : 0xFFFFFFFFu;
-                        if (b <= off && off < nb) { owner = fi; break; }
-                    }
-                    Print(L"  OCC %a @0x%x owner frag %u (base 0x%x sect %u exp %p)\n",
-                          nt, off, (UINT64)owner,
-                          (owner != 0xFFFFFFFFu) ? (UINT32)frags[owner].base : 0u,
-                          (owner != 0xFFFFFFFFu) ? (UINT32)frags[owner].sectionCount : 0u,
-                          (owner != 0xFFFFFFFFu) ? (void *)frags[owner].expanded : (void *)0);
-                    found++;
-                }
-            }
-            if (found == 0) Print(L"  OCC %a NOT in fork\n", nt);
-        }
-    }
     /* Pass 1: expand + place every fragment, collect exports.  Skip only
        fragment 0 (loaded by the caller); fragment 1 is the second QuickDraw
        image (the NQD/CGS provider: 324 exports) whose code sits at 0x4D350..
@@ -7620,63 +7597,8 @@ static int NatCfmLoadSystem(void)
                 mapN++;
             }
         }
-        {
-            static const char *const probe[] = {
-                "DrawMenuBar", "NQDSetCursor", "NQDShowCursor",
-                "NQDBackColor", "gNotifyRectList", "InitializeCursors",
-                "ResetCursorToArrow", "CGSGetWindowShape"
-            };
-            UINTN pi;
-            for (pi = 0; pi < sizeof(probe) / sizeof(probe[0]); pi++) {
-                Print(L"  CFM: export %a -> 0x%08x\n", probe[pi],
-                      (UINT32)NatCfmLookup(map, mapN, probe[pi]));
-            }
-        }
     }
 
-    g_NatCfmMap  = map;
-    g_NatCfmMapN = mapN;
-    /* Diagnostic: frag1 re-exported imports (sectionIndex == -3). */
-    if (nf > 1 && frags[1].expanded != NULL) {
-        UINTN kk;
-        for (kk = 0; kk < frags[1].exportCount; kk++) {
-            const char *nm = frags[1].exports[kk].name;
-            UINT32 iv;
-            if (!nm) continue;
-            if (frags[1].exports[kk].sectionIndex != -3) continue;
-            iv = (UINT32)frags[1].exports[kk].symbolValue;
-            Print(L"  F1X %a sec=%d val=0x%x -> import %a\n",
-                  nm, (INT32)frags[1].exports[kk].sectionIndex, iv,
-                  (iv < frags[1].symCount && frags[1].imports[iv].name)
-                      ? frags[1].imports[iv].name : "(oob)");
-        }
-    }
-    /* Diagnostic: which fragment/library defines NQDShowCursor / BAL_*? */
-    {
-        UINTN fi, kk;
-        /* frag1 import 0xA belongs to which library? */
-        for (kk = 0; kk < frags[1].libCount; kk++) {
-            UINT32 f0 = frags[1].libs[kk].firstImportedSymbol;
-            UINT32 n  = frags[1].libs[kk].importedSymbolCount;
-            if (0xA >= f0 && 0xA < f0 + n)
-                Print(L"  F1LIB import 0xA lib=%a (cnt=%u)\n",
-                      frags[1].libs[kk].name, (UINT64)kk);
-        }
-        for (fi = 1; fi < (UINTN)nf; fi++) {
-            UINTN kk2;
-            if (frags[fi].exports == NULL) continue;
-            for (kk2 = 0; kk2 < frags[fi].exportCount; kk2++) {
-                const char *nm = frags[fi].exports[kk2].name;
-                if (nm && nm[0]=='N' && nm[1]=='Q' && nm[2]=='D' &&
-                    nm[3]=='S' && nm[4]=='h' && nm[5]=='o' && nm[6]=='w') {
-                    Print(L"  F1PROV frag %u base=0x%x export %a sec=%d val=0x%x\n",
-                          (UINT64)fi, (UINT32)frags[fi].base, nm,
-                          (INT32)frags[fi].exports[kk2].sectionIndex,
-                          (UINT32)frags[fi].exports[kk2].symbolValue);
-                }
-            }
-        }
-    }
     /* Also load CHRP info section PEF fragments (if present) */
 
     {
@@ -7766,19 +7688,6 @@ static int NatCfmLoadSystem(void)
        binding see the info-section providers too. */
     g_NatCfmMap  = map;
     g_NatCfmMapN = mapN;
-    {
-        static const char *const probe2[] = {
-            "NQDSetCursor", "NQDShowCursor", "NQDHideCursor",
-            "InitializeCursors", "ResetCursorToArrow", "BAL_CGSShowCursor"
-        };
-        UINTN pi;
-        for (pi = 0; pi < sizeof(probe2) / sizeof(probe2[0]); pi++) {
-            Print(L"  CFM: export(final) %a -> 0x%08x\n", probe2[pi],
-                  (UINT32)NatCfmLookup(map, mapN, probe2[pi]));
-        }
-    }
-
-
 
     /* Pass 2: resolve imports, relocate and instantiate into guest RAM.
        Started at 1 (not 2) so the second QuickDraw image (frag 1, the NQD/CGS
@@ -7814,7 +7723,7 @@ static int NatCfmLoadSystem(void)
  
             if ((UINT32)f->base == NAT_CFM_ENTRY_BASE && imp[k] == 0x0000BA20u) {
                 const char *nm = f->imports[k].name ? f->imports[k].name : "(null)";
-                Print(L"  FRAG84 unbound import k=%u name=%a\\n", (UINT64)k, nm);
+                Print(L"  FRAG84 unbound import k=%u name=%a\n", (UINT64)k, nm);
             }
         }
         for (s = 0; s < f->sectionCount; s++) {

@@ -99,6 +99,7 @@ M68kTraceLine (
 // Global 68K CPU context
 // ---------------------------------------------------------------------------
 M68K_CPU_CONTEXT g_M68kContext = {0};
+BOOLEAN g_M68kInNatCupRun = FALSE;
 
 // One-shot post-memcpy single-step tracer (diagnostics)
 UINTN g_M68kDebugSteps = 0;
@@ -2366,7 +2367,29 @@ M68kRaiseException (
         if (g_M68kContext.PC >= 0x4080E2AAu) {
             UINT32 Sp;
             static UINTN ScriptEndCount = 0;
-            if (ScriptEndCount < 4) {
+            if (g_M68kInNatCupRun) {
+                /* A MixedMode/Toolbox run wandered past the boot-script
+                   window (typically a top-of-space walk that lands on the
+                   NanoKernel's live stack through the 0xFFC00000 ROM
+                   alias). The loader hijack below assumes the MAIN boot
+                   context: inside a CUP run it just re-executes the DR
+                   script on the Toolbox frame and loops until the
+                   instruction budget expires. Abort the run instead --
+                   Halted ends M68kExecuteBlock, NatCupRun68k reports the
+                   halt, rolls back low globals and returns 0. */
+                static UINTN CupDesertAborts = 0;
+                if (CupDesertAborts < 16) {
+                    CupDesertAborts++;
+                    Print (L"  68K DESERT-IN-CUP: pc=0x%08x sel=0x%04x "
+                           L"SP=0x%08x -> abort run\n",
+                           g_M68kContext.PC,
+                           M68kFetchWord (g_M68kContext.PC + 2),
+                           (UINT32)M68kGetStackPointer());
+                }
+                g_M68kContext.Halted = TRUE;
+                return;
+            }
+            if (ScriptEndCount < 64) {
                 ScriptEndCount++;
                 Print (L"  68K SCRIPT-END: desert @ 0x%08x sel=0x%04x -> "
                        L"JSR 0x4080E33C (ret 0x4080015C), SP=0x%08x\n",
@@ -4411,11 +4434,8 @@ M68kExecuteInstruction (
             //   MOVE.W #$D,$8.W ; MOVEQ #$8F,D0 ; ... RTS   -> D0=-113 fail
             // Keep byte 0x4 == 3 so the gate returns SUCCESS instead of the
             // -113 error that parks the DR boot in the low-RAM zero walk.
-            if ((Opcode & 0x0FFF) == 0x071E &&
-                M68kReadByte (0x00000004u) != 3) {
+            if ((Opcode & 0x0FFF) == 0x071E) {
                 M68kWriteByte (0x00000004u, 3);
-                Print (L"  A71E boot-read: prepared flag byte[4]=3 (sel(D0)=%08x)\n",
-                       g_M68kContext.D[0]);
             }
             // Service A71E/A647 INLINE (do not dispatch to the ROM trap
             // handler): 

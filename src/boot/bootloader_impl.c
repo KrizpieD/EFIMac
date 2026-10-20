@@ -1586,9 +1586,15 @@ PpcInstallSystemRom (
     // (VA & 0x3FFFFF == offset within window), exactly like classic 24-bit
     // ROM mirroring. The FFC window keeps its existing linear semantics.
     if (g_BootContext.RomType == PPC_ROM_TYPE_NEW_WORLD && Size == 0x00400000u) {
+        // Read-only: the top of this window is the NanoKernel's live
+        // KDP/HTAB/stack (see the writable-main-install note above), and
+        // the top-of-space alias invites stray 68K frame allocations
+        // (A7 wrap-around pushes land here first). Dropping them matches
+        // real hardware and keeps the shared buffer -- and every alias
+        // view of it -- intact.
         EFI_STATUS AliasStatus =
             PpcAddGuestMemoryRegion(Buffer, 0xFFC00000u, (UINT32)Size,
-                                    FALSE);
+                                    TRUE);
         Print(L"ROM alias installed: %d bytes at guest 0xFFC00000 (%r)\n",
               (UINT64)Size, AliasStatus);
         {

@@ -55,6 +55,12 @@ typedef struct {
 // Global 68K CPU context
 extern M68K_CPU_CONTEXT g_M68kContext;
 
+// TRUE while NatCupRun68k is executing a MixedMode/Toolbox 68K routine.
+// The post-script desert gate must only hijack the MAIN boot context into
+// the DR chunk loader; inside a CUP run the hijack cross-wires boot code
+// into the Toolbox frame and loops until the instruction budget expires.
+extern BOOLEAN g_M68kInNatCupRun;
+
 // ---------------------------------------------------------------------------
 // CCR flag bit positions (in the low byte of SR)
 // ---------------------------------------------------------------------------

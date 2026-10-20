@@ -117,6 +117,10 @@ PpcTranslateEffective (
     OUT UINT32* Pa
     );
 
+// Counter of NatCupRun68k calls (diagnostic). Exposed so 68K side can
+// decide when to be verbose.
+extern UINT32 g_Cup68kCallsTotal;
+
 // Recompute the decomposed BAT entry for the given upper/lower BAT SPR number
 // (528-551) after an mtspr write.
 VOID
