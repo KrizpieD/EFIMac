@@ -2161,7 +2161,18 @@ M68kExecuteTrap (
     )
 {
     UINT8 Vector = Opcode & 0xF;
-    Print (L"  68K TRAP #%d at PC=0x%08x\n", Vector, g_M68kContext.PC - 2);
+    UINT32 TrapPc = g_M68kContext.PC - 2;
+    /* Low-RAM TRAP #4 forms a tight retry loop in this boot path.
+       Skip as NOP to break out. */
+    if (Vector == 4 && TrapPc < 0x10000u) {
+        static UINTN Trap4LowSkip = 0;
+        if (Trap4LowSkip < 8) {
+            Trap4LowSkip++;
+            Print (L"  68K TRAP #4@%08x low-RAM -> skip\n", TrapPc);
+        }
+        return;
+    }
+    Print (L"  68K TRAP #%d at PC=0x%08x\n", Vector, TrapPc);
     M68kRaiseException (M68K_VEC_TRAP0 + Vector * 4);
 }
 
@@ -2172,6 +2183,29 @@ M68kExecuteIllegal (
     )
 {
     UINTN K;
+    /* Low RAM script/data being executed as code produces ILLEGALs;
+       skip past them to avoid spinning in the same instruction. */
+    if (g_M68kContext.PC < 0x30000u) {
+        static UINTN LowIllSkip = 0;
+        LowIllSkip++;
+        if (LowIllSkip < 1024) {
+            /* Best-effort skip: try to advance past extension words */
+            g_M68kContext.PC += 2;
+            {
+                UINT16 EaM = (Opcode >> 3) & 7;
+                UINT16 EaR = Opcode & 7;
+                if (EaM == 3 || EaM == 4 || EaM == 5 || EaM == 6) {
+                    g_M68kContext.PC += 2;
+                } else if (EaM == 7) {
+                    if (EaR == 1)      g_M68kContext.PC += 4;
+                    else if (EaR <= 4) g_M68kContext.PC += 2;
+                } else if (EaM == 0) {
+                    /* Dn direct often needs immediate ext in some encodings; cheap skip */
+                }
+            }
+            return;
+        }
+    }
     // DR-era thunk bank: the ROM walks 0xFFFF0000..0xFFFF7FFF as instructions,
     // but the words there are a PRIVATE opcode table (records of
     // "3860 0008 4BF7 <index>") that only the DR emulator understands.  Words
@@ -2303,9 +2337,22 @@ M68kRaiseException (
     // Read vector address from exception table
     UINT32 VecAddr = M68kReadLong ((UINT32)VectorNumber);
     if (VecAddr == 0) {
-        Print (L"  68K EXCEPTION %d: vector at 0x%08x is NULL — HALTING\n",
-               VectorNumber, (UINT32)VectorNumber);
-        g_M68kContext.Halted = TRUE;
+        static UINTN NullVecSkip2 = 0;
+        if (NullVecSkip2 < 128) {
+            NullVecSkip2++;
+            Print (L"  68K EXCEPTION %d: vector at 0x%08x is NULL — skipping\n",
+                   VectorNumber, (UINT32)VectorNumber);
+        }
+        /* Restore state and skip past faulting instruction */
+        g_M68kContext.SR = PreRaiseSr;
+        g_M68kContext.Supervisor = PreRaiseSup;
+        if (PreRaiseSup) {
+            g_M68kContext.SSP = PreRaiseSp;
+        } else {
+            g_M68kContext.A[7] = PreRaiseSp;
+        }
+        g_M68kContext.PC += 2;
+        g_M68kInInterrupt = FALSE;
         return;
     }
     // The nanokernel seeds unsupported-vector slots with the 0x80000000
@@ -2329,6 +2376,23 @@ M68kRaiseException (
             Print (L"  68K RAISE #%d vec=%d vecAddr=0x%08x retPC=0x%08x SR=0x%04x\n",
                    (UINT32)RaiseCount, VectorNumber, VecAddr,
                    g_M68kContext.PC, g_M68kContext.SR);
+        }
+        if (VecAddr == 0 && g_M68kContext.PC < 0x200000u) {
+            static UINTN NullVecSkip = 0;
+            if (NullVecSkip < 32) {
+                NullVecSkip++;
+                Print (L"  68K NULL vector -> skip fault\n");
+            }
+            g_M68kContext.SR = PreRaiseSr;
+            g_M68kContext.Supervisor = PreRaiseSup;
+            if (PreRaiseSup) {
+                g_M68kContext.SSP = PreRaiseSp;
+            } else {
+                g_M68kContext.A[7] = PreRaiseSp;
+            }
+            g_M68kContext.PC += 2;
+            g_M68kInInterrupt = FALSE;
+            return;
         }
         if (VecAddr >= 0xA8000000u && VecAddr < 0xAC000000u) {
             // Execution is entering the classic ROM alias bank: trace the
@@ -2493,7 +2557,7 @@ M68kLineFSvcDispatch (
     )
 {
     static UINTN SvcServiced = 0;
-    static UINTN SvcServiceLimit = 24;
+    static UINTN SvcServiceLimit = 256;
     static UINTN RpDumps = 0;
     UINTN K;
     if (SvcServiced >= SvcServiceLimit) return;

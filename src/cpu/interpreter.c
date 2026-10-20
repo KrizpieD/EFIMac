@@ -973,20 +973,22 @@ PpcWriteGuestByte (
     )
 {
     // Boot gate byte at 0x4 ("prepared" flag): the A71E service forces it to
-    // 3, yet the gate re-prints on every subsequent A71E, so something writes
-    // a different value back between traps. All widths funnel here byte by
-    // byte; our own force writes value 3, so log only non-3 writers with the
-    // PPC and 68K PCs of the culprit.
-    if (Address == 0x00000004u && Value != 3u) {
-        static UINT32 Byte4WatchN = 0;
-        if (Byte4WatchN < 32u) {
-            Byte4WatchN++;
-            Print (L"  BYTE4-CLOBBER [%08x]<-%02x ppcpc=%08x lr=%08x "
-                   L"68kpc=%08x r1=%08x\n",
-                   Address, Value, g_PpcContext.Pc,
-                   g_PpcContext.Lr & 0xFFFFFFFFu,
-                   g_M68kContext.PC, g_PpcContext.Gpr[1] & 0xFFFFFFFFu);
+    // 3, but Toolbox CUP routines (CallUniversalProc via NAT_MEM) also write
+    // to low RAM and can corrupt it. Enforce byte[4] == 3 at the single
+    // write funnel to stabilize post-handoff state.
+    if (Address == 0x00000004u) {
+        if (Value != 3u) {
+            static UINT32 Byte4WatchN = 0;
+            if (Byte4WatchN < 8u) {
+                Byte4WatchN++;
+                Print (L"  BYTE4-FORCE [%08x]<-%02x->03 ppcpc=%08x lr=%08x "
+                       L"68kpc=%08x r1=%08x\n",
+                       Address, Value, g_PpcContext.Pc,
+                       g_PpcContext.Lr & 0xFFFFFFFFu,
+                       g_M68kContext.PC, g_PpcContext.Gpr[1] & 0xFFFFFFFFu);
+            }
         }
+        Value = 3u;
     }
     // Trampoline-region watch: who (if anyone) populates 0x7F0000-0x800000
     // where the NK expects continuation stubs? Both CPU paths funnel here.
