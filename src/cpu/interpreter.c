@@ -6557,7 +6557,7 @@ NatCupRun68k (
 {
     M68K_CPU_CONTEXT Saved = g_M68kContext;
     const UINT32 Sentinel = 0x00FFF000u;
-    const UINTN  MaxTotal = 20000u;
+    const UINTN  MaxTotal = 200000u;
     UINT32 Sp = 0x00FF0000u;
     UINTN  Executed = 0u;
     UINT32 ResultD0;

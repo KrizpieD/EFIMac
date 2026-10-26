@@ -3907,6 +3907,14 @@ M68kExecuteInstruction (
         if (Opcode == 0x4E72) { M68kExecuteStop (Opcode); break; }
         // RTE: 0100 1110 0111 0011
         if (Opcode == 0x4E73) { M68kExecuteRte (); break; }
+        // RTD #imm16: 0100 1110 0111 0100
+        if (Opcode == 0x4E74) {
+            INT16 Disp = (INT16)M68kReadWord (g_M68kContext.PC);
+            UINT32 NewPC = M68kPopLong ();
+            g_M68kContext.PC = NewPC;
+            g_M68kContext.A[7] += (UINT32)(2 + Disp);
+            break;
+        }
         // RTS: 0100 1110 0111 0101
         if (Opcode == 0x4E75) {
             UINT32 NewPC = M68kPopLong ();
@@ -4960,6 +4968,10 @@ M68kExecuteBlock (
 {
     UINTN Executed = 0;
     while (Executed < MaxInstructions && !g_M68kContext.Halted) {
+        UINT32 PcNow = g_M68kContext.PC;
+        g_LastPcRing[g_LastPcIdx] = PcNow;
+        g_LastOpRing[g_LastPcIdx] = M68kReadWord (PcNow);
+        g_LastPcIdx = (g_LastPcIdx + 1) % 256;
         M68kExecuteInstruction ();
         Executed++;
     }
