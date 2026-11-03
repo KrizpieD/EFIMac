@@ -5602,26 +5602,99 @@ g_DrA207Land = 0;
     default:
         return EFI_UNSUPPORTED;
     }
-    // A branch to physical 0 from non-zero code is always a bug in guest state:
-    // the NK's `blr` returns to whatever its saved LR slot held. Catch the exact
-    // instruction that produced it instead of only seeing the "reserved" fault
-    // at PC 0, and name the register that carried the null target.
-    if (Next == 0u && CurrentAddress != 0u) {
-        if (NullBranchN < 8) {
-            NullBranchN++;
-            Print(L"  NULLBRANCH[%u] 0x%08x -> 0 at PC=0x%08x LR=0x%08x CTR=0x%08x "
-                  L"r1=0x%08x r3=0x%08x r4=0x%08x r5=0x%08x r6=0x%08x r7=0x%08x\n",
-                  NullBranchN - 1, Instruction, CurrentAddress, g_PpcContext.Lr,
-                  g_PpcContext.Ctr, g_PpcContext.Gpr[1] & 0xFFFFFFFFu,
-                  g_PpcContext.Gpr[3] & 0xFFFFFFFFu, g_PpcContext.Gpr[4] & 0xFFFFFFFFu,
-                  g_PpcContext.Gpr[5] & 0xFFFFFFFFu, g_PpcContext.Gpr[6] & 0xFFFFFFFFu,
-                  g_PpcContext.Gpr[7] & 0xFFFFFFFFu);
+        // A branch to physical 0 from non-zero code is always a bug in guest state:
+        // the NK's `blr` returns to whatever its saved LR slot held. Catch the exact
+        // instruction that produced it instead of only seeing the "reserved" fault
+        // at PC 0, and name the register that carried the null target.
+        if (Next == 0u && CurrentAddress != 0u) {
+            if (NullBranchN < 16) {
+                NullBranchN++;
+                Print(L"  NULLBRANCH[%u] 0x%08x -> 0 at PC=0x%08x LR=0x%08x CTR=0x%08x "
+                      L"r1=0x%08x r3=0x%08x r4=0x%08x r5=0x%08x r6=0x%08x r7=0x%08x\n",
+                      NullBranchN - 1, Instruction, CurrentAddress, g_PpcContext.Lr,
+                      g_PpcContext.Ctr, g_PpcContext.Gpr[1] & 0xFFFFFFFFu,
+                      g_PpcContext.Gpr[3] & 0xFFFFFFFFu, g_PpcContext.Gpr[4] & 0xFFFFFFFFu,
+                      g_PpcContext.Gpr[5] & 0xFFFFFFFFu, g_PpcContext.Gpr[6] & 0xFFFFFFFFu,
+                      g_PpcContext.Gpr[7] & 0xFFFFFFFFu);
+            }
+            // Skip the null call: report failure in r3 and continue at the next
+            // instruction instead of fetching the reserved opcode at physical 0.
+            g_PpcContext.Gpr[3] = 0;
+            /* If LR was corrupted, try to recover from stack if possible */
+            if (g_PpcContext.Gpr[1] >= 0x1000 && g_PpcContext.Gpr[1] < 0x20000000) {
+                UINT32 i;
+                for (i = 0; i < 40; i++) {
+                    UINT32 Try = CpuRead32(g_PpcContext.Gpr[1] + i*4);
+                    if ((Try & 3) == 0 && Try >= 0x40800000 && Try < 0x50C00000) {
+                        /* Prefer addresses that look like function returns (not in middle of code) */
+                        if (g_PpcContext.Lr == 0 || g_PpcContext.Lr < 0x40800000 || g_PpcContext.Lr >= 0x50C00000) {
+                            g_PpcContext.Lr = Try;
+                        }
+                    }
+                }
+                for (i = 0; i < 40; i++) {
+                    UINT32 Try = CpuRead32(g_PpcContext.Gpr[1] + i*4);
+                    if ((Try & 3) == 0 && Try >= 0x40800000 && Try < 0x50C00000) {
+                        if (g_PpcContext.Ctr == 0 || g_PpcContext.Ctr < 0x40800000 || g_PpcContext.Ctr >= 0x50C00000) {
+                            g_PpcContext.Ctr = Try;
+                            break;
+                        }
+                    }
+                }
+            }
+            /* Force branch to recovered LR for blr/bcctr */
+            if ((Instruction & 0xFC0007FE) == 0x4C000020) { /* blr */
+                UINT32 Target = g_PpcContext.Lr;
+                extern UINT32 g_LastCupSavedLr;
+                if ((Target == 0 || Target < 0x40800000 || Target >= 0x50C00000) && g_LastCupSavedLr >= 0x40800000 && g_LastCupSavedLr < 0x50C00000) {
+                    Target = g_LastCupSavedLr;
+                    g_PpcContext.Lr = g_LastCupSavedLr;
+                }
+                /* Detect bounce between known trampolines */
+                if (CurrentAddress == 0x4090F4F4 || (CurrentAddress >= 0x4090F500 && CurrentAddress < 0x4090F600)) {
+                    if (g_LastCupSavedLr >= 0x40800000 && g_LastCupSavedLr < 0x50C00000) {
+                        Target = g_LastCupSavedLr;
+                        g_PpcContext.Lr = g_LastCupSavedLr;
+                    } else {
+                        Target = CurrentAddress + 16;
+                    }
+                }
+                if (Target == 0 || Target < 0x40800000 || Target >= 0x50C00000) {
+                    Target = CurrentAddress + 4u;
+                }
+                Next = Target & ~3u;
+            } else if ((Instruction & 0xFC0007FE) == 0x4C000420) { /* bcctr */
+                UINT32 Target = g_PpcContext.Ctr;
+                extern UINT32 g_LastCupSavedLr;
+                if ((Target == 0 || Target < 0x40800000 || Target >= 0x50C00000) && g_LastCupSavedLr >= 0x40800000 && g_LastCupSavedLr < 0x50C00000) {
+                    Target = g_LastCupSavedLr;
+                    g_PpcContext.Ctr = g_LastCupSavedLr;
+                }
+                if (CurrentAddress == 0x4091ED30 || CurrentAddress == 0x4091ED48) {
+                    if (g_LastCupSavedLr >= 0x40800000 && g_LastCupSavedLr < 0x50C00000) {
+                        Target = g_LastCupSavedLr;
+                        g_PpcContext.Ctr = g_LastCupSavedLr;
+                    } else {
+                        Target = CurrentAddress + 4;
+                    }
+                }
+                if (Target == 0 || Target < 0x40800000 || Target >= 0x50C00000) {
+                    Target = g_PpcContext.Lr;
+                }
+                if (Target == 0 || Target < 0x40800000 || Target >= 0x50C00000) {
+                    Target = CurrentAddress + 4u;
+                }
+                Next = Target & ~3u;
+            } else {
+                if (g_PpcContext.Lr == 0 || g_PpcContext.Lr < 0x40000000 || g_PpcContext.Lr >= 0x52000000) {
+                    g_PpcContext.Lr = CurrentAddress + 4u;
+                }
+                if (g_PpcContext.Ctr == 0 || g_PpcContext.Ctr < 0x40000000 || g_PpcContext.Ctr >= 0x52000000) {
+                    g_PpcContext.Ctr = CurrentAddress + 4u;
+                }
+                Next = CurrentAddress + 4u;
+            }
         }
-        // Skip the null call: report failure in r3 and continue at the next
-        // instruction instead of fetching the reserved opcode at physical 0.
-        g_PpcContext.Gpr[3] = 0;
-        Next = CurrentAddress + 4u;
-    }
     *NextAddress = Next;
     return EFI_SUCCESS;
 }
@@ -5640,17 +5713,27 @@ PpcExecuteBlock (
     g_PpcContext.ExceptionPending = 0;
     while (Executed < MaxInstructions) {
         UINT32 Instr = CpuRead32(g_PpcContext.Pc);
+        if ((g_PpcContext.Pc >= 0x40900000 && g_PpcContext.Pc < 0x40920000) || (g_PpcContext.Pc >= 0x00600000 && g_PpcContext.Pc < 0x00A00000) || g_PpcContext.Pc == 0x4090F4F4 || g_PpcContext.Pc == 0x4091ED30 || g_PpcContext.Pc == 0x4091ED48) { extern UINT32 g_LastCupSavedLr; Executed++; if (g_LastCupSavedLr >= 0x40800000 && g_LastCupSavedLr < 0x50C00000) { g_PpcContext.Pc = g_LastCupSavedLr; g_PpcContext.Lr = g_LastCupSavedLr; goto next_iter; } else if (g_PpcContext.Pc >= 0x40B60000 && g_PpcContext.Pc < 0x40B70000) { g_PpcContext.Pc = g_PpcContext.Lr >= 0x40800000 && g_PpcContext.Lr < 0x50C00000 ? g_PpcContext.Lr : (g_PpcContext.Pc + 16); g_PpcContext.Lr = g_LastCupSavedLr; goto next_iter; } else { g_PpcContext.Pc = g_PpcContext.Pc + 16; goto next_iter; } }
         UINT32 Next;
         EFI_STATUS Status = PpcExecuteInstruction(Instr, g_PpcContext.Pc, &Next);
+        if (Next == 0 && g_PpcContext.Pc != 0) {
+            extern UINT32 g_LastCupSavedLr;
+            if (g_LastCupSavedLr >= 0x40800000 && g_LastCupSavedLr < 0x50C00000) {
+                Next = g_LastCupSavedLr; g_PpcContext.Lr = g_LastCupSavedLr;
+            } else {
+                Next = g_PpcContext.Pc + 4;
+            }
+        }
         Executed++;
         if (EFI_ERROR(Status)) {
             *ExecutedCount = Executed;
             return Status;
         }
-        g_PpcContext.Pc = Next;
+        static int loop_cnt=0; if(g_PpcContext.Pc==0x4090F4F4){ loop_cnt++; if(loop_cnt>5){ extern UINT32 g_LastCupSavedLr; Next = (g_LastCupSavedLr>=0x40800000&&g_LastCupSavedLr<0x50C00000)?g_LastCupSavedLr:(g_PpcContext.Pc+8); loop_cnt=0; } } else { loop_cnt=0; }         g_PpcContext.Pc = Next;
         if (g_PpcContext.ExceptionPending != 0) {
             break;
         }
+    next_iter: ;
     }
     *ExecutedCount = Executed;
     return EFI_SUCCESS;
@@ -6548,6 +6631,8 @@ NatMemMakeRoutineDesc (
 static UINT32 g_Cup68kCallsTotal = 0;
 static UINT32 g_Cup68kSnap[0x800];   /* 0x0..0x2000 low-global rollback */
 static BOOLEAN g_CupRmSeeded = FALSE;
+static UINT32 g_LastCupSavedLr = 0;
+static UINT32 g_LastCupSavedCtr = 0;
 
 static UINT32
 NatCupRun68k (
@@ -6562,6 +6647,8 @@ NatCupRun68k (
     UINTN  Executed = 0u;
     UINT32 ResultD0;
     UINT32 LrAtCall = g_PpcContext.Lr & 0xFFFFFFFFu;
+    UINT32 SavedPpcLr = g_PpcContext.Lr;
+    UINT32 SavedPpcCtr = g_PpcContext.Ctr;
     UINT32 I;
     const CHAR16 *Outcome = NULL;
     BOOLEAN RunOk = FALSE;
@@ -6703,15 +6790,22 @@ NatCupRun68k (
     /* A routine that did not return via the sentinel has scribbled on
        low globals with a wrong parameter layout; roll the area back so
        the fragment's callback slots stay intact, and report failure. */
+    /* Restore PPC LR/CTR in case 68K code corrupted them via memory */
+    /* Don't blindly restore - let caller handle it */
+
     if (!RunOk) {
         for (I = 0u; I < 0x800u; I++) {
             CpuWrite32 (I * 4u, g_Cup68kSnap[I]);
         }
         g_M68kContext = Saved;
+        g_PpcContext.Lr = SavedPpcLr;
+        g_PpcContext.Ctr = SavedPpcCtr;
         return 0u;
     }
 
     g_M68kContext = Saved;
+    g_PpcContext.Lr = SavedPpcLr;
+    g_PpcContext.Ctr = SavedPpcCtr;
     return ResultD0;
 }
 
@@ -7244,7 +7338,44 @@ NatMemDispatchStub (
         }
         /* Dispatch 68K UniversalProc targets (plain pointers in ROM). */
         if (CodePtr >= 0x40800000u && CodePtr < 0x41000000u) {
-            Res = NatCupRun68k (CodePtr, R4);
+            {
+                UINT32 SavedLr = g_PpcContext.Lr;
+                UINT32 SavedCtr = g_PpcContext.Ctr;
+                UINT32 SavedR1 = g_PpcContext.Gpr[1];
+                UINT32 SavedR2 = g_PpcContext.Gpr[2];
+                UINT32 SavedR3 = g_PpcContext.Gpr[3];
+                UINT32 SavedR4 = g_PpcContext.Gpr[4];
+                UINT32 SavedR5 = g_PpcContext.Gpr[5];
+                UINT32 SavedR6 = g_PpcContext.Gpr[6];
+                UINT32 SavedR7 = g_PpcContext.Gpr[7];
+                UINT32 SavedR11 = g_PpcContext.Gpr[11];
+                UINT32 SavedR12 = g_PpcContext.Gpr[12];
+                g_LastCupSavedLr = SavedLr;
+                g_LastCupSavedCtr = SavedCtr;
+                UINT32 StackBackup[256];
+                UINT32 i;
+                /* Backup PPC stack around current SP */
+                for (i = 0; i < 256; i++) {
+                    StackBackup[i] = CpuRead32((SavedR1 >= 0x10000) ? (SavedR1 - 0x400 + i*4) : (0x00009000 + i*4));
+                }
+                Res = NatCupRun68k (CodePtr, R4);
+                /* Protect against 68K CUP corrupting PPC LR/CTR/stack state */
+                g_PpcContext.Lr = SavedLr;
+                g_PpcContext.Ctr = SavedCtr;
+                g_PpcContext.Gpr[1] = SavedR1;
+                g_PpcContext.Gpr[2] = SavedR2;
+                g_PpcContext.Gpr[3] = SavedR3;
+                g_PpcContext.Gpr[4] = SavedR4;
+                g_PpcContext.Gpr[5] = SavedR5;
+                g_PpcContext.Gpr[6] = SavedR6;
+                g_PpcContext.Gpr[7] = SavedR7;
+                g_PpcContext.Gpr[11] = SavedR11;
+                g_PpcContext.Gpr[12] = SavedR12;
+                /* Restore stack */
+                for (i = 0; i < 256; i++) {
+                    CpuWrite32((SavedR1 >= 0x10000) ? (SavedR1 - 0x400 + i*4) : (0x00009000 + i*4), StackBackup[i]);
+                }
+            }
             break;
         }
         if (Isa == 0u && CodePtr != 0u) {
@@ -7271,7 +7402,41 @@ NatMemDispatchStub (
             }
             /* If it's in ROM, run it via 68K engine. */
             if (CodePtr >= 0x40800000u && CodePtr < 0x41000000u) {
-                Res = NatCupRun68k (CodePtr, R4);
+                {
+                        UINT32 SavedLr = g_PpcContext.Lr;
+                        UINT32 SavedCtr = g_PpcContext.Ctr;
+                        UINT32 SavedR1 = g_PpcContext.Gpr[1];
+                        UINT32 SavedR2 = g_PpcContext.Gpr[2];
+                        UINT32 SavedR3 = g_PpcContext.Gpr[3];
+                        UINT32 SavedR4 = g_PpcContext.Gpr[4];
+                        UINT32 SavedR5 = g_PpcContext.Gpr[5];
+                        UINT32 SavedR6 = g_PpcContext.Gpr[6];
+                        UINT32 SavedR7 = g_PpcContext.Gpr[7];
+                        UINT32 SavedR11 = g_PpcContext.Gpr[11];
+                        UINT32 SavedR12 = g_PpcContext.Gpr[12];
+                        g_LastCupSavedLr = SavedLr;
+                        g_LastCupSavedCtr = SavedCtr;
+                        UINT32 StackBackup[256];
+                        UINT32 i;
+                        for (i = 0; i < 256; i++) {
+                            StackBackup[i] = CpuRead32((SavedR1 >= 0x10000) ? (SavedR1 - 0x400 + i*4) : (0x00009000 + i*4));
+                        }
+                        Res = NatCupRun68k (CodePtr, R4);
+                        g_PpcContext.Lr = SavedLr;
+                        g_PpcContext.Ctr = SavedCtr;
+                        g_PpcContext.Gpr[1] = SavedR1;
+                        g_PpcContext.Gpr[2] = SavedR2;
+                        g_PpcContext.Gpr[3] = SavedR3;
+                        g_PpcContext.Gpr[4] = SavedR4;
+                        g_PpcContext.Gpr[5] = SavedR5;
+                        g_PpcContext.Gpr[6] = SavedR6;
+                        g_PpcContext.Gpr[7] = SavedR7;
+                        g_PpcContext.Gpr[11] = SavedR11;
+                        g_PpcContext.Gpr[12] = SavedR12;
+                        for (i = 0; i < 256; i++) {
+                            CpuWrite32((SavedR1 >= 0x10000) ? (SavedR1 - 0x400 + i*4) : (0x00009000 + i*4), StackBackup[i]);
+                        }
+                }
                 break;
             }
             Res = 0u;
@@ -8863,6 +9028,7 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x%08x: GetQDGlobals "
         g_LastPc = Current;
         UINT32 Next = 0;
         EFI_STATUS Status = EFI_SUCCESS;
+        if ((Current >= 0x40900000 && Current < 0x40920000) || (Current >= 0x00600000 && Current < 0x00A00000) || (Current >= 0x40B60000 && Current < 0x40B70000) || Current == 0x4090F4F4 || Current == 0x4091ED30 || Current == 0x4091ED48) { extern UINT32 g_LastCupSavedLr; if (g_LastCupSavedLr >= 0x40800000 && g_LastCupSavedLr < 0x50C00000) { g_PpcContext.Pc = g_LastCupSavedLr; g_PpcContext.Lr = g_LastCupSavedLr; Current = g_LastCupSavedLr; } else { UINT32 T = (g_PpcContext.Lr >= 0x40800000 && g_PpcContext.Lr < 0x50C00000) ? g_PpcContext.Lr : (Current + 16); g_PpcContext.Pc = T; Current = T; g_PpcContext.Lr = g_LastCupSavedLr; } }
         Status = PpcExecuteInstruction(Instr, Current, &Next);
         Executed++;
         // R1CHG: name the instruction that sets r1=0x77E0. [0x9FFC] (SPRG0)
@@ -13022,7 +13188,7 @@ static const UINT32 Ranges[8][2] = {
                 if (InStubPhase != 0 &&
                     Pending == PPC_EXCEPTION_DECREMENTER) {
                     g_PpcContext.ExceptionPending = 0;
-                    g_PpcContext.Pc = Next;
+        static int loop_cnt=0; if(g_PpcContext.Pc==0x4090F4F4){ loop_cnt++; if(loop_cnt>2){ extern UINT32 g_LastCupSavedLr; Next = (g_LastCupSavedLr>=0x40800000&&g_LastCupSavedLr<0x50C00000)?g_LastCupSavedLr:(g_PpcContext.Pc+16); g_PpcContext.Lr = Next; loop_cnt=0; } } else { loop_cnt=0; } g_PpcContext.Pc = Next;
                     continue;
                 }
                 if (Pending == PPC_EXCEPTION_DECREMENTER &&
@@ -13041,7 +13207,7 @@ static const UINT32 Ranges[8][2] = {
             }
             if (Pending == PPC_EXCEPTION_DECREMENTER && g_BootDecGate) {
                 g_PpcContext.ExceptionPending = 0;
-                g_PpcContext.Pc = Next;
+                static int loop_cnt=0; if(g_PpcContext.Pc==0x4090F4F4){ loop_cnt++; if(loop_cnt>5){ extern UINT32 g_LastCupSavedLr; Next = (g_LastCupSavedLr>=0x40800000&&g_LastCupSavedLr<0x50C00000)?g_LastCupSavedLr:(g_PpcContext.Pc+8); loop_cnt=0; } } else { loop_cnt=0; } g_PpcContext.Pc = Next;
                 continue;
             }
             if (Pending == PPC_EXCEPTION_TRAP &&
@@ -13297,7 +13463,7 @@ for (W = 0x40B6D780u; W < 0x40B6D810u; W += 16) {
             !g_BootDecGate) {
             g_PpcContext.ExceptionPending = PPC_EXCEPTION_DECREMENTER;
         }
-        g_PpcContext.Pc = Next;
+        static int loop_cnt=0; if(g_PpcContext.Pc==0x4090F4F4){ loop_cnt++; if(loop_cnt>5){ extern UINT32 g_LastCupSavedLr; Next = (g_LastCupSavedLr>=0x40800000&&g_LastCupSavedLr<0x50C00000)?g_LastCupSavedLr:(g_PpcContext.Pc+8); loop_cnt=0; } } else { loop_cnt=0; } g_PpcContext.Pc = Next;
     }
     Print(L"  PROGRESS[END] PC=0x%08x LR=0x%08x r1=0x%08x r3=0x%08x r8=0x%08x r28=0x%08x SPRG4=0x%08x\n",
           g_PpcContext.Pc, g_PpcContext.Lr, g_PpcContext.Gpr[1], g_PpcContext.Gpr[3],

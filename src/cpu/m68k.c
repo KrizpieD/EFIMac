@@ -4061,14 +4061,17 @@ M68kExecuteInstruction (
         // JSR: 0100 1110 10xx xxxx
         if ((Opcode & 0xFFC0) == 0x4E80) {
             UINT32 EA;
-            M68kComputeEA (Opcode & 0x3F, &EA, NULL);
-            if (EA < 0x400) {
-                // Target lies inside the exception-vector area — never code.
-                // This happens when a dispatch record was never built (e.g.
-                // the ATA-style walker at 0x408081A8 running with A1=0).
-                // Real hardware skips such calls via the record's zero
-                // routine-offset check; emulate the same by completing the
-                // call as an immediate return.  D0=0 signals "not handled".
+            UINT16 EaField = Opcode & 0x3F;
+            UINT8 EaMode = (EaField >> 3) & 0x7;
+            UINT8 EaReg = EaField & 0x7;
+            UINT32 AnVal = (EaReg == 7) ? M68kGetStackPointer () : g_M68kContext.A[EaReg];
+            if ((EaMode == 5 && AnVal == 0) || (EaMode == 2 && AnVal == 0) || (EaMode == 6 && AnVal == 0)) {
+                g_M68kContext.D[0] = 0;
+                M68kLogLowTransfer (g_M68kContext.PC - 2, Opcode, 0);
+                break;
+            }
+            M68kComputeEA (EaField, &EA, NULL);
+            if (EA < 0x400 || (EA >= 0x0000FF00 && EA < 0x00010000)) {
                 g_M68kContext.D[0] = 0;
                 M68kLogLowTransfer (g_M68kContext.PC - 2, Opcode, EA);
                 break;
