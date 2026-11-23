@@ -95,12 +95,10 @@ if ($NoReboot) {
     Write-Output "no-reboot: guest reset requests will exit QEMU"
 }
 
-# QMP monitor so we can observe RESET events (with reason) from the guest.
-$QmpPort = 14444
+# QEMU debug log for guest errors and unimplemented device accesses.
 $Qdbg = Join-Path $env:TEMP "opencode\qemu_debug.log"
 Remove-Item $Qdbg -ErrorAction SilentlyContinue
-$QArgs += @("-qmp", "tcp:127.0.0.1:$QmpPort,server=on,wait=off",
-           "-D", $Qdbg, "-d", "guest_errors,unimp")
+$QArgs += @("-D", $Qdbg, "-d", "guest_errors,unimp")
 
 $p = Start-Process -FilePath "C:\Program Files\qemu\qemu-system-x86_64.exe" `
     -ArgumentList $QArgs `
@@ -109,11 +107,8 @@ $p = Start-Process -FilePath "C:\Program Files\qemu\qemu-system-x86_64.exe" `
     -RedirectStandardError $BootOutErr `
     -PassThru
 
-# Consume QMP events to catch guest-issued resets with their reason.
-$qmpLog = Join-Path $env:TEMP "opencode\qmp_events.txt"
-Remove-Item $qmpLog -ErrorAction SilentlyContinue
-$qmpClient = $null
-$stream = $null
+# QMP is disabled: TCP QMP bind fails in this QEMU/Windows build and aborts
+# startup. Reset reasons are no longer captured; boot outcome comes from serial.
 $resetReasons = New-Object System.Collections.Generic.List[string]
 $iterations = $Seconds * 4
 $elapsed = 0
@@ -137,39 +132,6 @@ for ($i = 0; $i -lt $iterations; $i++) {
         $p.Refresh()
         if (-not $p.HasExited) { continue }
         break
-    }
-    if ($null -eq $qmpClient -and $elapsed -ge 3) {
-        try {
-            $qmpClient = New-Object System.Net.Sockets.TcpClient
-            $qmpClient.Connect("127.0.0.1", $QmpPort)
-            $stream = $qmpClient.GetStream()
-            Start-Sleep -Milliseconds 300
-            $greet = New-Object byte[] 4096
-            $gn = $stream.Read($greet, 0, $greet.Length)
-            if ($gn -gt 0) { Add-Content -Path $qmpLog -Value ([System.Text.Encoding]::ASCII.GetString($greet, 0, $gn)) }
-            $cap = [System.Text.Encoding]::ASCII.GetBytes("{""execute"":""qmp_capabilities""}`n")
-            $stream.Write($cap, 0, $cap.Length)
-            $stream.Flush()
-            Start-Sleep -Milliseconds 300
-        } catch { $qmpClient = $null }
-    }
-    if ($null -ne $stream) {
-        try {
-            if ($stream.DataAvailable) {
-                $buf = New-Object byte[] 65536
-                $n = $stream.Read($buf, 0, $buf.Length)
-                if ($n -gt 0) {
-                    $text = [System.Text.Encoding]::ASCII.GetString($buf, 0, $n)
-                    Add-Content -Path $qmpLog -Value $text
-                    foreach ($m in [regex]::Matches($text, '"reason":"([^"]+)"')) {
-                        $resetReasons.Add($m.Groups[1].Value)
-                    }
-                }
-            }
-        } catch {
-            try { $stream.Dispose() } catch { }
-            $stream = $null
-        }
     }
     $elapsed = [math]::Floor($i / 4)
     Start-Sleep -Milliseconds 250
@@ -222,7 +184,6 @@ for ($i = 0; $i -lt $iterations; $i++) {
     }
     if ($null -ne $stopReason) { break }
 }
-if ($qmpClient) { $qmpClient.Close() }
 $resetReasonStr = $resetReasons -join ','
 if ($null -ne $stopReason) {
     # Outcome already determined: the guest crashed or stalled, so the rest of

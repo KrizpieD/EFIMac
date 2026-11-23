@@ -2685,6 +2685,18 @@ PpcPatchNewWorldRom (
         Print(L"  68K patch: skip low-RAM relocation (0xAA40 beq->bra)\n");
     }
 
+    // EXPERIMENT: the DR handoff reaches 0x408000DC with A6 loaded from a
+    // sign-extended stack slot (0xFFFFFFE0). The checksum/relocation helper
+    // at 0x40800624 then spins forever. NOP the `bsr.w 0x40800624` at guest
+    // 0x4080011A to see whether boot can progress without that pass.
+    if (g_BootContext.RomSize >= 0x11E &&
+        Rom[0x11A] == 0x61 && Rom[0x11B] == 0x00 &&
+        Rom[0x11C] == 0x05 && Rom[0x11D] == 0x08) {
+        Rom[0x11A] = 0x4E; Rom[0x11B] = 0x71;
+        Rom[0x11C] = 0x4E; Rom[0x11D] = 0x71;
+        Print(L"  68K patch: skip checksum helper (0x11A bsr->nop)\n");
+    }
+
     // 68K boot HWInfo gate. On real hardware the Open Firmware trampoline
     // builds the IRP's HWInfo record and signs it with 'Hnfo' before the
     // nanokernel runs (powermac-rom InfoRecords.a: NKHWInfo.Signature at

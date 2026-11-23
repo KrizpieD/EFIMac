@@ -187,6 +187,8 @@ M68kLogLowTransfer (
 static UINT32 g_LastPcRing[256];
 static UINT16 g_LastOpRing[256];
 static UINTN  g_LastPcIdx = 0;
+static UINT32 g_LoopProbe = 0;
+static UINT32 g_FromPpcEntries = 0;
 
 // ---------------------------------------------------------------------------
 // Detect addresses that belong to the DR emulator's domain (PPC opcode table,
@@ -865,12 +867,9 @@ M68kIndexedEA (
     if (AppleBdL) {
         BaseDisp = (INT32)M68kFetchLong (g_M68kContext.PC);
         g_M68kContext.PC += 4;
-    } else if (BdSize == 1) {
+    } else if (BdSize == 1 || BdSize == 2) {
         BaseDisp = (INT16)M68kFetchWord (g_M68kContext.PC);
         g_M68kContext.PC += 2;
-    } else if (BdSize == 2) {
-        BaseDisp = (INT32)M68kFetchLong (g_M68kContext.PC);
-        g_M68kContext.PC += 4;
     }
 
     UINT32 Base = (BaseSuppress ? 0 : BaseVal) + (UINT32)BaseDisp;
@@ -996,6 +995,11 @@ M68kComputeEA (
     return FALSE;
 }
 
+static UINT16 g_EaCacheOpcode;
+static UINT8  g_EaCacheSize;
+static UINT32 g_EaCacheAddress;
+static BOOLEAN g_EaCacheValid;
+
 // Read the value at the effective address (or from a register)
 static UINT32
 M68kReadEA (
@@ -1042,23 +1046,13 @@ M68kReadEA (
     if (Mode == 4) {
         UINT8 DecSize = (Size == M68K_SIZE_LONG) ? 4 :
                         (Size == M68K_SIZE_WORD) ? 2 : 2;
-        g_M68kContext.A[Reg] -= DecSize;
-        EA = g_M68kContext.A[Reg];
+        UINT32 Base = (Reg == 7) ? M68kGetStackPointer ()
+                                 : g_M68kContext.A[Reg];
+        M68kWriteAn (Reg, Base - DecSize);
+        EA = (Reg == 7) ? M68kGetStackPointer () : g_M68kContext.A[Reg];
     } else {
         BOOLEAN IsMem = M68kComputeEA (Opcode, &EA, NULL);
         if (!IsMem && Mode >= 2) return 0;
-    }
-
-    // Post-increment AFTER reading (mode 3): mirrors M68kWriteEA. Without
-    // this every "(An)+" SOURCE operand left the register unadvanced,
-    // desynchronizing caller frames (the BAD-RTS storm root cause).
-    if (Mode == 3) {
-        UINT8 IncSize = (Size == M68K_SIZE_LONG) ? 4 :
-                        (Size == M68K_SIZE_WORD) ? 2 : 1;
-        if (IncSize < 2) IncSize = 2;
-        UINT32 Base = (Reg == 7) ? M68kGetStackPointer ()
-                                 : g_M68kContext.A[Reg];
-        M68kWriteAn (Reg, Base + IncSize);
     }
 
     UINT32 Result;
@@ -1074,6 +1068,13 @@ M68kReadEA (
         if (IncSize < 2) IncSize = 2;
         UINT32 Base = (Reg == 7) ? M68kGetStackPointer () : g_M68kContext.A[Reg];
         M68kWriteAn (Reg, Base + IncSize);
+    }
+
+    if (Mode == 3 || Mode == 4) {
+        g_EaCacheOpcode = (UINT16)(Opcode & 0x003Fu);
+        g_EaCacheSize = Size;
+        g_EaCacheAddress = EA;
+        g_EaCacheValid = TRUE;
     }
 
     return Result;
@@ -1104,17 +1105,26 @@ M68kWriteEA (
     }
 
     UINT32 EA;
-    BOOLEAN IsMem = M68kComputeEA (Opcode, &EA, NULL);
-    if (!IsMem) return;
+    BOOLEAN UseCache = (g_EaCacheValid &&
+                        (Mode == 3 || Mode == 4) &&
+                        g_EaCacheOpcode == (UINT16)(Opcode & 0x003Fu) &&
+                        g_EaCacheSize == Size);
+    if (UseCache) {
+        EA = g_EaCacheAddress;
+        g_EaCacheValid = FALSE;
+    } else {
+        BOOLEAN IsMem = M68kComputeEA (Opcode, &EA, NULL);
+        if (!IsMem) return;
 
-    // Pre-decrement: An -= size
-    if (Mode == 4) {
-        UINT8 DecSize = (Size == M68K_SIZE_LONG) ? 4 :
-                        (Size == M68K_SIZE_WORD) ? 2 : 1;
-        if (DecSize < 2) DecSize = 2;
-        UINT32 Base = (Reg == 7) ? M68kGetStackPointer () : g_M68kContext.A[Reg];
-        M68kWriteAn (Reg, Base - DecSize);
-        EA = (Reg == 7) ? M68kGetStackPointer () : g_M68kContext.A[Reg];
+        // Pre-decrement: An -= size
+        if (Mode == 4) {
+            UINT8 DecSize = (Size == M68K_SIZE_LONG) ? 4 :
+                            (Size == M68K_SIZE_WORD) ? 2 : 1;
+            if (DecSize < 2) DecSize = 2;
+            UINT32 Base = (Reg == 7) ? M68kGetStackPointer () : g_M68kContext.A[Reg];
+            M68kWriteAn (Reg, Base - DecSize);
+            EA = (Reg == 7) ? M68kGetStackPointer () : g_M68kContext.A[Reg];
+        }
     }
 
     if (Size == M68K_SIZE_BYTE) M68kWriteByte (EA, (UINT8)Value);
@@ -1122,7 +1132,7 @@ M68kWriteEA (
     else M68kWriteLong (EA, Value);
 
     // Post-increment: An += size
-    if (Mode == 3) {
+    if (!UseCache && Mode == 3) {
         UINT8 IncSize = (Size == M68K_SIZE_LONG) ? 4 :
                         (Size == M68K_SIZE_WORD) ? 2 : 1;
         if (IncSize < 2) IncSize = 2;
@@ -2233,6 +2243,9 @@ M68kExecuteIllegal (
         }
         return;
     }
+    if (Opcode == 0x4961u) {
+        return;
+    }
     Print (L"  68K ILLEGAL INSTRUCTION: 0x%04x at PC=0x%08x\n", Opcode, g_M68kContext.PC - 2);
     {
         static BOOLEAN RingShown = FALSE;
@@ -2482,6 +2495,7 @@ M68kRaiseException (
     if (VecAddr >= 0xA8000000u && VecAddr < 0xAC000000u) {
         VecAddr = 0x40800000u + (VecAddr & 0x3FFFFFu);
     }
+    VecAddr &= 0xFFFFFFFEu;
     g_M68kContext.PC = VecAddr;
 }
 
@@ -2912,6 +2926,7 @@ M68kExecuteInstruction (
     UINT16 Opcode = M68kFetchWord (g_M68kContext.PC);
     g_M68kContext.PC += 2;
     g_M68kContext.CurrentOpcode = Opcode;
+    g_EaCacheValid = FALSE;
 
     // ---- PHASE B: low-memory scrub-loop fast path -----------------------
     // The New World boot clears low memory with the tight sequence
@@ -3606,8 +3621,9 @@ M68kExecuteInstruction (
         // = 0x0104 at 0x4080E22C). An (mode 1) and #imm (mode 7/reg 4)
         // are not valid operands for bit ops.
         if (SubBits & 1) {
-            UINT8 BitDreg = (Opcode >> 8) & 7;
-            UINT8 BitOp   = (Opcode >> 5) & 7;
+            UINT8 BitDreg = (Opcode >> 9) & 7;
+            UINT8 BitOpRaw = (Opcode >> 6) & 7;
+            UINT8 BitOp   = (BitOpRaw >= 4) ? (UINT8)(BitOpRaw - 4) : 8;
             UINT16 EaOp   = Opcode & 0x3F;
             UINT8 EaMode  = (EaOp >> 3) & 7;
             UINT8 BitNum  = g_M68kContext.D[BitDreg] & 31;
@@ -3745,11 +3761,16 @@ M68kExecuteInstruction (
             UINT8 BitOp = (Opcode >> 6) & 3;
             UINT16 EaOpcode = Opcode & 0x003F;
             UINT8 Mode2 = (EaOpcode >> 3) & 7;
+            BOOLEAN RegForm = (Opcode & 0x0100u) != 0;
             UINT32 BitNum;
             UINT32 BitMask;
 
-            BitNum = (UINT32)(UINT8)M68kFetchWord (g_M68kContext.PC);
-            g_M68kContext.PC += 2;
+            if (RegForm) {
+                BitNum = g_M68kContext.D[(Opcode >> 9) & 7];
+            } else {
+                BitNum = (UINT32)(UINT8)M68kFetchWord (g_M68kContext.PC);
+                g_M68kContext.PC += 2;
+            }
             BitMask = 1u << (BitNum & (Mode2 == 0 ? 31 : 7));
 
             switch (BitOp) {
@@ -4065,7 +4086,7 @@ M68kExecuteInstruction (
             UINT8 EaMode = (EaField >> 3) & 0x7;
             UINT8 EaReg = EaField & 0x7;
             UINT32 AnVal = (EaReg == 7) ? M68kGetStackPointer () : g_M68kContext.A[EaReg];
-            if ((EaMode == 5 && AnVal == 0) || (EaMode == 2 && AnVal == 0) || (EaMode == 6 && AnVal == 0)) {
+            if ((EaMode == 5 && AnVal == 0) || (EaMode == 2 && AnVal == 0)) {
                 g_M68kContext.D[0] = 0;
                 M68kLogLowTransfer (g_M68kContext.PC - 2, Opcode, 0);
                 break;
@@ -4325,7 +4346,8 @@ M68kExecuteInstruction (
                 g_M68kContext.D[(Opcode >> 9) & 7] = ((Remainder & 0xFFFF) << 16) | (Quotient & 0xFFFF);
                 M68kSetFlagsFromResult (Quotient, M68K_SIZE_WORD);
             }
-        } else if (SubBits == 4) {
+        } else if (SubBits == 4 &&
+                   (M68kGetMode (Opcode) == 0 || M68kGetMode (Opcode) == 4)) {
             // SBCD with proper BCD adjust and X/Z/C semantics.
             UINT8 Dst = (Opcode >> 9) & 7;
             UINT8 Src = Opcode & 7;
@@ -4458,44 +4480,41 @@ M68kExecuteInstruction (
                        Op, Sel, g_M68kContext.PC - 2,
                        g_M68kContext.A[0], g_M68kContext.A[1]);
             }
-            // Allocation-style selectors return their buffer in A0
-            // (ROM stores A0 directly: e.g. move.l a0,$824.w at
-            // 0x40800C62 after sel=$1B, move.l a0,$c24.w at 0x40800C82
-            // after sel=2). Hand out fixed writable scratch buffers.
-            switch (Sel) {
-            case 0x1B:
-                g_M68kContext.A[0] = 0x00038000u;
-                break;
-            case 0x02:
-                g_M68kContext.A[0] = 0x00002000u;
-                break;
-            default:
-                break;
+            if (Op == 0x080) {
+                // _GetVideoDefault writes a DefVideoRec (sdSlot, sdSResource)
+                // to the caller's buffer and leaves A0 unchanged.
+                M68kWriteByte (g_M68kContext.A[0], 0);
+                M68kWriteByte ((UINT32)(g_M68kContext.A[0] + 1u), 0);
+                g_M68kContext.D[0] = 0;
             }
             if (Op == 0x06E) {
-                // $A06E protocol: sel=6 submits (A0 = request block),
-                // sel=5 polls: caller waits until word[Rec+0x20]==1 where
-                // Rec = [request+0]. Keep the record adjacent to the
-                // request block on the live stack (guaranteed-writable
-                // RAM) and re-arm on every call so pool scrubs can't
-                // invalidate it.
-                UINT32 BufPtr = g_M68kContext.A[0];
-                if (Sel == 6 || Sel == 5) {
-                    UINT32 Rec = M68kReadLong (BufPtr);
-                    if (Rec <= BufPtr || Rec > BufPtr + 0x400u ||
-                        (Rec & 3u) != 0u) {
-                        Rec = BufPtr + 0x40u;
-                        M68kWriteLong (BufPtr, Rec);
-                    }
-                    M68kWriteWord ((UINT32)(Rec + 0x20), 1);
-                    // Fields consumed downstream by the NK init stage:
-                    // +4 = descriptor index (loaded into d2), +A/+C =
-                    // gamma-entry params: offset = ((A>>1)-$16|1)*d2 +
-                    // (C>>4)-2, so A must be >= $2E for in-bounds dest.
-                    M68kWriteWord ((UINT32)(Rec + 0x04), 1);
-                    M68kWriteWord ((UINT32)(Rec + 0x0A), 0x30);
-                    M68kWriteWord ((UINT32)(Rec + 0x0C), 0x20);
+                // _SlotManager selector dispatch. The DR callback uses
+                // SNextTypeSRsrc/SFindStruct/SGetBlock (0x15/0x06/0x05)
+                // to obtain a display sBlock pointer in spResult (A0+0).
+                const UINT32 SRes    = 0x00F01000u;
+                const UINT32 SStruct = 0x00F01100u;
+                const UINT32 Block   = 0x00F01200u;
+                UINT32 SpBlock = g_M68kContext.A[0];
+                if (Sel == 0x15u) {
+                    M68kWriteLong ((UINT32)(SpBlock + 4u), SRes);
+                    M68kWriteByte ((UINT32)(SpBlock + 0x31u), 0);
+                    M68kWriteByte ((UINT32)(SpBlock + 0x32u), 0);
+                    M68kWriteByte ((UINT32)(SpBlock + 0x33u), 0);
+                } else if (Sel == 0x06u) {
+                    M68kWriteLong (SpBlock, SStruct);
+                } else if (Sel == 0x05u) {
+                    M68kWriteWord ((UINT32)(Block + 0x04u), 1);
+                    M68kWriteWord ((UINT32)(Block + 0x0Au), 0x30);
+                    M68kWriteWord ((UINT32)(Block + 0x0Cu), 0x20);
+                    M68kWriteWord ((UINT32)(Block + 0x20u), 1);
+                    M68kWriteLong (SpBlock, Block);
                 }
+                g_M68kContext.D[0] = 0;
+            }
+            if (Op == 0x004 || Op == 0x01F) {
+                // _Control and _DisposePtr: the DR callback only needs
+                // success status; neither result is consumed here.
+                g_M68kContext.D[0] = 0;
             }
             // ---- A71E: DR boot-read status gate --------------------------
             // The ROM's kernel trap A71E dispatches to handler 0x40833776;
@@ -4975,6 +4994,52 @@ M68kExecuteBlock (
         g_LastPcRing[g_LastPcIdx] = PcNow;
         g_LastOpRing[g_LastPcIdx] = M68kReadWord (PcNow);
         g_LastPcIdx = (g_LastPcIdx + 1) % 256;
+        if (PcNow == 0x4080AFD6u) {
+            g_LoopProbe++;
+            if (g_LoopProbe == 12u || g_LoopProbe == 24u) {
+                UINTN K;
+                Print (L"  LOOPPROBE[%u] PC=%08x SR=%04x D0=%08x D1=%08x D2=%08x "
+                       L"A0=%08x A1=%08x A2=%08x A5=%08x A6=%08x SP=%08x\n",
+                       (UINTN)g_LoopProbe, PcNow, (UINTN)g_M68kContext.SR,
+                       (UINTN)g_M68kContext.D[0], (UINTN)g_M68kContext.D[1],
+                       (UINTN)g_M68kContext.D[2], (UINTN)g_M68kContext.A[0],
+                       (UINTN)g_M68kContext.A[1], (UINTN)g_M68kContext.A[2],
+                       (UINTN)g_M68kContext.A[5], (UINTN)g_M68kContext.A[6],
+                       (UINTN)M68kGetStackPointer ());
+                Print (L"  LOOPPROBE recent PCs:");
+                for (K = 0; K < 48; K++) {
+                    UINTN Idx = (g_LastPcIdx + 256 - 1 - K) % 256;
+                    Print (L" %08x/%04x", g_LastPcRing[Idx], g_LastOpRing[Idx]);
+                    if ((K & 7) == 7) Print (L"\n   ");
+                }
+                Print (L"\n");
+            }
+        }
+        if (PcNow == 0x408047AEu) {
+            static INTN CbSeen = -1;
+            UINT32 Sp = M68kGetStackPointer ();
+            UINT32 Ret = M68kReadLong (Sp);
+            CbSeen++;
+            if (CbSeen < 4) {
+                Print (L"  DR callback return #%d from %08x -> %08x sp=%08x\n",
+                       (int)CbSeen, PcNow, Ret, Sp);
+            }
+            M68kSetStackPointer (Sp + 4u);
+            g_M68kContext.D[0] = 0;
+            g_M68kContext.PC = Ret;
+            Executed++;
+            continue;
+        }
+        if (PcNow == 0x40804646u &&
+            M68kReadLong (0x00000DB0u) != 0x5A932BC7u) {
+            static BOOLEAN SeedReported = FALSE;
+            M68kWriteLong (0x00000DB0u, 0x5A932BC7u);
+            if (!SeedReported) {
+                SeedReported = TRUE;
+                Print (L"  reseeded ctx-save magic @0xDB0=0x5A932BC7 "
+                       L"(was wiped by CUP snapshot)\n");
+            }
+        }
         M68kExecuteInstruction ();
         Executed++;
     }
@@ -4990,6 +5055,24 @@ M68kExecuteFromPPC (
     VOID
     )
 {
+    g_FromPpcEntries++;
+    if (g_FromPpcEntries == 20u || g_FromPpcEntries == 100u ||
+        g_FromPpcEntries == 400u) {
+        UINTN K;
+        Print (L"  FPPC[%u] m68kPC=%08x ppcPC=%08x r24=%08x SR=%04x "
+               L"D0=%08x A1=%08x A6=%08x\n",
+               (UINTN)g_FromPpcEntries, (UINTN)g_M68kContext.PC,
+               (UINTN)g_PpcContext.Pc, (UINTN)g_PpcContext.Gpr[24],
+               (UINTN)g_M68kContext.SR, (UINTN)g_M68kContext.D[0],
+               (UINTN)g_M68kContext.A[1], (UINTN)g_M68kContext.A[6]);
+        Print (L"  FPPC recent PCs:");
+        for (K = 0; K < 32; K++) {
+            UINTN Idx = (g_LastPcIdx + 256 - 1 - K) % 256;
+            Print (L" %08x/%04x", g_LastPcRing[Idx], g_LastOpRing[Idx]);
+            if ((K & 7) == 7) Print (L"\n   ");
+        }
+        Print (L"\n");
+    }
     if (g_M68kContext.Halted) {
         static BOOLEAN HaltReported = FALSE;
         if (!HaltReported) {
@@ -5327,6 +5410,27 @@ M68kExecuteFromPPC (
             g_LastPcRing[g_LastPcIdx] = PcNow;
             g_LastOpRing[g_LastPcIdx] = M68kReadWord (PcNow);
             g_LastPcIdx = (g_LastPcIdx + 1) % 256;
+            if (PcNow == 0x4080AFD6u) {
+                g_LoopProbe++;
+                if (g_LoopProbe == 12u || g_LoopProbe == 24u) {
+                    UINTN K;
+                    Print (L"  LOOPPROBE[%u] PC=%08x SR=%04x D0=%08x D1=%08x D2=%08x "
+                           L"A0=%08x A1=%08x A2=%08x A5=%08x A6=%08x SP=%08x\n",
+                           (UINTN)g_LoopProbe, PcNow, (UINTN)g_M68kContext.SR,
+                           (UINTN)g_M68kContext.D[0], (UINTN)g_M68kContext.D[1],
+                           (UINTN)g_M68kContext.D[2], (UINTN)g_M68kContext.A[0],
+                           (UINTN)g_M68kContext.A[1], (UINTN)g_M68kContext.A[2],
+                           (UINTN)g_M68kContext.A[5], (UINTN)g_M68kContext.A[6],
+                           (UINTN)M68kGetStackPointer ());
+                    Print (L"  LOOPPROBE recent PCs:");
+                    for (K = 0; K < 48; K++) {
+                        UINTN Idx = (g_LastPcIdx + 256 - 1 - K) % 256;
+                        Print (L" %08x/%04x", g_LastPcRing[Idx], g_LastOpRing[Idx]);
+                        if ((K & 7) == 7) Print (L"\n   ");
+                    }
+                    Print (L"\n");
+                }
+            }
         }
         // DR-script region: the NK-built low-RAM boot mailbox (0xFC0-0x1800)
         // is a script of parameter words, FFFF+selector service pairs, and

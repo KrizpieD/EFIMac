@@ -696,6 +696,13 @@ efi_main (
             PpcWriteGuestByte(B + 0x5E8 + 1, (UINT8)(B >> 16));
             PpcWriteGuestByte(B + 0x5E8 + 2, (UINT8)(B >> 8));
             PpcWriteGuestByte(B + 0x5E8 + 3, (UINT8)(B));
+            {
+              UINT32 D = 0x40B0D000u;
+              PpcWriteGuestByte(B + 0x630 + 0, (UINT8)(D >> 24));
+              PpcWriteGuestByte(B + 0x630 + 1, (UINT8)(D >> 16));
+              PpcWriteGuestByte(B + 0x630 + 2, (UINT8)(D >> 8));
+              PpcWriteGuestByte(B + 0x630 + 3, (UINT8)D);
+            }
             // VMMaxVirtualPages/VMLogicalPages: the NK prints these from
             // caller[0x6B4]/[0x6B8] (copied to [r1+0x6B4]/[r1+0x6B8]). They are
             // 0 in the degenerate build -> zero virtual memory -> the PMDT gets

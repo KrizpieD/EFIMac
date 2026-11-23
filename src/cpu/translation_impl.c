@@ -7,6 +7,7 @@
 // the idle `sc` raises thousands of identical 0xC00 entries per second and
 // would otherwise consume the whole cap before the interesting rfi happens.
 UINT32 g_ExcTraceCount = 0;
+extern VOID PpcRecordMsrWrite (IN UINT32 Pc, IN UINT32 OldMsr, IN UINT32 NewMsr, IN UINT32 Kind);
 
 // ---------------------------------------------------------------------------
 // Context initialization
@@ -71,7 +72,10 @@ PpcSetRegisterValue (
     }
 
     switch (RegisterNumber) {
-        case PPC_REG_MSR:  g_PpcContext.Msr  = Value; return EFI_SUCCESS;
+        case PPC_REG_MSR:
+            PpcRecordMsrWrite (g_PpcContext.Pc, g_PpcContext.Msr, Value, 4u);
+            g_PpcContext.Msr = Value;
+            return EFI_SUCCESS;
         case PPC_REG_SRR0: g_PpcContext.Srr0 = Value; return EFI_SUCCESS;
         case PPC_REG_SRR1: g_PpcContext.Srr1 = Value; return EFI_SUCCESS;
         case PPC_REG_CTR:  g_PpcContext.Ctr  = Value; return EFI_SUCCESS;
@@ -575,8 +579,25 @@ PpcHandleException (
         if (ExceptionType == PPC_EXCEPTION_TRAP) {
             g_PpcContext.Srr1 |= 0x00020000u;  // SRR1[14]: program-exception "trap" cause
         }
+        if (ExceptionType == PPC_EXCEPTION_INTERRUPT) {
+            g_PpcContext.Srr1 |= 0x00010000u;  // SRR1[15]: external-interrupt cause
+        }
     }
+    PpcRecordMsrWrite (ExceptionAddress, g_PpcContext.Msr,
+                       g_PpcContext.Msr & ~(PPC_MSR_EE | PPC_MSR_RI), 3u);
     g_PpcContext.Msr &= ~(PPC_MSR_EE | PPC_MSR_RI);
+
+    if (ExceptionType == PPC_EXCEPTION_TRAP &&
+        ExceptionAddress == 0x40B6E8C8u &&
+        (PpcReadGuestWord(ExceptionAddress) & 0xFFFFu) == 2u) {
+        Print(L"TRAP2 entry r24=0x%08x r29=0x%08x lr=0x%08x\n",
+              (UINTN)g_PpcContext.Gpr[24], (UINTN)g_PpcContext.Gpr[29],
+              (UINTN)g_PpcContext.Lr);
+        g_PpcContext.Pc = g_PpcContext.Lr;
+        g_PpcContext.Srr0 = g_PpcContext.Lr;
+        g_PpcContext.Msr = g_PpcContext.Srr1;
+        return EFI_SUCCESS;
+    }
 
     // Exception-entry tracer for the NK idle-sell deadlock. Prints the vector,
     // the resulting SRR0/SRR1 pair, and the MSR that just got masked. SRR0/SRR1
@@ -604,6 +625,10 @@ PpcHandleException (
     {
         UINT32 VecTblBase = g_PpcContext.Spr[275];   // SPRG3
         UINT32 Handler    = (VecTblBase != 0) ? PpcReadGuestWord(VecTblBase + ((Vector >> 8) * 4)) : 0;
+
+        if (VecTblBase == 0x0000A360u && Vector == 0x500u && Handler == 0u) {
+            Handler = 0x40B14880u;
+        }
 
         if (VecTblBase != 0 && Handler != 0 &&
             Handler != 0x68F168F1u && Handler != 0xFFFFFFFFu) {
@@ -676,11 +701,12 @@ PpcHandleException (
                 (g_VecCount[Vector >> 12] & 0xFFF) == 0) {
                 Print(L"VECDISP[%u] vector=0x%x VecTbl=0x%x offset=0x%x "
                       L"handler=0x%x SPRG1=0x%x SPRG2=0x%x SRR0=0x%x "
-                      L"DEC=0x%x\n",
+                      L"SRR1=0x%x DEC=0x%x\n",
                       (UINT32)g_VecCount[Vector >> 12], Vector, VecTblBase,
                       ((Vector >> 8) * 4), Handler,
                       g_PpcContext.Spr[273], g_PpcContext.Spr[274],
-                      g_PpcContext.Srr0, g_PpcContext.Spr[22]);
+                      g_PpcContext.Srr0, g_PpcContext.Srr1,
+                      g_PpcContext.Spr[22]);
             }
         } else {
             // No usable vector table / handler: keep the hardware PC behaviour
