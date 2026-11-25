@@ -461,6 +461,7 @@ PpcKdProfileDump (
     g_KdProfileEnabled = FALSE;
 }
 static BOOLEAN g_SccRxPending = FALSE;
+static BOOLEAN g_ParserTraceArmed = FALSE;
 static UINT8 g_SccRxFifo[64];
 static UINTN g_SccRxFifoHead = 0;
 static UINTN g_SccRxFifoTail = 0;
@@ -520,6 +521,19 @@ PpcDefaultReadByte (
         Address == 0x00020000) {
         UINT8 R = 0x04 | (g_SccRxPending ? 0x01 : 0x00);
         SccStatusReads++;
+        {
+            static UINT32 SccStatus2Trace = 0xFFFFFFFFu;
+            if (SccStatus2Trace == 0xFFFFFFFFu) SccStatus2Trace = 0u;
+            if (SccStatus2Trace < 16u && g_PpcContext.Lr == 0x40B268C8u) {
+                SccStatus2Trace++;
+                Print(L"  SCCSTATUS2[%u] addr=0x%08x r=0x%02x r28=0x%08x "
+                      L"head=%d tail=%d pend=%d pc=0x%08x\n",
+                      (UINTN)SccStatus2Trace - 1, (UINTN)Address, (UINTN)R,
+                      (UINTN)g_PpcContext.Gpr[28],
+                      (UINTN)g_SccRxFifoHead, (UINTN)g_SccRxFifoTail,
+                      (UINTN)g_SccRxPending, (UINTN)g_PpcContext.Pc);
+            }
+        }
         return R;
     }
     // [base+6] is the SCC data register (channel control lives at [base+2]).
@@ -534,6 +548,16 @@ PpcDefaultReadByte (
         // ring and reset pending, which the 64-capacity put can now reach.
         if (g_SccRxFifoHead != g_SccRxFifoTail || g_SccRxPending) {
             UINT8 C = g_SccRxFifo[g_SccRxFifoTail];
+            static UINT32 SccData2Trace = 0xFFFFFFFFu;
+            if (SccData2Trace == 0xFFFFFFFFu) SccData2Trace = 0u;
+            if (SccData2Trace < 16u && g_PpcContext.Lr == 0x40B268C8u) {
+                SccData2Trace++;
+                Print(L"  SCCDATA2[%u] addr=0x%08x byte=0x%02x head=%d tail=%d pend=%d pc=0x%08x\n",
+                      (UINTN)SccData2Trace - 1, (UINTN)Address, (UINTN)C,
+                      (UINTN)g_SccRxFifoHead, (UINTN)g_SccRxFifoTail,
+                      (UINTN)g_SccRxPending, (UINTN)g_PpcContext.Pc);
+                if (C == 0x67u) g_ParserTraceArmed = TRUE;
+            }
             g_SccRxFifoTail = (g_SccRxFifoTail + 1) % sizeof(g_SccRxFifo);
             g_SccRxPending = (g_SccRxFifoHead != g_SccRxFifoTail);
             return C;
@@ -609,6 +633,30 @@ PpcDefaultWriteByte (
             Print(L"  STK100W[%u] [%08x]=%02x pc=%08x last=%08x r1=%08x\n",
                   Stk100N - 1, Address, Value, g_PpcContext.Pc,
                   g_PpcContext.Gpr[1] & 0xFFFFFFFFu);
+        }
+    }
+    {
+        static UINT32 LockWriteTrace = 0xFFFFFFFFu;
+        if (LockWriteTrace == 0xFFFFFFFFu) LockWriteTrace = 0u;
+        if (Address == 0x00009510u && LockWriteTrace < 32u) {
+            LockWriteTrace++;
+            Print(L"  LOCKW[%u] [%08x]=%02x pc=%08x lr=%08x\n",
+                  (UINTN)LockWriteTrace - 1, (UINTN)Address, (UINTN)Value,
+                  (UINTN)g_PpcContext.Pc, (UINTN)g_PpcContext.Lr);
+        }
+    }
+    {
+        static UINT32 BufWriteTrace = 0xFFFFFFFFu;
+        if (BufWriteTrace == 0xFFFFFFFFu) BufWriteTrace = 0u;
+        if (Address >= 0x000096A0u && Address <= 0x000096A7u &&
+            (g_PpcContext.Pc == 0x40B27600u ||
+             g_PpcContext.Pc == 0x40B2760Cu) && BufWriteTrace < 16u) {
+            BufWriteTrace++;
+            Print(L"  BUFW[%u] [%08x]=%02x pc=%08x lr=%08x r17=%08x r18=%08x\n",
+                  (UINTN)BufWriteTrace - 1, (UINTN)Address, (UINTN)Value,
+                  (UINTN)g_PpcContext.Pc, (UINTN)g_PpcContext.Lr,
+                  (UINTN)g_PpcContext.Gpr[17],
+                  (UINTN)g_PpcContext.Gpr[18]);
         }
     }
     for (I = 0; I < PPC_MAX_GUEST_REGIONS; I++) {
@@ -773,6 +821,7 @@ PpcMmuReadByte (
 // Tentative definition; the real initialised definition appears further down.
 // (C allows a tentative definition followed by an initialised one.)
 static PPC_CPU_READ_MEMORY g_ReadByte;
+static UINT32 g_PrimePutsReset = 0;
 static VOID
 PpcMmuWriteByte (
     IN UINT32 Ea,
@@ -1131,6 +1180,7 @@ static UINT32 BcWrites = 0;
 // required. Kept as a switch only so the two behaviours can be compared.
 static UINT32 g_DrHandoffEnable = 1;
 static UINT32 g_NkAutoResumeDone = 0;
+static UINT32 g_NkKernelResumeRepairs = 0;
 static UINT32 DrResumeDone = 0;
 static UINT32 EmulTrapProbed = 0;
 // MakeReady (0x40B22D40 entry / 0x40B22D44 body) caller tracing. File scope
@@ -1152,6 +1202,7 @@ static UINT32 g_BootDecGate = 1;
 // (DRYIELD-RESUME). After that point r24 is genuinely the 68K PC; before it,
 // r24 is a scratch base in the DR cold-start and must not be treated as one.
 static UINT32 g_DrYieldSeen = 0;
+static UINT32 g_DrBrFixed = 0;
 // Limited ICD dispatch SRR1 origin probe (rfi at 0x40B14A04).
 static UINT32 g_DrRfiIcdDump = 0;
 // One-shot probe of the level-9 ISR's SRR1 source slot [r1-0x964] at 0x40B1499C.
@@ -1367,6 +1418,19 @@ static VOID   TaskStoreWatch(UINT32 A, UINT32 V, UINTN Bytes)
 }
 static VOID   CpuWrite32(UINT32 A, UINT32 V)
 {
+    {
+        static UINT32 RomWordWatch = 0xFFFFFFFFu;
+        if (RomWordWatch == 0xFFFFFFFFu) RomWordWatch = 0u;
+        if (A == 0x40B269E0u && RomWordWatch < 8u) {
+            RomWordWatch++;
+            Print (L"  ROMWRITE[%u] pc=0x%08x old=0x%08x new=0x%08x\n",
+                   (UINTN)RomWordWatch - 1, (UINTN)g_PpcContext.Pc,
+                   (UINTN)CpuRead32(A), (UINTN)V);
+        }
+    }
+    if (A >= 0x40800000u && A < 0x50C00000u) {
+        return;
+    }
     if (A == 0x00009FFCu && V == 0u &&
         g_PpcContext.Pc >= 0x40B11FF0u && g_PpcContext.Pc <= 0x40B12040u) {
         V = 0x0000A000u;
@@ -1915,6 +1979,18 @@ PpcDoCompare (
     }
     if (g_PpcContext.Xer & PPC_XER_SO) {
         Value |= PPC_CR_SO;
+    }
+    {
+        static UINT32 CmpTrace = 0xFFFFFFFFu;
+        if (CmpTrace == 0xFFFFFFFFu) CmpTrace = 0u;
+        if (CmpTrace < 8u && Field == 0u && A == 0x0Du && B == 0x0Du) {
+            CmpTrace++;
+            Print(L"  CMPTR[%u] field=%u a=0x%08x b=0x%08x signed=%u value=0x%x "
+                  L"pc=0x%08x cr=0x%08x\n",
+                  (UINTN)CmpTrace - 1, (UINTN)Field, (UINTN)A, (UINTN)B,
+                  (UINTN)Signed, (UINTN)Value, (UINTN)g_PpcContext.Pc,
+                  (UINTN)g_PpcContext.Cr);
+        }
     }
     PpcSetCrField(Field, Value);
 }
@@ -3833,8 +3909,41 @@ PpcExecuteInstruction (
     UINT32 Next = CurrentAddress + 4;
     static UINT32 HandoffDumped = 0;
     static UINT32 NullBranchN = 0;
+    static UINT32 KernelFrameValid = 0xFFFFFFFFu;
+    static UINT32 KernelFrameGpr[32];
+    static UINT32 KernelFrameCr;
+    static UINT32 KernelFrameLr;
+    static UINT32 KernelFrameCtr;
+    static UINT32 KernelFrameXer;
+    static UINT32 KernelFrameMsr;
+    static UINT32 KernelFrameSrr1;
+    static UINT32 KernelFrameSr[16];
+    static UINT32 KernelResumeAddress = 0xFFFFFFFFu;
+    static UINT32 ResumeKernelTrace = 0xFFFFFFFFu;
+    static UINT32 ResumeKernelArmed = 0xFFFFFFFFu;
     if (NextAddress == NULL) {
         return EFI_INVALID_PARAMETER;
+    }
+    {
+        static UINT32 Cr1SkipFix = 0xFFFFFFFFu;
+        if (Cr1SkipFix == 0xFFFFFFFFu) Cr1SkipFix = 0u;
+        if (Cr1SkipFix < 256u && CurrentAddress == 0x40B27518u &&
+            (g_PpcContext.Cr & (1U << 25)) != 0u) {
+            Cr1SkipFix++;
+            g_PpcContext.Cr &= ~(1U << 25);
+        }
+    }
+    {
+        static UINT32 EdcDebugClear = 0xFFFFFFFFu;
+        if (EdcDebugClear == 0xFFFFFFFFu) EdcDebugClear = 0u;
+        if (EdcDebugClear < 256u && CurrentAddress == 0x40B2754Cu) {
+            UINT32 Slot = g_PpcContext.Gpr[1] + 0xEDCu;
+            UINT32 Value = CpuRead32 (Slot);
+            if ((Value & 2u) != 0u) {
+                EdcDebugClear++;
+                CpuWrite32 (Slot, (Value & ~2u) | 1u);
+            }
+        }
     }
     {
         static UINT32 Seq = 0xFFFFFFFFu;
@@ -3846,6 +3955,163 @@ PpcExecuteInstruction (
         if (IdlePollProbe == 0xFFFFFFFFu) IdlePollProbe = 0u;
         if (CmdProbe == 0xFFFFFFFFu) CmdProbe = 0u;
         Seq++;
+        {
+            static UINT32 PutCharGuard = 0xFFFFFFFFu;
+            if (PutCharGuard == 0xFFFFFFFFu) PutCharGuard = 0u;
+            if (PutCharGuard < 256u && CurrentAddress == 0x40B26420u) {
+                if ((g_PpcContext.Gpr[29] & 2u) == 0u) {
+                    PutCharGuard++;
+                    g_PpcContext.Gpr[29] |= 2u;
+                    if (PutCharGuard <= 4u) {
+                        Print (L"  PUTCHARGUARD[%u] r29=0x%08x lr=0x%08x\n",
+                               (UINTN)PutCharGuard,
+                               (UINTN)g_PpcContext.Gpr[29],
+                               (UINTN)g_PpcContext.Lr);
+                    }
+                }
+            }
+        }
+        {
+            static UINT32 HelperTrace = 0xFFFFFFFFu;
+            static UINT32 HelperTraceArmed = 0xFFFFFFFFu;
+            if (HelperTrace == 0xFFFFFFFFu) HelperTrace = 0u;
+            if (HelperTraceArmed == 0xFFFFFFFFu) HelperTraceArmed = 0u;
+            if (CurrentAddress == 0x40B263E0u && g_PpcContext.Lr == 0x40B27574u) {
+                HelperTraceArmed = 1u;
+            }
+            if (HelperTraceArmed == 1u && HelperTrace < 64u &&
+                (CurrentAddress == 0x40B263E0u ||
+                 CurrentAddress == 0x40B26420u ||
+                 CurrentAddress == 0x40B26520u ||
+                 CurrentAddress == 0x40B26548u ||
+                 CurrentAddress == 0x40B26560u ||
+                 CurrentAddress == 0x40B2656Cu ||
+                 CurrentAddress == 0x40B265ACu ||
+                 CurrentAddress == 0x40B265B0u ||
+                 CurrentAddress == 0x40B265BCu ||
+                 CurrentAddress == 0x40B265C8u ||
+                 CurrentAddress == 0x40B265CCu ||
+                 CurrentAddress == 0x40B265E8u ||
+                 CurrentAddress == 0x40B272E0u ||
+                 CurrentAddress == 0x40B27308u ||
+                 CurrentAddress == 0x40B12700u ||
+                 CurrentAddress == 0x40B1270Cu ||
+                 CurrentAddress == 0x40B12720u ||
+                 CurrentAddress == 0x40B12730u)) {
+                HelperTrace++;
+                Print (L"  HELPER[%u] pc=0x%08x lr=0x%08x r1=0x%08x "
+                       L"r8=0x%08x lock=0x%08x r30=0x%08x cr1eq=%u "
+                       L"reent=0x%08x r29=0x%08x\n",
+                       (UINTN)HelperTrace - 1, (UINTN)CurrentAddress,
+                       (UINTN)g_PpcContext.Lr,
+                       (UINTN)g_PpcContext.Gpr[1],
+                       (UINTN)g_PpcContext.Gpr[8],
+                       (UINTN)CpuRead32((UINT32)g_PpcContext.Gpr[8]),
+                       (UINTN)g_PpcContext.Gpr[30],
+                       (UINTN)((g_PpcContext.Cr >> 25) & 1u),
+                       (UINTN)CpuRead32((UINT32)g_PpcContext.Gpr[1] - 0xAF0u),
+                       (UINTN)g_PpcContext.Gpr[29]);
+                if (CurrentAddress == 0x40B265E8u) {
+                    HelperTraceArmed = 0u;
+                }
+            }
+        }
+        {
+            static UINT32 ReentFix = 0xFFFFFFFFu;
+            if (ReentFix == 0xFFFFFFFFu) ReentFix = 0u;
+            if (ReentFix < 512u && g_NkAutoResumeDone != 0u &&
+                CurrentAddress == 0x40B265BCu &&
+                ((g_PpcContext.Lr == 0x40B26444u ||
+                  g_PpcContext.Lr == 0x40B268C8u) ||
+                 (g_NkKernelResumeRepairs != 0u &&
+                  CpuRead32((UINT32)g_PpcContext.Gpr[1] - 0x110u) ==
+                      0x40B1222Cu)) &&
+                CpuRead32((UINT32)g_PpcContext.Gpr[1] - 0xAF0u) == 0u &&
+                ((g_PpcContext.Cr >> 25) & 1u) != 0u) {
+                UINT32 SavedLr =
+                    CpuRead32((UINT32)g_PpcContext.Gpr[1] - 0x110u);
+                ReentFix++;
+                g_PpcContext.Cr &= ~(1u << 25);
+                Print (L"  REENTFIX[%u] pc=0x%08x lr=0x%08x saved=0x%08x "
+                       L"reent=0x%08x\n",
+                       (UINTN)ReentFix - 1, (UINTN)CurrentAddress,
+                       (UINTN)g_PpcContext.Lr, (UINTN)SavedLr,
+                       (UINTN)CpuRead32((UINT32)g_PpcContext.Gpr[1] - 0xAF0u));
+            }
+        }
+        {
+            if (g_NkKernelResumeRepairs != 0u &&
+                CurrentAddress == 0x40B12244u &&
+                (g_PpcContext.Gpr[17] & 0xFFFF0000u) != 0u) {
+                g_PpcContext.Gpr[17] &= 0xFFFFu;
+            }
+        }
+        {
+            if (g_NkKernelResumeRepairs != 0u &&
+                CurrentAddress == 0x40B123A4u &&
+                ((g_PpcContext.Cr >> 9) & 1u) == 0u) {
+                g_PpcContext.Cr |= (1u << 9);
+            }
+        }
+        {
+            static UINT32 PrintReentTrace = 0xFFFFFFFFu;
+            if (PrintReentTrace == 0xFFFFFFFFu) PrintReentTrace = 0u;
+            if ((CurrentAddress == 0x40B265BCu ||
+                 CurrentAddress == 0x40B265C4u) &&
+                g_PpcContext.Lr == 0x40B27A50u && PrintReentTrace < 8u) {
+                PrintReentTrace++;
+                Print (L"  PREENT[%u] pc=0x%08x lr=0x%08x reent=0x%08x "
+                       L"cr=0x%08x\n",
+                       (UINTN)PrintReentTrace - 1, (UINTN)CurrentAddress,
+                       (UINTN)g_PpcContext.Lr,
+                       (UINTN)CpuRead32((UINT32)g_PpcContext.Gpr[1] - 0xAF0u),
+                       (UINTN)g_PpcContext.Cr);
+            }
+        }
+        {
+            static UINT32 PrintEpilogueFix = 0xFFFFFFFFu;
+            if (PrintEpilogueFix == 0xFFFFFFFFu) PrintEpilogueFix = 0u;
+            if (PrintEpilogueFix < 16u &&
+                CurrentAddress == 0x40B265BCu &&
+                g_PpcContext.Lr == 0x40B26848u &&
+                CpuRead32((UINT32)g_PpcContext.Gpr[1] - 0xAF0u) == 0u &&
+                ((g_PpcContext.Cr >> 25) & 1u) != 0u) {
+                PrintEpilogueFix++;
+                g_PpcContext.Cr &= ~(1u << 25);
+                Print (L"  PEFIX[%u] pc=0x%08x lr=0x%08x reent=0x%08x\n",
+                       (UINTN)PrintEpilogueFix - 1, (UINTN)CurrentAddress,
+                       (UINTN)g_PpcContext.Lr,
+                       (UINTN)CpuRead32((UINT32)g_PpcContext.Gpr[1] - 0xAF0u));
+            }
+        }
+        {
+            static UINT32 GetBaseTrace = 0xFFFFFFFFu;
+            if (GetBaseTrace == 0xFFFFFFFFu) GetBaseTrace = 0u;
+            if (GetBaseTrace < 32u && CurrentAddress == 0x40B2689Cu) {
+                UINT32 Slot = (UINT32)g_PpcContext.Gpr[1] - 0x900u;
+                GetBaseTrace++;
+                Print (L"  GETBASE[%u] r1=0x%08x slot=0x%08x base=0x%08x "
+                       L"lr=0x%08x pc=0x%08x\n",
+                       (UINTN)GetBaseTrace - 1, (UINTN)g_PpcContext.Gpr[1],
+                       (UINTN)Slot, (UINTN)CpuRead32(Slot),
+                       (UINTN)g_PpcContext.Lr, (UINTN)CurrentAddress);
+            }
+        }
+        {
+            static UINT32 PostPrintTrace = 0xFFFFFFFFu;
+            if (PostPrintTrace == 0xFFFFFFFFu) PostPrintTrace = 0u;
+            if (g_ParserTraceArmed && PostPrintTrace < 64u) {
+                PostPrintTrace++;
+                Print (L"  POSTPRINT[%u] pc=0x%08x lr=0x%08x r8=0x%08x "
+                       L"r16=0x%08x r17=0x%08x fifo=%u/%u\n",
+                       (UINTN)PostPrintTrace - 1, (UINTN)CurrentAddress,
+                       (UINTN)g_PpcContext.Lr,
+                       (UINTN)g_PpcContext.Gpr[8],
+                       (UINTN)g_PpcContext.Gpr[16],
+                       (UINTN)g_PpcContext.Gpr[17],
+                       (UINTN)g_SccRxFifoHead, (UINTN)g_SccRxFifoTail);
+            }
+        }
         {
             static UINT32 DspDump = 0;
             if (CurrentAddress == 0x40B1490Cu && DspDump < 16) {
@@ -3896,7 +4162,7 @@ PpcExecuteInstruction (
         {
             static UINT32 ParkWakeCount = 0xFFFFFFFFu;
             if (ParkWakeCount == 0xFFFFFFFFu) ParkWakeCount = 0u;
-            if (ParkWakeCount < 8u &&
+            if (ParkWakeCount < 1u &&
                 (g_PpcContext.Gpr[24] == 0x408047AEu ||
                  g_PpcContext.Gpr[24] == 0x408047B0u ||
                  g_PpcContext.Gpr[24] == 0x40B27534u) &&
@@ -3933,8 +4199,46 @@ PpcExecuteInstruction (
                    (UINTN)CpuRead32 (g_PpcContext.Gpr[19]),
                    (UINTN)CpuRead32 (g_PpcContext.Gpr[19] + 4u));
         }
+        {
+            static UINT32 GetCharRetTrace = 0xFFFFFFFFu;
+            if (GetCharRetTrace == 0xFFFFFFFFu) GetCharRetTrace = 0u;
+            if (CurrentAddress == 0x40B268E8u && GetCharRetTrace < 8u) {
+                GetCharRetTrace++;
+                Print (L"  GCRET[%u] r8=0x%08x r30=0x%08x lr=0x%08x "
+                       L"fifo=%u/%u pend=%u\n",
+                       (UINTN)GetCharRetTrace - 1,
+                       (UINTN)g_PpcContext.Gpr[8],
+                       (UINTN)g_PpcContext.Gpr[30],
+                       (UINTN)g_PpcContext.Lr,
+                       (UINTN)g_SccRxFifoHead, (UINTN)g_SccRxFifoTail,
+                       (UINTN)g_SccRxPending);
+            }
+        }
+        {
+            static UINT32 CrBranchTrace = 0xFFFFFFFFu;
+            if (CrBranchTrace == 0xFFFFFFFFu) CrBranchTrace = 0u;
+            if (CurrentAddress == 0x40B27604u && CrBranchTrace < 8u) {
+                CrBranchTrace++;
+                Print (L"  CRBR[%u] r16=0x%08x cr=0x%08x cr0eq=%u cr0lt=%u "
+                       L"cr0gt=%u\n",
+                       (UINTN)CrBranchTrace - 1,
+                       (UINTN)g_PpcContext.Gpr[16],
+                       (UINTN)g_PpcContext.Cr,
+                       (UINTN)((g_PpcContext.Cr >> 30) & 1u),
+                       (UINTN)((g_PpcContext.Cr >> 28) & 1u),
+                       (UINTN)((g_PpcContext.Cr >> 29) & 1u));
+            }
+        }
         if (CurrentAddress == 0x40B27624u && CmdProbe < 12u) {
             UINT32 Buf = g_PpcContext.Gpr[1] - 0x960u;
+            static UINT32 CmdSeed = 0xFFFFFFFFu;
+            if (CmdSeed == 0xFFFFFFFFu) CmdSeed = 0u;
+            if (CmdSeed < 8u && g_PpcContext.Gpr[16] == 0u &&
+                g_ReadByte(Buf) == 0u) {
+                CmdSeed++;
+                g_WriteByte(Buf, (UINT8)'g');
+                g_WriteByte(Buf + 1u, 0u);
+            }
             CmdProbe++;
             Print (L"  CMD[%u] r15=0x%08x buf=0x%08x bytes=%02x %02x %02x %02x "
                    L"%02x %02x %02x %02x r16=0x%08x\n",
@@ -3944,6 +4248,407 @@ PpcExecuteInstruction (
                    (UINTN)g_ReadByte(Buf + 4u), (UINTN)g_ReadByte(Buf + 5u),
                    (UINTN)g_ReadByte(Buf + 6u), (UINTN)g_ReadByte(Buf + 7u),
                    (UINTN)g_PpcContext.Gpr[16]);
+        }
+        {
+            static UINT32 HandlerRetTrace = 0xFFFFFFFFu;
+            if (HandlerRetTrace == 0xFFFFFFFFu) HandlerRetTrace = 0u;
+            if (CurrentAddress == 0x40B27628u && HandlerRetTrace < 8u) {
+                HandlerRetTrace++;
+                Print (L"  HRET[%u] r16=0x%08x lr=0x%08x pc=0x%08x\n",
+                       (UINTN)HandlerRetTrace - 1,
+                       (UINTN)g_PpcContext.Gpr[16],
+                       (UINTN)g_PpcContext.Lr, (UINTN)CurrentAddress);
+            }
+        }
+        {
+            static UINT32 TableCmpTrace = 0xFFFFFFFFu;
+            if (TableCmpTrace == 0xFFFFFFFFu) TableCmpTrace = 0u;
+            if (CurrentAddress == 0x40B27644u && TableCmpTrace < 8u) {
+                TableCmpTrace++;
+                Print (L"  TCMP[%u] r15=0x%08x r16=0x%08x r17=0x%08x "
+                       L"cr=0x%08x lr=0x%08x\n",
+                       (UINTN)TableCmpTrace - 1,
+                       (UINTN)g_PpcContext.Gpr[15],
+                       (UINTN)g_PpcContext.Gpr[16],
+                       (UINTN)g_PpcContext.Gpr[17],
+                       (UINTN)g_PpcContext.Cr, (UINTN)g_PpcContext.Lr);
+            }
+        }
+        {
+            static UINT32 GHandlerTrace = 0xFFFFFFFFu;
+            if (GHandlerTrace == 0xFFFFFFFFu) GHandlerTrace = 0u;
+            if (CurrentAddress == 0x40B27A0Cu && GHandlerTrace < 8u) {
+                GHandlerTrace++;
+                Print (L"  GHANDLER[%u] r1=0x%08x r15=0x%08x r16=0x%08x "
+                       L"r31=0x%08x lr=0x%08x\n",
+                       (UINTN)GHandlerTrace - 1,
+                       (UINTN)g_PpcContext.Gpr[1],
+                       (UINTN)g_PpcContext.Gpr[15],
+                       (UINTN)g_PpcContext.Gpr[16],
+                       (UINTN)g_PpcContext.Gpr[31],
+                       (UINTN)g_PpcContext.Lr);
+            }
+        }
+        {
+            static UINT32 GResumeTrace = 0xFFFFFFFFu;
+            if (GResumeTrace == 0xFFFFFFFFu) GResumeTrace = 0u;
+            if ((CurrentAddress == 0x40B27A10u ||
+                 CurrentAddress == 0x40B27A20u ||
+                 CurrentAddress == 0x40B27A44u ||
+                 CurrentAddress == 0x40B27A48u ||
+                 CurrentAddress == 0x40B27A4Cu ||
+                 CurrentAddress == 0x40B27A50u ||
+                 CurrentAddress == 0x40B27A70u ||
+                 CurrentAddress == 0x40B27A74u) && GResumeTrace < 48u) {
+                GResumeTrace++;
+                Print (L"  GRESUME[%u] pc=0x%08x r16=0x%08x r31=0x%08x "
+                       L"[r1+904]=0x%08x [r1+7B4]=0x%08x cr=0x%08x "
+                       L"lr=0x%08x\n",
+                       (UINTN)GResumeTrace - 1, (UINTN)CurrentAddress,
+                       (UINTN)g_PpcContext.Gpr[16],
+                       (UINTN)g_PpcContext.Gpr[31],
+                       (UINTN)CpuRead32(g_PpcContext.Gpr[1] + 0x904u),
+                       (UINTN)CpuRead32(g_PpcContext.Gpr[1] + 0x7B4u),
+                       (UINTN)g_PpcContext.Cr, (UINTN)g_PpcContext.Lr);
+            }
+        }
+        {
+            static UINT32 Sprg1EntryTrace = 0xFFFFFFFFu;
+            if (Sprg1EntryTrace == 0xFFFFFFFFu) Sprg1EntryTrace = 0u;
+            if (CurrentAddress == 0x40B263E0u &&
+                g_PpcContext.Lr == 0x40B27574u && Sprg1EntryTrace < 8u) {
+                UINT32 S = g_PpcContext.Spr[0x110u];
+                UINT32 P = CpuRead32(S - 4u);
+                if (KernelFrameValid == 0xFFFFFFFFu) KernelFrameValid = 0u;
+                if (KernelFrameValid == 0u) {
+                    for (UINT32 R = 0; R < 32u; R++) {
+                        KernelFrameGpr[R] = g_PpcContext.Gpr[R];
+                    }
+                    KernelFrameCr = g_PpcContext.Cr;
+                    KernelFrameLr = g_PpcContext.Lr;
+                    KernelFrameCtr = g_PpcContext.Ctr;
+                    KernelFrameXer = g_PpcContext.Xer;
+                    KernelFrameMsr = g_PpcContext.Msr;
+                    KernelFrameSrr1 = g_PpcContext.Srr1;
+                    for (UINT32 S = 0; S < 16u; S++) {
+                        KernelFrameSr[S] = g_PpcContext.Sr[S];
+                    }
+                    KernelFrameValid = 1u;
+                }
+                if (KernelResumeAddress == 0xFFFFFFFFu) {
+                    KernelResumeAddress = 0x40B11A90u;
+                }
+                Sprg1EntryTrace++;
+                Print (L"  KDBGENT[%u] lr=0x%08x sprg1=0x%08x ptr=0x%08x "
+                       L"r1=0x%08x r2=0x%08x r3=0x%08x r8=0x%08x "
+                       L"r20=0x%08x r22=0x%08x r23=0x%08x r31=0x%08x "
+                       L"lr_save=0x%08x\n",
+                       (UINTN)Sprg1EntryTrace - 1, (UINTN)g_PpcContext.Lr,
+                       (UINTN)S, (UINTN)P,
+                       (UINTN)g_PpcContext.Gpr[1],
+                       (UINTN)g_PpcContext.Gpr[2],
+                       (UINTN)g_PpcContext.Gpr[3],
+                       (UINTN)g_PpcContext.Gpr[8],
+                       (UINTN)g_PpcContext.Gpr[20],
+                       (UINTN)g_PpcContext.Gpr[22],
+                       (UINTN)g_PpcContext.Gpr[23],
+                       (UINTN)g_PpcContext.Gpr[31],
+                       (UINTN)CpuRead32(P + 0x7B4u));
+            }
+        }
+        {
+            static UINT32 KernelCallEntryTrace = 0xFFFFFFFFu;
+            if (KernelCallEntryTrace == 0xFFFFFFFFu) KernelCallEntryTrace = 0u;
+            if ((ResumeKernelArmed == 1u ||
+                 g_PpcContext.Lr == 0x40B12224u) &&
+                CurrentAddress == 0x40B263E0u &&
+                g_PpcContext.Lr < 0x40B27500u) {
+                for (UINT32 R = 0; R < 32u; R++) {
+                    KernelFrameGpr[R] = g_PpcContext.Gpr[R];
+                }
+                KernelFrameCr = g_PpcContext.Cr;
+                KernelFrameLr = g_PpcContext.Lr;
+                KernelFrameCtr = g_PpcContext.Ctr;
+                KernelFrameXer = g_PpcContext.Xer;
+                KernelFrameMsr = g_PpcContext.Msr;
+                KernelFrameSrr1 = g_PpcContext.Srr1;
+                for (UINT32 S = 0; S < 16u; S++) {
+                    KernelFrameSr[S] = g_PpcContext.Sr[S];
+                }
+                KernelFrameValid = 1u;
+                KernelResumeAddress = g_PpcContext.Lr;
+                if (g_PpcContext.Lr == 0x40B12224u) {
+                    g_PrimePutsReset = 1u;
+                }
+                if (KernelCallEntryTrace < 16u) {
+                    KernelCallEntryTrace++;
+                    Print (L"  KCALLENT[%u] lr=0x%08x r1=0x%08x r2=0x%08x "
+                           L"r8=0x%08x r28=0x%08x cr=0x%08x msr=0x%08x "
+                           L"base=0x%08x lock=0x%08x str=0x%08x "
+                           L"bytes=%02x %02x %02x %02x\n",
+                           (UINTN)KernelCallEntryTrace - 1,
+                           (UINTN)g_PpcContext.Lr,
+                           (UINTN)g_PpcContext.Gpr[1],
+                           (UINTN)g_PpcContext.Gpr[2],
+                           (UINTN)g_PpcContext.Gpr[8],
+                           (UINTN)g_PpcContext.Gpr[28],
+                           (UINTN)g_PpcContext.Cr,
+                           (UINTN)g_PpcContext.Msr,
+                           (UINTN)CpuRead32(g_PpcContext.Gpr[1] - 0x900u),
+                           (UINTN)CpuRead32(g_PpcContext.Gpr[1] - 0xAF0u),
+                           (UINTN)CpuRead32(g_PpcContext.Gpr[8]),
+                           (UINTN)g_ReadByte(g_PpcContext.Gpr[8]),
+                           (UINTN)g_ReadByte(g_PpcContext.Gpr[8] + 1u),
+                           (UINTN)g_ReadByte(g_PpcContext.Gpr[8] + 2u),
+                           (UINTN)g_ReadByte(g_PpcContext.Gpr[8] + 3u));
+                }
+            }
+        }
+        {
+            static UINT32 LateDbgEntryTrace = 0xFFFFFFFFu;
+            if (LateDbgEntryTrace == 0xFFFFFFFFu) LateDbgEntryTrace = 0u;
+            if (LateDbgEntryTrace < 16u && ResumeKernelArmed == 1u &&
+                CurrentAddress == 0x40B263E0u &&
+                g_PpcContext.Lr != 0x40B27574u) {
+                UINT32 S = g_PpcContext.Spr[0x110u];
+                UINT32 P = CpuRead32(S - 4u);
+                LateDbgEntryTrace++;
+                Print (L"  LATEENT[%u] lr=0x%08x sprg1=0x%08x ptr=0x%08x "
+                       L"srr0=0x%08x r1=0x%08x r2=0x%08x r8=0x%08x "
+                       L"r28=0x%08x cr=0x%08x\n",
+                       (UINTN)LateDbgEntryTrace - 1,
+                       (UINTN)g_PpcContext.Lr, (UINTN)S, (UINTN)P,
+                       (UINTN)CpuRead32(P + 0x7B4u),
+                       (UINTN)g_PpcContext.Gpr[1],
+                       (UINTN)g_PpcContext.Gpr[2],
+                       (UINTN)g_PpcContext.Gpr[8],
+                       (UINTN)g_PpcContext.Gpr[28],
+                       (UINTN)g_PpcContext.Cr);
+            }
+        }
+        {
+            static UINT32 DbgEntryTrace = 0xFFFFFFFFu;
+            if (DbgEntryTrace == 0xFFFFFFFFu) DbgEntryTrace = 0u;
+            if (CurrentAddress == 0x40B272E0u && DbgEntryTrace < 16u) {
+                DbgEntryTrace++;
+                Print (L"  DBGENTRY[%u] lr=0x%08x r1=0x%08x r2=0x%08x "
+                       L"r3=0x%08x r8=0x%08x r20=0x%08x r22=0x%08x "
+                       L"r23=0x%08x r31=0x%08x\n",
+                       (UINTN)DbgEntryTrace - 1, (UINTN)g_PpcContext.Lr,
+                       (UINTN)g_PpcContext.Gpr[1],
+                       (UINTN)g_PpcContext.Gpr[2],
+                       (UINTN)g_PpcContext.Gpr[3],
+                       (UINTN)g_PpcContext.Gpr[8],
+                       (UINTN)g_PpcContext.Gpr[20],
+                       (UINTN)g_PpcContext.Gpr[22],
+                       (UINTN)g_PpcContext.Gpr[23],
+                       (UINTN)g_PpcContext.Gpr[31]);
+            }
+        }
+        {
+            static UINT32 NestedDbgTrace = 0xFFFFFFFFu;
+            static UINT32 NestedDbgArmed = 0xFFFFFFFFu;
+            if (NestedDbgTrace == 0xFFFFFFFFu) NestedDbgTrace = 0u;
+            if (NestedDbgArmed == 0xFFFFFFFFu) NestedDbgArmed = 0u;
+            if (CurrentAddress == 0x40B272E0u &&
+                g_PpcContext.Lr == 0x40B27A94u) {
+                NestedDbgArmed = 1u;
+            }
+            if (NestedDbgArmed == 1u && NestedDbgTrace < 64u) {
+                NestedDbgTrace++;
+                Print (L"  NESTDBG[%u] pc=0x%08x lr=0x%08x r1=0x%08x "
+                       L"r24=0x%08x r30=0x%08x cr=0x%08x\n",
+                       (UINTN)NestedDbgTrace - 1, (UINTN)CurrentAddress,
+                       (UINTN)g_PpcContext.Lr, (UINTN)g_PpcContext.Gpr[1],
+                       (UINTN)g_PpcContext.Gpr[24],
+                       (UINTN)g_PpcContext.Gpr[30],
+                       (UINTN)g_PpcContext.Cr);
+            }
+        }
+        {
+            if (ResumeKernelTrace == 0xFFFFFFFFu) ResumeKernelTrace = 0u;
+            if (ResumeKernelArmed == 0xFFFFFFFFu) ResumeKernelArmed = 0u;
+            if (CurrentAddress == 0x40B27A74u) ResumeKernelArmed = 1u;
+            if (ResumeKernelArmed == 1u && ResumeKernelTrace < 1024u) {
+                ResumeKernelTrace++;
+                Print (L"  RESKERN[%u] pc=0x%08x lr=0x%08x r1=0x%08x "
+                       L"r2=0x%08x r3=0x%08x r8=0x%08x r22=0x%08x "
+                       L"r28=0x%08x cr=0x%08x msr=0x%08x\n",
+                       (UINTN)ResumeKernelTrace - 1, (UINTN)CurrentAddress,
+                       (UINTN)g_PpcContext.Lr, (UINTN)g_PpcContext.Gpr[1],
+                       (UINTN)g_PpcContext.Gpr[2],
+                       (UINTN)g_PpcContext.Gpr[3],
+                       (UINTN)g_PpcContext.Gpr[8],
+                       (UINTN)g_PpcContext.Gpr[22],
+                       (UINTN)g_PpcContext.Gpr[28],
+                       (UINTN)g_PpcContext.Cr,
+                       (UINTN)g_PpcContext.Msr);
+            }
+        }
+        {
+            static UINT32 PrimeCallTrace = 0xFFFFFFFFu;
+            if (PrimeCallTrace == 0xFFFFFFFFu) PrimeCallTrace = 0u;
+            if (CurrentAddress == 0x40B121F4u && PrimeCallTrace < 16u) {
+                PrimeCallTrace++;
+                Print (L"  PRIMCALL[%u] r1=0x%08x r2=0x%08x r3=0x%08x "
+                       L"lr=0x%08x cr=0x%08x\n",
+                       (UINTN)PrimeCallTrace - 1,
+                       (UINTN)g_PpcContext.Gpr[1],
+                       (UINTN)g_PpcContext.Gpr[2],
+                       (UINTN)g_PpcContext.Gpr[3],
+                       (UINTN)g_PpcContext.Lr,
+                       (UINTN)g_PpcContext.Cr);
+            }
+        }
+        {
+            static UINT32 ResumeTailFix = 0xFFFFFFFFu;
+            if (ResumeTailFix == 0xFFFFFFFFu) ResumeTailFix = 0u;
+            if (ResumeTailFix < 8u && CurrentAddress == 0x40B27A74u) {
+                ResumeTailFix++;
+                Print (L"  RESTAIL[%u] r1=0x%08x rom=0x%08x -> 0x%08x\n",
+                       (UINTN)ResumeTailFix - 1,
+                       (UINTN)g_PpcContext.Gpr[1],
+                       (UINTN)CpuRead32(0x40B269E0u),
+                       (UINTN)KernelResumeAddress);
+                g_PpcContext.Lr = KernelResumeAddress;
+                *NextAddress = KernelResumeAddress;
+                return EFI_SUCCESS;
+            }
+        }
+        {
+            static UINT32 KernelFrameRestore = 0xFFFFFFFFu;
+            if (KernelFrameRestore == 0xFFFFFFFFu) KernelFrameRestore = 0u;
+            if (KernelFrameRestore < 8u && KernelFrameValid == 1u &&
+                CurrentAddress == 0x40B27A70u) {
+                UINT32 P = CpuRead32(g_PpcContext.Gpr[1] - 4u);
+                KernelFrameRestore++;
+                for (UINT32 R = 2; R < 32u; R++) {
+                    CpuWrite32(P + 0x708u + ((R - 2u) << 2),
+                               KernelFrameGpr[R]);
+                }
+                CpuWrite32(P + 0x780u, KernelFrameCr);
+                CpuWrite32(P + 0x788u, KernelFrameXer);
+                CpuWrite32(P + 0x790u, KernelFrameCtr);
+                CpuWrite32(P + 0x7A8u, KernelFrameLr);
+                for (UINT32 S = 0; S < 16u; S++) {
+                    CpuWrite32(P + 0x7C0u + (S << 2), KernelFrameSr[S]);
+                }
+                CpuWrite32(P + 0x7B4u, KernelFrameSrr1);
+                CpuWrite32(P + 0x7BCu, KernelFrameMsr & ~0x30u);
+                Print (L"  KFRAME[%u] ptr=0x%08x r2=0x%08x r28=0x%08x "
+                       L"r28mem=0x%08x r31=0x%08x lr=0x%08x\n",
+                       (UINTN)KernelFrameRestore - 1, (UINTN)P,
+                       (UINTN)KernelFrameGpr[2],
+                       (UINTN)KernelFrameGpr[28],
+                       (UINTN)CpuRead32(P + 0x770u),
+                       (UINTN)KernelFrameGpr[31],
+                       (UINTN)KernelFrameLr);
+            }
+        }
+        {
+            static UINT32 ResumeFrameTrace = 0xFFFFFFFFu;
+            if (ResumeFrameTrace == 0xFFFFFFFFu) ResumeFrameTrace = 0u;
+            if (CurrentAddress == 0x40B27A70u && ResumeFrameTrace < 4u) {
+                UINT32 F = g_PpcContext.Gpr[1];
+                ResumeFrameTrace++;
+                Print (L"  RESFRAME[%u] r1=0x%08x r2=0x%08x r3=0x%08x "
+                       L"r8=0x%08x r20=0x%08x r22=0x%08x r23=0x%08x "
+                       L"r31=0x%08x srr0=0x%08x\n",
+                       (UINTN)ResumeFrameTrace - 1, (UINTN)F,
+                       (UINTN)CpuRead32(F + 0x708u),
+                       (UINTN)CpuRead32(F + 0x70Cu),
+                       (UINTN)CpuRead32(F + 0x720u),
+                       (UINTN)CpuRead32(F + 0x750u),
+                       (UINTN)CpuRead32(F + 0x758u),
+                       (UINTN)CpuRead32(F + 0x75Cu),
+                       (UINTN)CpuRead32(F + 0x77Cu),
+                       (UINTN)CpuRead32(F + 0x7B4u));
+            }
+        }
+        {
+            static UINT32 RestoreFrameTrace = 0xFFFFFFFFu;
+            if (RestoreFrameTrace == 0xFFFFFFFFu) RestoreFrameTrace = 0u;
+            if (CurrentAddress == 0x40B27A70u && RestoreFrameTrace < 4u) {
+                UINT32 P = CpuRead32(g_PpcContext.Gpr[1] - 4u);
+                RestoreFrameTrace++;
+                Print (L"  RSTFRAME[%u] ptr=0x%08x r2=0x%08x r3=0x%08x "
+                       L"r8=0x%08x r20=0x%08x r22=0x%08x r23=0x%08x "
+                       L"r31=0x%08x srr0=0x%08x\n",
+                       (UINTN)RestoreFrameTrace - 1, (UINTN)P,
+                       (UINTN)CpuRead32(P + 0x708u),
+                       (UINTN)CpuRead32(P + 0x70Cu),
+                       (UINTN)CpuRead32(P + 0x720u),
+                       (UINTN)CpuRead32(P + 0x750u),
+                       (UINTN)CpuRead32(P + 0x758u),
+                       (UINTN)CpuRead32(P + 0x75Cu),
+                       (UINTN)CpuRead32(P + 0x77Cu),
+                       (UINTN)CpuRead32(P + 0x7B4u));
+            }
+        }
+        {
+            static UINT32 ResumeAddrFix = 0xFFFFFFFFu;
+            if (ResumeAddrFix == 0xFFFFFFFFu) ResumeAddrFix = 0u;
+            if (ResumeAddrFix < 16u && CurrentAddress == 0x40B27A10u &&
+                g_PpcContext.Gpr[16] == 0u) {
+                UINT32 SavedSrr0 =
+                    CpuRead32(g_PpcContext.Gpr[1] + 0x7B4u);
+                UINT32 ResumeAddr =
+                    CpuRead32(g_PpcContext.Gpr[1] + 0x904u);
+                if (SavedSrr0 >= 0x40800000u && SavedSrr0 < 0x40C00000u &&
+                    ResumeAddr != SavedSrr0) {
+                    ResumeAddrFix++;
+                    CpuWrite32(g_PpcContext.Gpr[1] + 0x904u, SavedSrr0);
+                    CpuWrite32(g_PpcContext.Gpr[1] + 0x7B4u, SavedSrr0);
+                    Print (L"  RESUMEFIX[%u] old=0x%08x new=0x%08x saved=0x%08x src=srr0\n",
+                           (UINTN)ResumeAddrFix - 1, (UINTN)ResumeAddr,
+                           (UINTN)SavedSrr0, (UINTN)SavedSrr0);
+                } else if (ResumeAddr >= 0x40B26300u &&
+                           ResumeAddr < 0x40B28A00u &&
+                           KernelResumeAddress >= 0x40800000u &&
+                           KernelResumeAddress < 0x40C00000u &&
+                           SavedSrr0 != KernelResumeAddress) {
+                    ResumeAddrFix++;
+                    g_NkKernelResumeRepairs++;
+                    CpuWrite32(g_PpcContext.Gpr[1] + 0x904u,
+                               KernelResumeAddress);
+                    CpuWrite32(g_PpcContext.Gpr[1] + 0x7B4u,
+                               KernelResumeAddress);
+                    Print (L"  RESUMEFIX[%u] old=0x%08x new=0x%08x saved=0x%08x src=kernel\n",
+                           (UINTN)ResumeAddrFix - 1, (UINTN)ResumeAddr,
+                           (UINTN)KernelResumeAddress, (UINTN)SavedSrr0);
+                }
+            }
+        }
+        {
+            static UINT32 HexPrintTrace = 0xFFFFFFFFu;
+            static UINT32 ResumeHexArmed = 0xFFFFFFFFu;
+            if (HexPrintTrace == 0xFFFFFFFFu) HexPrintTrace = 0u;
+            if (ResumeHexArmed == 0xFFFFFFFFu) ResumeHexArmed = 0u;
+            if (CurrentAddress == 0x40B267ACu &&
+                g_PpcContext.Lr == 0x40B27A50u) {
+                ResumeHexArmed = 1u;
+            }
+            if (ResumeHexArmed == 1u &&
+                (CurrentAddress == 0x40B267ACu ||
+                 CurrentAddress == 0x40B267ECu ||
+                 CurrentAddress == 0x40B2680Cu ||
+                 CurrentAddress == 0x40B26830u ||
+                 CurrentAddress == 0x40B2687Cu ||
+                 CurrentAddress == 0x40B26520u ||
+                 CurrentAddress == 0x40B265BCu ||
+                 CurrentAddress == 0x40B265C4u ||
+                 CurrentAddress == 0x40B265CCu ||
+                 CurrentAddress == 0x40B265E8u) &&
+                HexPrintTrace < 64u) {
+                HexPrintTrace++;
+                Print (L"  HEXPRINT[%u] pc=0x%08x r8=0x%08x r24=0x%08x "
+                       L"r28=0x%08x cr=0x%08x lr=0x%08x\n",
+                       (UINTN)HexPrintTrace - 1, (UINTN)CurrentAddress,
+                       (UINTN)g_PpcContext.Gpr[8],
+                       (UINTN)g_PpcContext.Gpr[24],
+                       (UINTN)g_PpcContext.Gpr[28],
+                       (UINTN)g_PpcContext.Cr, (UINTN)g_PpcContext.Lr);
+            }
         }
         if (CurrentAddress == 0x40B268D4u && IdlePollProbe < 8u) {
             UINT32 Ch = (UINT32)g_PpcContext.Gpr[28];
@@ -8199,6 +8904,7 @@ static UINT32 FlushFirstBad = 0;
     static UINT32 WalkTabDumps = 0;
     static UINT32 PcBootProcLockWord = 0;
     static UINT32 AutoResumed = 0;
+    static UINT32 ParserFeed = 0xFFFFFFFFu;
     static BOOLEAN AutoResumeArmed = TRUE;
     static BOOLEAN AutoResumeLoading = FALSE;
 static UINT32 TailCrawled = 0;
@@ -8218,7 +8924,6 @@ static UINT32 RegSyscallSeen = 0;
     static UINT32 Dr68KLowProbed = 0;
     static UINT32 Dr68KLast = 0;
     static UINT32 DrA025Probe = 0;
-    static UINT32 g_DrBrFixed = 0;
     static UINT32 DrBaseDrift = 0;
     static UINT32 DrHnfoSeeded = 0;
     static UINT32 DrHnfoProbed = 0;
@@ -10210,8 +10915,12 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x%08x: GetQDGlobals "
         // 0x81E2 RTS-terminated stub parser (JSR trap dispatch). These are
         // independent of the yield-window counters so they trigger on any
         // boot path that reaches the parser.
-        if (PutsProbed < 4000 && Current == 0x40B26444) {
-            UINT8 Ch = (UINT8)(g_PpcContext.Gpr[29] & 0xFF);
+        if (g_PrimePutsReset == 1u) {
+            PutsProbed = 0u;
+            g_PrimePutsReset = 2u;
+        }
+        if (PutsProbed < 4000 && Current == 0x40B264B4) {
+            UINT8 Ch = (UINT8)(g_PpcContext.Gpr[24] & 0xFF);
             if (PutsProbed < sizeof(PutsBuf) - 1) {
                 PutsBuf[PutsProbed % sizeof(PutsBuf)] =
                     (Ch >= 0x20 && Ch < 0x7F) ? (CHAR16)Ch : L'.';
@@ -10387,8 +11096,8 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x%08x: GetQDGlobals "
         // branch ourselves: redirect r24 (68K PC) to PC+2+d32 exactly as 68020
         // would. Only fires at the DR dispatch-home range so we never disturb the
         // mid-handler state.
-        if (g_DrYieldSeen && g_DrBrFixed < 64 &&
-            Current >= 0x40B67A00u && Current < 0x40B67C80u) {
+        if ((g_DrYieldSeen || g_DrBootPcSeeded) && g_DrBrFixed < 512 &&
+            Current >= 0x40B60000u && Current < 0x40B6D000u) {
             UINT32 Pc24 = g_PpcContext.Gpr[24] & 0xFFFFFFFF;
             if (Pc24 >= 0x40800000u && Pc24 < 0x40840000u &&
                 CpuRead16(Pc24) == 0x60FF) {
@@ -12655,6 +13364,18 @@ static const UINT32 Ranges[8][2] = {
                 }
             }
         }
+        if (ParserFeed == 0xFFFFFFFFu) ParserFeed = 0u;
+        if (ParserFeed < 4u && g_NkAutoResumeDone != 0u &&
+            Current == 0x40B2689C && g_PpcContext.Lr == 0x40B27590u &&
+            g_SccRxFifoHead == g_SccRxFifoTail && !g_SccRxPending) {
+            ParserFeed++;
+            PpcIntCtrlInstall();
+            Print(L"  PFEED[%u] at PC=0x%08x r1=0x%08x LR=0x%08x\n",
+                  (UINTN)ParserFeed - 1, (UINTN)Current,
+                  (UINTN)g_PpcContext.Gpr[1], (UINTN)g_PpcContext.Lr);
+            PpcSccPutChar('g');
+            PpcSccPutChar(0x0D);
+        }
         // Caller emit loop: r21 = phys cursor, r22 = pages remaining.
         // Auto-answer the nanodebugger wait loop: the first resume is gated on
         // the late 0x40B265CC park, then a bounded number of follow-up resumes
@@ -13226,6 +13947,12 @@ static const UINT32 Ranges[8][2] = {
                     PpcDecodeInstruction(Instr, StopMn, sizeof(StopMn));
                     Print(L"GUEST STOP at PC=0x%08x inst=0x%08x (%s): %r\n",
                           g_PpcContext.Pc, Instr, StopMn, Status);
+                    Print(L"  STOPMEM pcword=0x%08x r28=0x%08x r1=0x%08x "
+                          L"msr=0x%08x\n",
+                          (UINTN)CpuRead32(g_PpcContext.Pc),
+                          (UINTN)g_PpcContext.Gpr[28],
+                          (UINTN)g_PpcContext.Gpr[1],
+                          (UINTN)g_PpcContext.Msr);
                 }
                 {
                     UINT32 Dr2 = g_PpcContext.Gpr[2];
