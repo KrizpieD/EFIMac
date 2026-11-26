@@ -15,6 +15,7 @@ search strategy.
 | Named C2B budget test | 240 | H-C9: prove post-resume init is slow, not stalled | Once, after diagnostics reverted |
 | Named C3 budget test | 240 | Post-`Priming` C3 hypotheses (H-C116 onward): prove slow, not stalled | Once per authorized hypothesis, after C2B regression passes and diagnostics are reverted |
 | Named C4 budget test | 240 | Post-`Priming` H-C133: prove QD install, guest framebuffer writes, and GOP blit | Once per authorized hypothesis, after C3 regression passes |
+| Named C5 budget test | 240 | Post-C4 H-C141: prove QD-rendered framebuffer writes, not the C4 synthetic stub | Once per authorized hypothesis, after C4 validation passes |
 | Soak | 180 | Explicitly requested final validation | Never as discovery |
 
 No multi-minute blind runs. No ad hoc QEMU command loops. Always use

@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('C0', 'C1', 'C2', 'C2A', 'C2B', 'C3', 'C4')]
+    [ValidateSet('C0', 'C1', 'C2', 'C2A', 'C2B', 'C3', 'C4', 'C5')]
     [string]$Contract,
     [int]$Seconds = 45,
     [string[]]$Require = @(),

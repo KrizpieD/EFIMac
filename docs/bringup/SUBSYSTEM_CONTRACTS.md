@@ -269,9 +269,10 @@ unclassified `UNBOUNDCALL`. Every remaining `UNBOUNDCALL` must be entered in
 **Status:** PASS via `H-C140` (immediate post-store blit). `H-C139` proved a
 real guest PPC stub can write `0x18000000` (`FBWRITE[0..3]`), and `H-C140`
 added an immediate blit after restoring guest state. The named C4 240 s gate
-passed with all required markers and no forbidden markers. Active hypothesis:
-none. This is a bounded guest-executed framebuffer store, not QD rendering;
-QD-driven drawing remains a separate future contract.
+passed with all required markers and no forbidden markers. A 480 s
+post-gate validation also passed (`records 7106`, same markers, no forbidden
+markers). Active hypothesis: none. This is a bounded guest-executed framebuffer
+store, not QD rendering; QD-driven drawing remains a separate future contract.
 
 **Preconditions**
 - C3 passes. Graphics/serial output path initialized; no known fatal markers.
@@ -289,3 +290,37 @@ gate passes.
 
 **Explicit Non-Goals**
 - Full Mac OS feature completeness, every Finder window, sound, or network.
+
+## C5 — QD-driven drawing
+
+**Status:** OPEN. C4 is locked by H-C140 plus a 480 s validation, but its
+framebuffer writes come from the bounded guest PPC stub at `0x0000FC00`.
+H-C141 falsified probe un-gating alone: with the stub disabled, no QD render
+probe, framebuffer write, or blit appeared. H-C142 traced the post-screen
+`Pc24` windows and found no PATH2/native-handoff offer; H-C143 showed low
+`r24` values are transient inside `PpcExecuteInstruction`; H-C144 latched
+handoff and completed PEF loading but still produced no QD output. H-C145 was
+inconclusive and reverted after two runs failed before handoff; C4 was
+revalidated after the revert. Active hypothesis: none. Single targeted
+postcondition remains: a post-C4 boot emits `QDRENDER`
+and `FBWRITE[0]` with `C4FBSTUB[0]` absent, then
+`PpcGraphicsBlitToDisplay`.
+
+**Preconditions**
+- C4 gate and 480 s validation pass; C3/C2B regressions pass.
+- The virtual QD screen remains installed at `0x18000000`.
+- The C4 synthetic store is disabled or made ineligible before the C5 gate.
+
+**Postconditions / Pass-Fail Gate**
+```powershell
+& .\scripts\bringup-gate.ps1 -Contract C5 -Seconds 240 `
+  -Require @('Priming the system free list','NatQdInstallScreen','QDRENDER','FBWRITE[0]','PpcGraphicsBlitToDisplay') `
+  -Forbid @('[FAIL]','GUEST STOP','budget stop','C4FBSTUB[0]')
+```
+Pass requires at least one QD render probe hit, a framebuffer write while the
+C4 stub is absent, and a GOP blit, with no forbidden markers. Wall-clock
+validation beyond 240 s is allowed only after this gate passes.
+
+**Explicit Non-Goals**
+- Full desktop/Finder completion, sound, network, and general Toolbox coverage.
+- Treating guest-executed synthetic stores as QD rendering.
