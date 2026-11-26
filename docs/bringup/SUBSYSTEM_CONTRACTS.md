@@ -242,7 +242,8 @@ with no unclassified `UNBOUNDCALL`. Bounded diagnostics were removed after
 PASS; remaining state corrections are the PMDT counter mask at `0x40B12244`
 and CR5 EQ repair at `0x40B123A4`. Final diagnostic-free build re-verified C3
 (4 PMDT records, 3 after `Priming`; no forbidden markers) and the C2B locked
-regression (`t+160s Priming`).
+regression (`t+160s Priming`). Post-C4 H-C140 regressions re-verified C3
+(`records 7042`) and C2B (`records 6226`) with no forbidden markers.
 
 **Preconditions**
 - C2 or C2B passes; dispatcher/stack table semantics locked in `STATE_LEDGER.md`.
@@ -265,18 +266,26 @@ unclassified `UNBOUNDCALL`. Every remaining `UNBOUNDCALL` must be entered in
 
 ## C4 — First sign-of-life output
 
+**Status:** PASS via `H-C140` (immediate post-store blit). `H-C139` proved a
+real guest PPC stub can write `0x18000000` (`FBWRITE[0..3]`), and `H-C140`
+added an immediate blit after restoring guest state. The named C4 240 s gate
+passed with all required markers and no forbidden markers. Active hypothesis:
+none. This is a bounded guest-executed framebuffer store, not QD rendering;
+QD-driven drawing remains a separate future contract.
+
 **Preconditions**
 - C3 passes. Graphics/serial output path initialized; no known fatal markers.
 
 **Postconditions / Pass-Fail Gate**
 ```powershell
-& .\scripts\bringup-gate.ps1 -Contract C4 -Seconds 120 `
-  -Require @('Priming the system free list','PpcGraphicsBlitToDisplay','NatQdInstallScreen') `
+& .\scripts\bringup-gate.ps1 -Contract C4 -Seconds 240 `
+  -Require @('Priming the system free list','NatQdInstallScreen','PpcGraphicsBlitToDisplay','FBWRITE[0]') `
   -Forbid @('[FAIL]','GUEST STOP','budget stop')
 ```
-Pass requires `PpcGraphicsBlitToDisplay` and `NatQdInstallScreen` at least once
-and stable serial output through the gate. Wall-clock validation beyond 120 s is
-allowed only after this gate passes.
+Pass requires real post-`Priming` `NatQdInstallScreen`,
+`PpcGraphicsBlitToDisplay`, and `FBWRITE[0]` evidence and stable serial output
+through the gate. Wall-clock validation beyond 240 s is allowed only after this
+gate passes.
 
 **Explicit Non-Goals**
 - Full Mac OS feature completeness, every Finder window, sound, or network.

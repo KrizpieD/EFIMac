@@ -10,6 +10,26 @@ A single UEFI x86_64 application (the "heavy bootloader") that stages a classic
 PowerPC Mac boot environment and runs the guest's own firmware + OS on a
 PowerPC interpreter. Output artifact: `build/EFI-Mac-Emulator.efi`.
 
+## Bring-up workflow (mandatory for agents)
+
+Authoritative artifacts: [STATE_LEDGER.md](docs/bringup/STATE_LEDGER.md),
+[SUBSYSTEM_CONTRACTS.md](docs/bringup/SUBSYSTEM_CONTRACTS.md),
+[HARNESS_GATES.md](docs/bringup/HARNESS_GATES.md).
+
+- **Phase A — Map & Model (read-only):** before any code change, update
+  `STATE_LEDGER.md` and `SUBSYSTEM_CONTRACTS.md` with the verified invariants,
+  the hypothesis ID, and the single contract postcondition being targeted.
+- **Phase B — Scoped Implementation:** modify at most one subsystem or stub per
+  task, against one contract ID, and verify with one short deterministic run via
+  `scripts/bringup-gate.ps1` (see `HARNESS_GATES.md`).
+- Prohibited: multi-minute blind runs, uncontracted speculative edits, and
+  tracing deep inside known hardware/debugger poll loops before deciding whether
+  to stub or bypass them. Multi-minute runs are allowed only as targeted
+  post-implementation validation.
+- Every diagnostic run must name a contract and hypothesis, use bounded trace
+  triggers, and write the structured `BGATE-*` state dump defined in
+  `HARNESS_GATES.md`.
+
 ## Environment
 
 - Host OS: Windows. Shell: PowerShell 7 (`pwsh`).
@@ -47,6 +67,10 @@ space-free path, and captures serial output.
 Useful switches: `-MacDisc`, `-OldWorldRom`, `-Seconds`, `-StallSeconds 0`
 (no-output stall detector off — the guest is quiet for long stretches),
 `-NoReboot`, `-StopOnPattern`, `-TimelinePattern`.
+
+For contract-gated runs use `scripts/bringup-gate.ps1 -Contract <id> -Seconds 45
+-Require @(...) -Forbid @(...)`; it pre-cleans the stage, runs the helper with
+bounded patterns, writes `bringup_gate_result.txt`, and exits non-zero on fail.
 
 **Clear the staged disc scratch dir before a run.** QEMU/Windows can leave a
 `C__` folder under `mac_disc\` that breaks the next run.

@@ -822,6 +822,17 @@ PpcMmuReadByte (
 // (C allows a tentative definition followed by an initialised one.)
 static PPC_CPU_READ_MEMORY g_ReadByte;
 static UINT32 g_PrimePutsReset = 0;
+static UINT32 g_C4ScreenInstalled = 0;
+static UINT32 g_C4FramebufferWrites = 0;
+static UINT32 g_C4BlitPrinted = 0;
+static UINT32 g_C4StoreRuns = 0;
+static VOID NatQdInstallScreen (VOID);
+static VOID C4ExecuteFramebufferStore (VOID);
+EFI_STATUS PpcExecuteInstruction (
+    IN UINT32 Instruction,
+    IN UINT32 CurrentAddress,
+    OUT UINT32 *NextAddress
+    );
 static VOID
 PpcMmuWriteByte (
     IN UINT32 Ea,
@@ -841,6 +852,14 @@ PpcMmuWriteByte (
                   (g_PpcContext.Msr & PPC_MSR_DR) ? 1u : 0u,
                   g_PpcContext.Sdr1, g_PpcContext.Gpr[1] & 0xFFFFFFFFu);
         }
+    }
+    if (g_C4ScreenInstalled != 0u &&
+        Ea >= 0x18000000u && Ea < 0x18800000u &&
+        g_C4FramebufferWrites < 8u) {
+        g_C4FramebufferWrites++;
+        Print(L"  FBWRITE[%u] [%08x]=%02x pc=%08x\n",
+              (UINTN)g_C4FramebufferWrites - 1, (UINTN)Ea, (UINTN)Value,
+              (UINTN)g_PpcContext.Pc);
     }
     if ((g_PpcContext.Msr & PPC_MSR_DR) != 0 &&
         PpcTranslateEffective(Ea, FALSE, &Pa)) {
@@ -4048,9 +4067,29 @@ PpcExecuteInstruction (
         }
         {
             if (g_NkKernelResumeRepairs != 0u &&
-                CurrentAddress == 0x40B123A4u &&
-                ((g_PpcContext.Cr >> 9) & 1u) == 0u) {
-                g_PpcContext.Cr |= (1u << 9);
+                CurrentAddress == 0x40B123A4u) {
+                if (((g_PpcContext.Cr >> 9) & 1u) == 0u) {
+                    g_PpcContext.Cr |= (1u << 9);
+                }
+                if (g_C4ScreenInstalled == 0u) {
+                    NatQdInstallScreen();
+                    g_C4ScreenInstalled = 1u;
+                    Print(L"NatQdInstallScreen\n");
+                }
+                if (g_C4StoreRuns == 0u && g_C4FramebufferWrites == 0u) {
+                    g_C4StoreRuns++;
+                    C4ExecuteFramebufferStore();
+                    Print(L"  C4FBSTUB[%u] writes=%u\n",
+                          (UINTN)g_C4StoreRuns - 1,
+                          (UINTN)g_C4FramebufferWrites);
+                    if (g_C4FramebufferWrites != 0u) {
+                        PpcGraphicsBlitToDisplay();
+                        if (g_C4BlitPrinted == 0u) {
+                            g_C4BlitPrinted = 1u;
+                            Print(L"PpcGraphicsBlitToDisplay\n");
+                        }
+                    }
+                }
             }
         }
         {
@@ -7376,6 +7415,40 @@ NatRectEmpty (
     return (T >= B || L >= R);
 }
 
+static VOID
+C4ExecuteFramebufferStore (
+    VOID
+    )
+{
+    UINT32 SavedPc = g_PpcContext.Pc;
+    UINT32 SavedMsr = g_PpcContext.Msr;
+    UINT32 SavedR3 = (UINT32)g_PpcContext.Gpr[3];
+    UINT32 SavedR4 = (UINT32)g_PpcContext.Gpr[4];
+    UINT32 Words[4];
+    UINT32 I;
+    UINT32 Stub = 0x0000FC00u;
+
+    Words[0] = 0x3C601800u;
+    Words[1] = 0x60630000u;
+    Words[2] = 0x38841234u;
+    Words[3] = 0x90230000u;
+    for (I = 0; I < 4u; I++) {
+        CpuWrite32(Stub + I * 4u, Words[I]);
+    }
+
+    g_PpcContext.Msr &= ~PPC_MSR_DR;
+    for (I = 0; I < 4u; I++) {
+        UINT32 Address = Stub + I * 4u;
+        UINT32 Next = Address + 4u;
+        g_PpcContext.Pc = Address;
+        (void)PpcExecuteInstruction(CpuRead32(Address), Address, &Next);
+    }
+    g_PpcContext.Msr = SavedMsr;
+    g_PpcContext.Gpr[3] = SavedR3;
+    g_PpcContext.Gpr[4] = SavedR4;
+    g_PpcContext.Pc = SavedPc;
+}
+
 /* Minimal Region record: rgnSize(2), rgnBBox(8), data(2).
    We only model the bounding box; complex region shapes fall back to it. */
 #define NAT_RGN_BBOX 2u
@@ -10206,6 +10279,14 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x%08x: GetQDGlobals "
         // to the real GOP framebuffer.
         if (g_DrNativeHandoff != 0 && (Executed & 0xFFFFFu) == 0x00000u) {
             PpcGraphicsBlitToDisplay();
+        }
+        if (g_C4ScreenInstalled != 0u && g_C4FramebufferWrites != 0u &&
+            (Executed & 0xFFFFFu) == 0x00000u) {
+            PpcGraphicsBlitToDisplay();
+            if (g_C4BlitPrinted == 0u) {
+                g_C4BlitPrinted = 1u;
+                Print(L"PpcGraphicsBlitToDisplay\n");
+            }
         }
         // QuickDraw-path probes: is the guest's own renderer actually reached?
         if (g_DrNativeHandoff != 0) {
