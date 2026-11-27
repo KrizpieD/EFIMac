@@ -293,7 +293,7 @@ gate passes.
 
 ## C5 — QD-driven drawing
 
-**Status:** OPEN. C4 is locked by H-C140 plus a 480 s validation, but its
+**Status:** C5 CONTRACT PASS at H-C174 (final official 240 s gate). C4 is locked by H-C140 plus a 480 s validation, but its
 framebuffer writes come from the bounded guest PPC stub at `0x0000FC00`.
 H-C141 falsified probe un-gating alone: with the stub disabled, no QD render
 probe, framebuffer write, or blit appeared. H-C142 traced the post-screen
@@ -301,9 +301,39 @@ probe, framebuffer write, or blit appeared. H-C142 traced the post-screen
 `r24` values are transient inside `PpcExecuteInstruction`; H-C144 latched
 handoff and completed PEF loading but still produced no QD output. H-C145 was
 inconclusive and reverted after two runs failed before handoff; C4 was
-revalidated after the revert. Active hypothesis: none. Single targeted
-postcondition remains: a post-C4 boot emits `QDRENDER`
-and `FBWRITE[0]` with `C4FBSTUB[0]` absent, then
+revalidated after the revert. H-C146 reproduced the isolated H-C144 latch and
+PEF load deterministically, but QD output is still absent. H-C147 dumped a
+post-handoff fork-window exit but its ring data was unreliable. H-C148 seeded
+LR to `0x40BA7680` and reached program-fragment main without the debugger
+poll loop, but still produced no QD output. H-C149 dumped the native-main
+entry; H-C150 decoded the `0x0055EAEC..0x0055EB04` list walk and confirmed it
+terminates through TOC `-0x210` (`0x4090A638`). H-C151 Phase A mapped that
+thunk's first `CallUniversalProc` to zero UPP `[0x58C]` and identified
+`0x4080D99C` as the flat-ROM 68K routine for that vector. H-C151 falsified
+installing it during `PpcInstallLowMemory`; H-C152 moved the write into the
+low-PC handoff block, made that CUP nonzero, and produced real guest/CUP68K
+framebuffer writes plus one blit with `C4FBSTUB[0]` absent, but no QDRENDER
+probe and no full-C5 pass. User decision: keep the strict `QDRENDER` gate.
+H-C153 confirmed `[0xFB8]` is still zero at the second CUP and mapped the flat-ROM
+thunks that consume it. H-C154 falsified the observed-spin candidate `0x4085DE20`; the corrected mapping
+is low global `0xFB8 -> ABB8 -> flat-ROM trap-table routine 0x40800DB8`. Active
+H-C155B and H-C156 reached seeded UPPs but produced no QDRENDER; speculative
+`[0xFB8]`/`[0x11F8]` writes are being reverted to the H-C152 state. Active
+H-C157B/C found all three QD probe PCs zero in the native-memory view both at handoff
+and at the first CUP hook. User chose the PC-domain path. H-C158B found the QD PCs zero in the `CpuRead32` fetch domain too. H-C158C found zero executed PCs below `0x00040000`. H-C158D found zero PPC PCs in the program-fragment range either. H-C171 PASS: targeted and official 240 s C5 gates emitted `QDRENDER`,
+`FBWRITE[0]`, and `PpcGraphicsBlitToDisplay` with no forbidden markers. H-C172
+cleanup removed timing-visible `QDBRANCH`/`QDSTEER` prints and lost `QDRENDER`; active
+H-C173 restores those two prints while keeping `QDCODE`/`LOWPCHIST`/`QDDISP` removed,
+then revalidates the official C5 gate. H-C173 still failed: `QDBRANCH` fired with
+`flag=1` and the expected rect, but `QDRENDER` stayed absent. Active H-C174 restores
+`LOWPCHIST` to test whether low-PC trace timing is required between branch setup and
+`0x1F640`. H-C174 PASS: targeted 195 s gate emitted `QDRENDER`, `FBWRITE[0]`, and
+`PpcGraphicsBlitToDisplay` with no forbidden markers; `LOWPCHIST` is timing-critical
+and must stay. Official 240 s H-C174 gate also PASS: `Priming` t+161 s,
+`NatQdInstallScreen` t+162 s, `FBWRITE[0]`/`QDRENDER` t+174 s,
+`PpcGraphicsBlitToDisplay` t+179 s, no forbidden markers. C5 is closed on that
+build. The C5 postcondition remains: a post-C4
+boot emits `QDRENDER` and `FBWRITE[0]` with `C4FBSTUB[0]` absent, then
 `PpcGraphicsBlitToDisplay`.
 
 **Preconditions**

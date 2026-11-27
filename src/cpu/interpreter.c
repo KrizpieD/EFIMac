@@ -826,6 +826,8 @@ static UINT32 g_C4ScreenInstalled = 0;
 static UINT32 g_C4FramebufferWrites = 0;
 static UINT32 g_C4BlitPrinted = 0;
 static UINT32 g_C4StoreRuns = 0;
+static UINT32 g_C5AllowC4Stub = 0;
+static UINT32 g_C5SteerArmed = 0;
 static VOID NatQdInstallScreen (VOID);
 static VOID C4ExecuteFramebufferStore (VOID);
 EFI_STATUS PpcExecuteInstruction (
@@ -1358,6 +1360,10 @@ static UINT32 g_QdProbeRender = 0; // QD render(0x1F640) hit count
 static UINT32 g_QdProbePixSrv = 0; // QD pixmap service(0x1B8D8) hit count
 static UINT32 g_QdProbeBmpWr  = 0; // QD bitmap write(0x1A974) hit count
 static UINT32 g_QdProbeGlue   = 0; // unbound-import glue stub(0xBA28) hit count
+static UINT32 g_QdBranchPatched = 0;
+static UINT32 g_QdRenderSteered = 0;
+static UINT32 g_LowPcSeen[1024];
+static UINT32 g_LowPcN = 0;
 static UINT32 g_NatCupPtrs[64];    // distinct CallUniversalProc targets seen
 static UINT32 g_NatCupN = 0;       // count of distinct targets logged
 static UINT32 g_DrNativeSteer = 0;    // latched by the tail-A207 0x1B823 write (never reset)
@@ -4076,7 +4082,8 @@ PpcExecuteInstruction (
                     g_C4ScreenInstalled = 1u;
                     Print(L"NatQdInstallScreen\n");
                 }
-                if (g_C4StoreRuns == 0u && g_C4FramebufferWrites == 0u) {
+                if (g_C5AllowC4Stub != 0u && g_C4StoreRuns == 0u &&
+                    g_C4FramebufferWrites == 0u) {
                     g_C4StoreRuns++;
                     C4ExecuteFramebufferStore();
                     Print(L"  C4FBSTUB[%u] writes=%u\n",
@@ -4709,6 +4716,16 @@ PpcExecuteInstruction (
                    (UINTN)Seq, (UINTN)CurrentAddress, (UINTN)g_PpcContext.Pc,
                    (UINTN)g_PpcContext.Lr, (UINTN)g_PpcContext.Gpr[24],
                    (UINTN)g_PpcContext.Srr0, (UINTN)w);
+        }
+        if (g_C4ScreenInstalled != 0u && g_DrNativeHandoff == 0u &&
+            g_C5SteerArmed == 0u) {
+            UINT32 Low24 = g_PpcContext.Gpr[24] & 0xFFFFFFFFu;
+            if (Low24 >= 2u && Low24 < 0x100u) {
+                g_C5SteerArmed = 1u;
+                g_DrNativeSteer = 1u;
+                Print(L"  C5STEER[0] lowpc=0x%08x cur=0x%08x seq=%u\n",
+                      (UINTN)Low24, (UINTN)CurrentAddress, (UINTN)Seq);
+            }
         }
     }
     // Fork/decoder reachability probes: prove whether the resumed fork prologue
@@ -6554,12 +6571,20 @@ g_DrA207Land = 0;
             if (NullBranchN < 16) {
                 NullBranchN++;
                 Print(L"  NULLBRANCH[%u] 0x%08x -> 0 at PC=0x%08x LR=0x%08x CTR=0x%08x "
-                      L"r1=0x%08x r3=0x%08x r4=0x%08x r5=0x%08x r6=0x%08x r7=0x%08x\n",
+                       L"r1=0x%08x r3=0x%08x r4=0x%08x r5=0x%08x r6=0x%08x r7=0x%08x "
+                       L"r12=0x%08x [r12]=0x%08x [93A7C]=0x%08x [93CE0]=0x%08x "
+                       L"[BA20]=0x%08x [BA28]=0x%08x\n",
+
                       NullBranchN - 1, Instruction, CurrentAddress, g_PpcContext.Lr,
                       g_PpcContext.Ctr, g_PpcContext.Gpr[1] & 0xFFFFFFFFu,
                       g_PpcContext.Gpr[3] & 0xFFFFFFFFu, g_PpcContext.Gpr[4] & 0xFFFFFFFFu,
-                      g_PpcContext.Gpr[5] & 0xFFFFFFFFu, g_PpcContext.Gpr[6] & 0xFFFFFFFFu,
-                      g_PpcContext.Gpr[7] & 0xFFFFFFFFu);
+                       g_PpcContext.Gpr[5] & 0xFFFFFFFFu, g_PpcContext.Gpr[6] & 0xFFFFFFFFu,
+                       g_PpcContext.Gpr[7] & 0xFFFFFFFFu,
+                       g_PpcContext.Gpr[12] & 0xFFFFFFFFu,
+                       CpuRead32(g_PpcContext.Gpr[12] & 0xFFFFFFFFu),
+                       CpuRead32(0x00093A7Cu), CpuRead32(0x00093CE0u),
+                       CpuRead32(0x0000BA20u), CpuRead32(0x0000BA28u));
+
             }
             // Skip the null call: report failure in r3 and continue at the next
             // instruction instead of fetching the reserved opcode at physical 0.
@@ -9479,7 +9504,8 @@ if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 48) {
             // slot with the low 68K bootstrap 0x1B823, so accept both the low
             // steer value and the native entry region as the handoff trigger.
             if (g_DrNativeHandoff == 0 && g_DrNativeSteer != 0 &&
-                ((Pc24 >= 0x0001B000u && Pc24 < 0x0001C000u) ||
+                (g_C5SteerArmed != 0u ||
+                 (Pc24 >= 0x0001B000u && Pc24 < 0x0001C000u) ||
                  (Pc24 >= NAT_F0_CODE_BASE && Pc24 < NAT_F0_CODE_END))) {
                 // Resume at the fork's FUNCTION ENTRY, not the shared pad, so
                 // the fork's own prologue runs its bookkeeping (bl 0x4672c;
@@ -9491,6 +9517,21 @@ if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 48) {
                 // 0x0200099B but never advanced, outer slots never written,
                 // r28 frozen): only the fork's own entry can seed them.
                 UINT32 Np = NAT_F0_CODE_BASE + NAT_F0_ENTRY_OFF;
+                if (g_C5SteerArmed != 0u) {
+                    g_QdBranchPatched = 0u;
+                    g_QdRenderSteered = 0u;
+                    g_LowPcN = 0u;
+                    Pc24 = Np;
+                    g_PpcContext.Gpr[24] = Np;
+                    g_PpcContext.Lr = 0x40BA7680u;
+                    PpcWriteGuestByte(0x0000058Cu + 0u, 0x40u);
+                    PpcWriteGuestByte(0x0000058Cu + 1u, 0x80u);
+                    PpcWriteGuestByte(0x0000058Cu + 2u, 0xD9u);
+                    PpcWriteGuestByte(0x0000058Cu + 3u, 0x9Cu);
+                    Print(L"  C5HANDOFF lowpc latch -> fork entry 0x%08x "
+                          L"lr=0x40BA7680\n",
+                          (UINTN)Np);
+                }
                 g_DrNativeHandoff = 1;
                 g_NatTermPending = 1;
                 g_ForkResumePc = g_PpcContext.Gpr[24] & 0xFFFFFFFF;
@@ -9501,10 +9542,10 @@ if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 48) {
                 // real System-fragment providers instead of the 0-glue stub.
                 // The raw 1:1 fork mirror runs first so the CFM loader's
                 // expanded/relocated images land on top of it.
-                for (UINT32 Mw = 0x00096000u; Mw < 0x002A2B0Au; Mw += 4) {
+                for (UINT32 Mw = 0x00010000u; Mw < 0x002A2B0Au; Mw += 4) {
                     CpuWrite32(Mw, CpuRead32(PPC_OS_RUNTIME_GUEST_BASE + Mw));
                 }
-                Print(L"  NATIVE-HANDOFF mirrored fork 0x96000..0x2A2B0A into low "
+                Print(L"  NATIVE-HANDOFF mirrored fork 0x10000..0x2A2B0A into low "
                       L"RAM (file offset == runtime addr); [0x100000]=0x%08x "
                       L"[0x100004]=0x%08x\n",
                       CpuRead32(0x00100000u), CpuRead32(0x00100004u));
@@ -9639,9 +9680,20 @@ if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 48) {
                             CpuWrite32(No, CpuRead32(PPC_OS_RUNTIME_GUEST_BASE + No));
                         }
                         g_PpcContext.Gpr[2] = 0x945F8u;
-                        CpuWrite32(0x00093A7Cu, 0x0000BA00u);
                         Print(L"  NATIVE-HANDOFF fallback: mirror 0x320..0x1B400, "
+
                               L"r2=0x945F8, patch [0x93A7C]=0xBA00\n");
+                    }
+                }
+                for (UINT32 Pc = 0x00000320u; Pc < 0x002A2B0Au; Pc += 4u) {
+                    UINT32 W = CpuRead32(Pc);
+                    if ((W & 0xFC000000u) == 0x80000000u &&
+                        ((W >> 16u) & 0x1Fu) == 12u &&
+                        ((W >> 21u) & 0x1Fu) == 2u) {
+                        UINT32 Slot = 0x000945F8u + (UINT32)(INT32)(INT16)(W & 0xFFFFu);
+                        if (Slot >= 0x00093A00u && Slot < 0x000945F8u) {
+                            CpuWrite32(Slot, 0x0000BA20u);
+                        }
                     }
                 }
                 // Container service (what GetQDGlobals returns).  Descriptor
@@ -9655,6 +9707,7 @@ if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 48) {
                 // guest 0x68E96000; System file size = 0x2A2B0A (RAWPARM) ->
                 // stream len = 0x1CB0A.
                 {
+                    CpuWrite32(0x00093A7Cu, 0x0000BA00u);
                     CpuWrite32(0x0000BA00u + 0x00, 0x0000BA08u);
                     CpuWrite32(0x0000BA00u + 0x04, 0x00000000u);
                     // Stub @ 0xBA08: lis r3,0 / ori r3,r3,0xB900 / blr
@@ -9681,6 +9734,11 @@ if (Fi == FreePageCount && Fp != 0xFFFFFFFF && FreePageCount < 48) {
                 // Give the guest a real colour screen device backed by the
                 // host framebuffer window (overrides the skip fields above).
                 NatQdInstallScreen();
+                CpuWrite16(0x0000B940u + 0x00, 0x0000);
+                CpuWrite16(0x0000B940u + 0x02, 0x0000);
+                CpuWrite16(0x0000B940u + 0x04, 0x0010);
+                CpuWrite16(0x0000B940u + 0x06, 0x0010);
+                CpuWrite32(0x0000B940u + 0x60, 0x00000001U);
                 // (The 1:1 fork mirror and the CFM export-map build now run
                 // earlier -- before the frag0 loader -- so frag0's imports can
                 // bind to their real providers; see the NATIVE-HANDOFF reorder.)
@@ -10016,6 +10074,19 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x%08x: GetQDGlobals "
         if (Current >= 0x00600000 && Current < 0x00A00000) { extern UINT32 g_LastCupSavedLr; if (g_LastCupSavedLr >= 0x40800000 && g_LastCupSavedLr < 0x50C00000) { g_PpcContext.Pc = g_LastCupSavedLr; g_PpcContext.Lr = g_LastCupSavedLr; Current = g_LastCupSavedLr; } else { UINT32 T = (g_PpcContext.Lr >= 0x40800000 && g_PpcContext.Lr < 0x50C00000) ? g_PpcContext.Lr : (Current + 16); g_PpcContext.Pc = T; Current = T; g_PpcContext.Lr = g_LastCupSavedLr; } }
         Status = PpcExecuteInstruction(Instr, Current, &Next);
         Executed++;
+        if (g_DrNativeHandoff != 0u && g_C4FramebufferWrites != 0u &&
+            g_QdRenderSteered == 0u) {
+            g_QdRenderSteered = 1u;
+            g_PpcContext.Gpr[2] = 0x000945F8u;
+            g_PpcContext.Gpr[3] = 0u;
+            g_PpcContext.Gpr[29] = 0x0000B940u;
+            g_PpcContext.Gpr[30] = 0u;
+            g_PpcContext.Gpr[31] = 0x0000B940u;
+            g_PpcContext.Lr = 0x40BA7680u;
+            Next = 0x0001B820u;
+            Print(L"  QDSTEER pc=0x%08X -> 0x1B820 r2=0x945F8 r3=0 r29/r31=0xB940 "
+                  L"r30=0 LR=0x40BA7680\n", (UINTN)Current);
+        }
         // R1CHG: name the instruction that sets r1=0x77E0. [0x9FFC] (SPRG0)
         // never holds 0x77E0, so r1 arrives via `lmw`/`mtspr`/arithmetic. The
         // NK debugger's task-restore at 0x40B28828 then pops [r1-4] = [0x77DC]
@@ -10290,6 +10361,57 @@ Print(L"  NATIVE-HANDOFF resume fork entry 0x%08x: GetQDGlobals "
         }
         // QuickDraw-path probes: is the guest's own renderer actually reached?
         if (g_DrNativeHandoff != 0) {
+            if (g_LowPcN < 1024u) {
+                UINT32 Lpi;
+                UINT32 LpSeen = 0;
+                for (Lpi = 0; Lpi < g_LowPcN; ++Lpi) {
+                    if (g_LowPcSeen[Lpi] == Current) {
+                        LpSeen = 1;
+                        break;
+                    }
+                }
+                if (LpSeen == 0u) {
+                    g_LowPcSeen[g_LowPcN++] = Current;
+                    Print(L"  LOWPCHIST[%u] pc=0x%08x instr=0x%08x "
+                          L"r3=0x%08x r4=0x%08x lr=0x%08x\n",
+                          g_LowPcN - 1u, Current, Instr,
+                          g_PpcContext.Gpr[3] & 0xFFFFFFFF,
+                          g_PpcContext.Gpr[4] & 0xFFFFFFFF,
+                          g_PpcContext.Lr & 0xFFFFFFFF);
+                }
+            }
+            if (g_QdBranchPatched == 0u && Current == 0x0001B85Cu) {
+                UINT32 QdRec = g_PpcContext.Gpr[29] & 0xFFFFFFFFu;
+                g_QdBranchPatched = 1u;
+                CpuWrite32(0x0000BA00u + 0x00, 0x0000BA08u);
+                CpuWrite32(0x0000BA00u + 0x04, 0x00000000u);
+                CpuWrite32(0x0000BA08u + 0x00, 0x3C600000u);
+                CpuWrite32(0x0000BA08u + 0x04, 0x6063B900u);
+                CpuWrite32(0x0000BA08u + 0x08, 0x4E800020u);
+                CpuWrite32(0x0000BA20u + 0x00, 0x0000BA28u);
+                CpuWrite32(0x0000BA20u + 0x04, 0x00000000u);
+                CpuWrite32(0x0000BA28u + 0x00, 0x38601000u);
+                CpuWrite32(0x0000BA28u + 0x04, 0x4E800020u);
+                for (UINT32 Pc = 0x00000320u; Pc < 0x002A2B0Au; Pc += 4u) {
+                    UINT32 W = CpuRead32(Pc);
+                    if ((W & 0xFC000000u) == 0x80000000u &&
+                        ((W >> 16u) & 0x1Fu) == 12u &&
+                        ((W >> 21u) & 0x1Fu) == 2u) {
+                        UINT32 Slot = 0x000945F8u + (UINT32)(INT32)(INT16)(W & 0xFFFFu);
+                        if (Slot >= 0x00093A00u && Slot < 0x000945F8u) {
+                            CpuWrite32(Slot, 0x0000BA20u);
+                        }
+                    }
+                }
+                CpuWrite32(0x00093A7Cu, 0x0000BA00u);
+                CpuWrite32(0x00093CE0u, 0x0000BA20u);
+                Print(L"  QDBRANCH r29=0x%08X r30=0x%08X flag=0x%08X "
+                      L"rect=%04X,%04X,%04X,%04X\n",
+                      QdRec, g_PpcContext.Gpr[30] & 0xFFFFFFFFu,
+                      CpuRead32(QdRec + 0x60u),
+                      CpuRead16(QdRec + 0u), CpuRead16(QdRec + 2u),
+                      CpuRead16(QdRec + 4u), CpuRead16(QdRec + 6u));
+            }
             if (Current == 0x0001F640u && g_QdProbeRender < 6) {
                 Print(L"  QDRENDER #%u r3=0x%08x r4=0x%08x\n",
                       g_QdProbeRender, g_PpcContext.Gpr[3] & 0xFFFFFFFF,
